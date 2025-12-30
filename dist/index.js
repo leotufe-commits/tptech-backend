@@ -1,14 +1,9 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const express_1 = __importDefault(require("express"));
-const cors_1 = __importDefault(require("cors"));
-const dotenv_1 = __importDefault(require("dotenv"));
-const auth_routes_1 = __importDefault(require("./routes/auth.routes"));
-dotenv_1.default.config();
-const app = (0, express_1.default)();
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import authRoutes from "./routes/auth.routes.js";
+dotenv.config();
+const app = express();
 /**
  * CORS:
  * - En local permite localhost:5173/5174
@@ -24,13 +19,13 @@ const allowedOrigins = process.env.CORS_ORIGIN
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ];
-app.use((0, cors_1.default)({
+app.use(cors({
     origin: allowedOrigins,
     credentials: true,
 }));
-app.use(express_1.default.json());
+app.use(express.json());
 // Rutas
-app.use("/auth", auth_routes_1.default);
+app.use("/auth", authRoutes);
 app.get("/", (req, res) => {
     res.send("TPTech Backend OK 🚀");
 });

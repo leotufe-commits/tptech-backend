@@ -1,22 +1,16 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendResetEmail = sendResetEmail;
-const nodemailer_1 = __importDefault(require("nodemailer"));
+import nodemailer from "nodemailer";
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined;
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = process.env.SMTP_PASS;
-async function sendResetEmail(to, resetLink) {
+export async function sendResetEmail(to, resetLink) {
     // Si no hay SMTP configurado, imprimimos el link en consola (DEV)
     if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
         console.log("📩 [DEV] Reset link para:", to);
         console.log("🔗", resetLink);
         return;
     }
-    const transporter = nodemailer_1.default.createTransport({
+    const transporter = nodemailer.createTransport({
         host: SMTP_HOST,
         port: SMTP_PORT,
         secure: SMTP_PORT === 465,
