@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relación 1-1 con la joyería
+  jewelry   Jewelry?
+}
+
+model Jewelry {
+  id String @id @default(cuid())
+
+  // Nombre de la joyería
+  name String
+
+  // Responsable
+  firstName String
+  lastName  String
+
+  // Teléfono
+  phoneCountry String
+  phoneNumber  String
+
+  // Dirección
+  street     String
+  number     String
+  city       String
+  province   String
+  postalCode String
+  country    String
+
+  // Relación con User (1-1)
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
