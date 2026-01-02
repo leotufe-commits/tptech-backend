@@ -3,11 +3,19 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+
+    "rootDir": "src",
+    "outDir": "dist",
+
     "strict": true,
     "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+
     "esModuleInterop": true,
-    "outDir": "dist",
-    "rootDir": "src"
+    "resolveJsonModule": true,
+
+    "sourceMap": true
   },
-  "include": ["src", "prisma"]
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "prisma"]
 }
