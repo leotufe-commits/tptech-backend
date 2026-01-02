@@ -3,7 +3,6 @@ import type { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
-import { UserStatus } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
 import { requireAuth } from "../middlewares/requireAuth.js";
@@ -50,21 +49,21 @@ const registerSchema = z.object({
   city: z.string().min(1),
   province: z.string().min(1),
   postalCode: z.string().min(1),
-  country: z.string().min(1)
+  country: z.string().min(1),
 });
 
 const loginSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(1)
+  password: z.string().min(1),
 });
 
 const forgotSchema = z.object({
-  email: z.string().email()
+  email: z.string().email(),
 });
 
 const resetSchema = z.object({
   token: z.string().min(10),
-  newPassword: z.string().min(6)
+  newPassword: z.string().min(6),
 });
 
 const updateJewelrySchema = z.object({
@@ -81,7 +80,7 @@ const updateJewelrySchema = z.object({
   city: z.string().min(1),
   province: z.string().min(1),
   postalCode: z.string().min(1),
-  country: z.string().min(1)
+  country: z.string().min(1),
 });
 
 /* ===========================
@@ -93,17 +92,19 @@ router.get("/me", requireAuth, async (req, res) => {
   const userId = req.userId!;
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    include: { jewelry: true }
+    include: { jewelry: true },
   });
 
-  if (!user) return res.status(404).json({ message: "User not found." });
+  if (!user) {
+    return res.status(404).json({ message: "User not found." });
+  }
 
   const safeUser: any = { ...user };
   delete safeUser.password;
 
   return res.json({
     user: safeUser,
-    jewelry: user.jewelry ?? null
+    jewelry: user.jewelry ?? null,
   });
 });
 
@@ -115,10 +116,12 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
 
     const me = await prisma.user.findUnique({
       where: { id: userId },
-      select: { jewelryId: true }
+      select: { jewelryId: true },
     });
 
-    if (!me) return res.status(404).json({ message: "User not found." });
+    if (!me) {
+      return res.status(404).json({ message: "User not found." });
+    }
 
     const updated = await prisma.jewelry.update({
       where: { id: me.jewelryId },
@@ -133,14 +136,17 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
         city: data.city.trim(),
         province: data.province.trim(),
         postalCode: data.postalCode.trim(),
-        country: data.country.trim()
-      }
+        country: data.country.trim(),
+      },
     });
 
     return res.json(updated);
   } catch (err: any) {
     if (err?.name === "ZodError") {
-      return res.status(400).json({ message: "Datos inválidos.", issues: err.issues });
+      return res.status(400).json({
+        message: "Datos inválidos.",
+        issues: err.issues,
+      });
     }
     console.error(err);
     return res.status(500).json({ message: "Error interno." });
@@ -172,8 +178,8 @@ router.post("/register", async (req, res) => {
         city: data.city.trim(),
         province: data.province.trim(),
         postalCode: data.postalCode.trim(),
-        country: data.country.trim()
-      }
+        country: data.country.trim(),
+      },
     });
 
     const user = await tx.user.create({
@@ -181,10 +187,10 @@ router.post("/register", async (req, res) => {
         email,
         password: hashed,
         name: `${data.firstName.trim()} ${data.lastName.trim()}`.trim(),
-        status: UserStatus.ACTIVE,
-        jewelryId: jewelry.id
+        status: "ACTIVE", // ✅ STRING, matchea con la DB
+        jewelryId: jewelry.id,
       },
-      include: { jewelry: true }
+      include: { jewelry: true },
     });
 
     return { user, jewelry };
@@ -198,7 +204,7 @@ router.post("/register", async (req, res) => {
   return res.status(201).json({
     user: safeUser,
     jewelry: result.jewelry,
-    token
+    token,
   });
 });
 
@@ -209,11 +215,16 @@ router.post("/login", async (req, res) => {
 
   const user = await prisma.user.findUnique({
     where: { email },
-    include: { jewelry: true }
+    include: { jewelry: true },
   });
 
   if (!user) {
     return res.status(401).json({ message: "Email o contraseña incorrectos." });
+  }
+
+  // ✅ bloqueo de usuarios no activos
+  if (user.status !== "ACTIVE") {
+    return res.status(403).json({ message: "Usuario no habilitado." });
   }
 
   const ok = await bcrypt.compare(data.password, user.password);
@@ -229,7 +240,7 @@ router.post("/login", async (req, res) => {
   return res.json({
     user: safeUser,
     jewelry: user.jewelry ?? null,
-    token
+    token,
   });
 });
 
@@ -247,7 +258,9 @@ router.post("/forgot-password", async (req, res) => {
     { expiresIn: "30m" }
   );
 
-  const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
+  const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(
+    resetToken
+  )}`;
   await sendResetEmail(email, resetLink);
 
   return res.json({ ok: true });
@@ -266,7 +279,7 @@ router.post("/reset-password", async (req, res) => {
 
   await prisma.user.update({
     where: { id: String(payload.sub) },
-    data: { password: newHash }
+    data: { password: newHash },
   });
 
   return res.json({ ok: true });
