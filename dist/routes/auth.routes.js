@@ -2,13 +2,16 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
+import { UserStatus } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
 import { requireAuth } from "../middlewares/requireAuth.js";
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
+const JWT_SECRET = process.env.JWT_SECRET ?? "";
 const APP_URL = process.env.APP_URL || "http://localhost:5174"; // Front
 function signToken(userId) {
+    if (!JWT_SECRET)
+        throw new Error("JWT_SECRET no está configurado");
     return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: "7d" });
 }
 /* ===========================
@@ -27,18 +30,18 @@ const registerSchema = z.object({
     city: z.string().min(1),
     province: z.string().min(1),
     postalCode: z.string().min(1),
-    country: z.string().min(1),
+    country: z.string().min(1)
 });
 const loginSchema = z.object({
     email: z.string().email(),
-    password: z.string().min(1),
+    password: z.string().min(1)
 });
 const forgotSchema = z.object({
-    email: z.string().email(),
+    email: z.string().email()
 });
 const resetSchema = z.object({
     token: z.string().min(10),
-    newPassword: z.string().min(6),
+    newPassword: z.string().min(6)
 });
 const updateJewelrySchema = z.object({
     name: z.string().min(1),
@@ -51,7 +54,7 @@ const updateJewelrySchema = z.object({
     city: z.string().min(1),
     province: z.string().min(1),
     postalCode: z.string().min(1),
-    country: z.string().min(1),
+    country: z.string().min(1)
 });
 /* ===========================
    ROUTES
@@ -62,15 +65,16 @@ router.get("/me", requireAuth, async (req, res) => {
         const userId = req.userId;
         const user = await prisma.user.findUnique({
             where: { id: userId },
-            include: { jewelry: true },
+            include: { jewelry: true }
         });
-        if (!user) {
+        if (!user)
             return res.status(404).json({ message: "User not found." });
-        }
-        const { password, ...safeUser } = user;
+        // nunca devolver password
+        const safeUser = { ...user };
+        delete safeUser.password;
         return res.json({
             user: safeUser,
-            jewelry: user.jewelry ?? null,
+            jewelry: user.jewelry ?? null
         });
     }
     catch (err) {
@@ -83,8 +87,14 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
     try {
         const userId = req.userId;
         const data = updateJewelrySchema.parse(req.body);
+        const me = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { jewelryId: true }
+        });
+        if (!me)
+            return res.status(404).json({ message: "User not found." });
         const updated = await prisma.jewelry.update({
-            where: { userId },
+            where: { id: me.jewelryId },
             data: {
                 name: data.name.trim(),
                 firstName: data.firstName.trim(),
@@ -96,8 +106,8 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
                 city: data.city.trim(),
                 province: data.province.trim(),
                 postalCode: data.postalCode.trim(),
-                country: data.country.trim(),
-            },
+                country: data.country.trim()
+            }
         });
         return res.json(updated);
     }
@@ -123,13 +133,6 @@ router.post("/register", async (req, res) => {
         }
         const hashed = await bcrypt.hash(data.password, 10);
         const result = await prisma.$transaction(async (tx) => {
-            const user = await tx.user.create({
-                data: {
-                    email,
-                    password: hashed,
-                    name: `${data.firstName} ${data.lastName}`.trim(),
-                },
-            });
             const jewelry = await tx.jewelry.create({
                 data: {
                     name: data.jewelryName.trim(),
@@ -142,17 +145,28 @@ router.post("/register", async (req, res) => {
                     city: data.city.trim(),
                     province: data.province.trim(),
                     postalCode: data.postalCode.trim(),
-                    country: data.country.trim(),
-                    userId: user.id,
+                    country: data.country.trim()
+                }
+            });
+            const user = await tx.user.create({
+                data: {
+                    email,
+                    password: hashed, // ✅ tu schema usa "password"
+                    name: `${data.firstName.trim()} ${data.lastName.trim()}`.trim(),
+                    status: UserStatus.ACTIVE,
+                    jewelryId: jewelry.id
                 },
+                include: { jewelry: true }
             });
             return { user, jewelry };
         });
         const token = signToken(result.user.id);
+        const safeUser = { ...result.user };
+        delete safeUser.password;
         return res.status(201).json({
-            user: result.user,
+            user: safeUser,
             jewelry: result.jewelry,
-            token,
+            token
         });
     }
     catch (err) {
@@ -173,7 +187,7 @@ router.post("/login", async (req, res) => {
         const email = data.email.toLowerCase().trim();
         const user = await prisma.user.findUnique({
             where: { email },
-            include: { jewelry: true },
+            include: { jewelry: true }
         });
         if (!user) {
             return res.status(401).json({ message: "Email o contraseña incorrectos." });
@@ -183,26 +197,33 @@ router.post("/login", async (req, res) => {
             return res.status(401).json({ message: "Email o contraseña incorrectos." });
         }
         const token = signToken(user.id);
+        const safeUser = { ...user };
+        delete safeUser.password;
         return res.json({
-            user: { id: user.id, email: user.email, name: user.name },
+            user: safeUser,
             jewelry: user.jewelry ?? null,
-            token,
+            token
         });
     }
     catch (err) {
-        console.error(err);
-        return res.status(500).json({ message: "Error interno." });
+        console.error("🔥 LOGIN ERROR:", err);
+        return res.status(500).json({ message: "Error interno login" });
     }
 });
 /** POST /auth/forgot-password */
 router.post("/forgot-password", async (req, res) => {
     try {
+        if (!JWT_SECRET)
+            return res.status(500).json({ message: "JWT_SECRET no configurado" });
         const data = forgotSchema.parse(req.body);
         const email = data.email.toLowerCase().trim();
         const user = await prisma.user.findUnique({ where: { email } });
+        // anti-enumeración
         if (!user)
             return res.json({ ok: true });
-        const resetToken = jwt.sign({ sub: user.id, type: "reset" }, JWT_SECRET, { expiresIn: "30m" });
+        const resetToken = jwt.sign({ sub: user.id, type: "reset" }, JWT_SECRET, {
+            expiresIn: "30m"
+        });
         const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
         await sendResetEmail(email, resetLink);
         return res.json({ ok: true });
@@ -215,15 +236,17 @@ router.post("/forgot-password", async (req, res) => {
 /** POST /auth/reset-password */
 router.post("/reset-password", async (req, res) => {
     try {
+        if (!JWT_SECRET)
+            return res.status(500).json({ message: "JWT_SECRET no configurado" });
         const data = resetSchema.parse(req.body);
         const payload = jwt.verify(data.token, JWT_SECRET);
         if (!payload?.sub || payload?.type !== "reset") {
             return res.status(401).json({ message: "Token inválido." });
         }
-        const hashed = await bcrypt.hash(data.newPassword, 10);
+        const newHash = await bcrypt.hash(data.newPassword, 10);
         await prisma.user.update({
             where: { id: String(payload.sub) },
-            data: { password: hashed },
+            data: { password: newHash } // ✅ tu schema usa "password"
         });
         return res.json({ ok: true });
     }
@@ -233,3 +256,4 @@ router.post("/reset-password", async (req, res) => {
     }
 });
 export default router;
+//# sourceMappingURL=auth.routes.js.map

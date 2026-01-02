@@ -1,12 +1,9 @@
-import { Request, Response, NextFunction } from "express";
-import jwt, { JwtPayload } from "jsonwebtoken";
+import type { Request, Response, NextFunction } from "express";
+import jwt, { type JwtPayload } from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET;
-
-if (!JWT_SECRET) {
-  throw new Error("❌ JWT_SECRET no está definido en las variables de entorno");
-}
-
+/**
+ * Extensión del Request de Express
+ */
 declare global {
   namespace Express {
     interface Request {
@@ -15,11 +12,18 @@ declare global {
   }
 }
 
-export function requireAuth(
-  req: Request,
-  res: Response,
-  next: NextFunction
-) {
+/**
+ * Middleware de autenticación JWT
+ */
+export function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const JWT_SECRET = process.env.JWT_SECRET;
+
+  if (!JWT_SECRET) {
+    return res.status(500).json({
+      message: "JWT_SECRET no está definido en el servidor"
+    });
+  }
+
   try {
     const authHeader = req.headers.authorization;
 
@@ -40,9 +44,9 @@ export function requireAuth(
     }
 
     req.userId = payload.sub;
-    next();
-  } catch (err) {
-    console.error("🔒 AUTH ERROR:", err);
+    return next();
+  } catch (error) {
+    console.error("🔒 AUTH ERROR:", error);
     return res.status(401).json({ message: "Token inválido o expirado" });
   }
 }

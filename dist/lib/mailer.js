@@ -24,3 +24,4 @@ export async function sendResetEmail(to, resetLink) {
         html: `<p>Abrí este link para restablecer tu contraseña:</p><p><a href="${resetLink}">${resetLink}</a></p>`,
     });
 }
+//# sourceMappingURL=mailer.js.map
