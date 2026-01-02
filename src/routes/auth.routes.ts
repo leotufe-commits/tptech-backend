@@ -1,11 +1,11 @@
 import { Router } from "express";
-import type { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
 import { requireAuth } from "../middlewares/requireAuth.js";
+import { UserStatus } from "@prisma/client";
 
 const router = Router();
 
@@ -95,9 +95,7 @@ router.get("/me", requireAuth, async (req, res) => {
     include: { jewelry: true },
   });
 
-  if (!user) {
-    return res.status(404).json({ message: "User not found." });
-  }
+  if (!user) return res.status(404).json({ message: "User not found." });
 
   const safeUser: any = { ...user };
   delete safeUser.password;
@@ -119,9 +117,7 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
       select: { jewelryId: true },
     });
 
-    if (!me) {
-      return res.status(404).json({ message: "User not found." });
-    }
+    if (!me) return res.status(404).json({ message: "User not found." });
 
     const updated = await prisma.jewelry.update({
       where: { id: me.jewelryId },
@@ -143,10 +139,9 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
     return res.json(updated);
   } catch (err: any) {
     if (err?.name === "ZodError") {
-      return res.status(400).json({
-        message: "Datos inválidos.",
-        issues: err.issues,
-      });
+      return res
+        .status(400)
+        .json({ message: "Datos inválidos.", issues: err.issues });
     }
     console.error(err);
     return res.status(500).json({ message: "Error interno." });
@@ -187,7 +182,7 @@ router.post("/register", async (req, res) => {
         email,
         password: hashed,
         name: `${data.firstName.trim()} ${data.lastName.trim()}`.trim(),
-        status: "ACTIVE", // ✅ STRING, matchea con la DB
+        status: UserStatus.ACTIVE,
         jewelryId: jewelry.id,
       },
       include: { jewelry: true },
@@ -222,8 +217,8 @@ router.post("/login", async (req, res) => {
     return res.status(401).json({ message: "Email o contraseña incorrectos." });
   }
 
-  // ✅ bloqueo de usuarios no activos
-  if (user.status !== "ACTIVE") {
+  // ✅ bloquear usuarios no activos
+  if (user.status !== UserStatus.ACTIVE) {
     return res.status(403).json({ message: "Usuario no habilitado." });
   }
 
@@ -252,11 +247,9 @@ router.post("/forgot-password", async (req, res) => {
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user) return res.json({ ok: true });
 
-  const resetToken = jwt.sign(
-    { sub: user.id, type: "reset" },
-    JWT_SECRET_SAFE,
-    { expiresIn: "30m" }
-  );
+  const resetToken = jwt.sign({ sub: user.id, type: "reset" }, JWT_SECRET_SAFE, {
+    expiresIn: "30m",
+  });
 
   const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(
     resetToken

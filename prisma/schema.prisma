@@ -11,23 +11,18 @@ datasource db {
  * =========================
  * ENUMS
  * =========================
- *
- * (Opcional) Podés dejarlo si querés usarlo más adelante,
- * pero ahora NO lo usamos para evitar mismatch con la DB.
  */
-
-// enum UserStatus {
-//   ACTIVE
-//   PENDING
-//   BLOCKED
-// }
+enum UserStatus {
+  ACTIVE
+  PENDING
+  BLOCKED
+}
 
 /**
  * =========================
  * JOYERÍA (EMPRESA)
  * =========================
  */
-
 model Jewelry {
   id           String @id @default(cuid())
   name         String
@@ -53,15 +48,12 @@ model Jewelry {
  * USUARIOS
  * =========================
  */
-
 model User {
-  id       String  @id @default(cuid())
-  email    String  @unique
+  id       String     @id @default(cuid())
+  email    String     @unique
   password String
   name     String?
-
-  // ✅ Ahora matchea con Postgres (TEXT)
-  status   String  @default("ACTIVE")
+  status   UserStatus @default(ACTIVE)
 
   jewelryId String
 
