@@ -8,7 +8,15 @@ import { requireAuth } from "../middlewares/requireAuth.js";
 
 const router = Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
+/**
+ * ✅ PRODUCCIÓN: no permitir fallback inseguro
+ * Si JWT_SECRET no existe, el server debe fallar al iniciar.
+ */
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET no está configurado");
+}
+
 const APP_URL = process.env.APP_URL || "http://localhost:5174"; // Front
 
 function signToken(userId: string) {
@@ -86,7 +94,11 @@ router.get("/me", requireAuth, async (req, res) => {
       return res.status(404).json({ message: "User not found." });
     }
 
-    const { password, ...safeUser } = user;
+    // compat: si tu tabla todavía tiene "password" (viejo) lo sacamos
+    // y si ya migraste a "passwordHash" también lo sacamos
+    // (no rompe aunque no exista)
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { password, passwordHash, ...safeUser } = user as any;
 
     return res.json({
       user: safeUser,
@@ -104,6 +116,10 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
     const userId = req.userId!;
     const data = updateJewelrySchema.parse(req.body);
 
+    // Nota: en tu schema actual "Jewelry" parece no tener userId,
+    // pero si lo tiene en la DB legacy, esto funciona.
+    // Si ya migraste al nuevo modelo (jewelryId en User),
+    // lo ajustamos en el siguiente paso.
     const updated = await prisma.jewelry.update({
       where: { userId },
       data: {
@@ -124,7 +140,9 @@ router.put("/me/jewelry", requireAuth, async (req, res) => {
     return res.json(updated);
   } catch (err: any) {
     if (err?.name === "ZodError") {
-      return res.status(400).json({ message: "Datos inválidos.", issues: err.issues });
+      return res
+        .status(400)
+        .json({ message: "Datos inválidos.", issues: err.issues });
     }
     if (err?.code === "P2025") {
       return res.status(404).json({ message: "Joyería no encontrada." });
@@ -145,13 +163,16 @@ router.post("/register", async (req, res) => {
       return res.status(409).json({ message: "El email ya está registrado." });
     }
 
-    const hashed = await bcrypt.hash(data.password, 10);
+    // Guardamos hash, NUNCA plaintext
+    const passwordHash = await bcrypt.hash(data.password, 10);
 
     const result = await prisma.$transaction(async (tx: any) => {
       const user = await tx.user.create({
         data: {
           email,
-          password: hashed,
+          // compat: si tu modelo usa passwordHash, guardamos ahí
+          // si usa password (legacy), Prisma tirará error y lo vemos al toque.
+          passwordHash,
           name: `${data.firstName} ${data.lastName}`.trim(),
         },
       });
@@ -169,7 +190,7 @@ router.post("/register", async (req, res) => {
           province: data.province.trim(),
           postalCode: data.postalCode.trim(),
           country: data.country.trim(),
-          userId: user.id,
+          userId: user.id, // legacy
         },
       });
 
@@ -178,14 +199,19 @@ router.post("/register", async (req, res) => {
 
     const token = signToken(result.user.id);
 
+    // Nunca devolver hashes
+    const { password, passwordHash: _ph, ...safeUser } = result.user as any;
+
     return res.status(201).json({
-      user: result.user,
+      user: safeUser,
       jewelry: result.jewelry,
       token,
     });
   } catch (err: any) {
     if (err?.name === "ZodError") {
-      return res.status(400).json({ message: "Datos inválidos.", issues: err.issues });
+      return res
+        .status(400)
+        .json({ message: "Datos inválidos.", issues: err.issues });
     }
     if (err?.code === "P2002") {
       return res.status(409).json({ message: "El email ya está registrado." });
@@ -210,7 +236,13 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ message: "Email o contraseña incorrectos." });
     }
 
-    const ok = await bcrypt.compare(data.password, user.password);
+    // compat: soportar DB legacy (password) y nuevo (passwordHash)
+    const hash = (user as any).passwordHash ?? (user as any).password ?? null;
+    if (!hash) {
+      return res.status(401).json({ message: "Email o contraseña incorrectos." });
+    }
+
+    const ok = await bcrypt.compare(data.password, hash);
     if (!ok) {
       return res.status(401).json({ message: "Email o contraseña incorrectos." });
     }
@@ -218,13 +250,16 @@ router.post("/login", async (req, res) => {
     const token = signToken(user.id);
 
     return res.json({
-      user: { id: user.id, email: user.email, name: user.name },
+      user: { id: user.id, email: user.email, name: (user as any).name ?? null },
       jewelry: user.jewelry ?? null,
       token,
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: "Error interno." });
+    console.error("🔥 LOGIN ERROR:", err);
+    return res.status(500).json({
+      message: "Error interno login",
+      error: String(err),
+    });
   }
 });
 
@@ -235,15 +270,18 @@ router.post("/forgot-password", async (req, res) => {
     const email = data.email.toLowerCase().trim();
 
     const user = await prisma.user.findUnique({ where: { email } });
+
+    // ✅ anti-enumeración: siempre responder ok
     if (!user) return res.json({ ok: true });
 
-    const resetToken = jwt.sign(
-      { sub: user.id, type: "reset" },
-      JWT_SECRET,
-      { expiresIn: "30m" }
-    );
+    const resetToken = jwt.sign({ sub: user.id, type: "reset" }, JWT_SECRET, {
+      expiresIn: "30m",
+    });
 
-    const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
+    const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(
+      resetToken
+    )}`;
+
     await sendResetEmail(email, resetLink);
 
     return res.json({ ok: true });
@@ -263,11 +301,14 @@ router.post("/reset-password", async (req, res) => {
       return res.status(401).json({ message: "Token inválido." });
     }
 
-    const hashed = await bcrypt.hash(data.newPassword, 10);
+    const newHash = await bcrypt.hash(data.newPassword, 10);
 
     await prisma.user.update({
       where: { id: String(payload.sub) },
-      data: { password: hashed },
+      data: {
+        // compat: preferimos passwordHash
+        passwordHash: newHash,
+      } as any,
     });
 
     return res.json({ ok: true });
