@@ -1,3 +1,4 @@
+// src/modules/movimientos/movimientos.routes.ts
 import { Router } from "express";
 
 const router = Router();
