@@ -1,7 +1,7 @@
 import { Router } from "express";
-import authRoutes from "../modules/auth/auth.routes.js";
-import movimientosRoutes from "../modules/movimientos/movimientos.routes.js";
-import { requireAuth } from "../middlewares/requireAuth.js";
+import usersRoutes from "./users.routes";
+import rolesRoutes from "./roles.routes";
+import requireTenant from "../middlewares/requireTenant";
 
 const router = Router();
 
