@@ -1,4 +1,3 @@
-// src/config/cors.ts
 import cors, { type CorsOptions } from "cors";
 
 function parseEnvOrigins(raw: string | undefined) {
@@ -22,16 +21,17 @@ export function buildCorsMiddleware() {
 
   const options: CorsOptions = {
     origin: (origin, callback) => {
-      // server-to-server / healthchecks sin origin
       if (!origin) return callback(null, true);
-
       if (allowedOrigins.has(origin)) return callback(null, true);
-
-      return callback(new Error(`CORS bloqueado para origin: ${origin}`));
+      return callback(null, false);
     },
+
     credentials: true,
+
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+
+    optionsSuccessStatus: 204,
   };
 
   return cors(options);

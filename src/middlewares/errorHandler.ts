@@ -1,11 +1,18 @@
 // src/middlewares/errorHandler.ts
-import type { Request, Response, NextFunction } from "express";
+import type { ErrorRequestHandler } from "express";
 
-export function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction) {
-  console.error("🔥 APP ERROR:", err);
+export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  console.error("❌ ERROR:", err);
 
-  const msg = err?.message || "Error interno.";
-  const status = String(msg).startsWith("CORS bloqueado") ? 403 : 500;
+  const status =
+    typeof (err as any)?.status === "number"
+      ? (err as any).status
+      : typeof (err as any)?.statusCode === "number"
+        ? (err as any).statusCode
+        : 500;
 
-  return res.status(status).json({ message: msg });
-}
+  const message =
+    typeof (err as any)?.message === "string" ? (err as any).message : "Internal Server Error";
+
+  res.status(status).json({ ok: false, message });
+};

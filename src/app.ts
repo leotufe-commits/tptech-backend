@@ -1,17 +1,19 @@
-// src/app.ts
+// BACKEND
+// tptech-backend/src/app.ts
 import express from "express";
+import cookieParser from "cookie-parser";
 
-import routes from "./routes/index.js";
-import { requestContextMiddleware } from "./lib/prisma.js";
-import { errorHandler } from "./middlewares/errorHandler.js";
-import { buildCorsMiddleware } from "./config/cors.js";
-import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/security.js";
+import routes from "./routes";
+import { requestContextMiddleware } from "./lib/prisma";
+import { errorHandler } from "./middlewares/errorHandler";
+import { buildCorsMiddleware } from "./config/cors";
+import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/security";
 
 export function createApp() {
   const app = express();
 
   /* =====================
-     Seguridad básica (headers)
+     Seguridad básica
   ===================== */
   app.disable("x-powered-by");
   app.use(buildHelmetMiddleware());
@@ -22,23 +24,24 @@ export function createApp() {
   app.set("trust proxy", 1);
 
   /* =====================
-     Body parser
+     Parsers
   ===================== */
   app.use(express.json({ limit: "1mb" }));
+  app.use(cookieParser());
 
   /* =====================
      Request Context (ALS)
-     ⚠️ debe ir ANTES de rutas
+     ⚠️ ANTES de rutas
   ===================== */
   app.use(requestContextMiddleware);
 
   /* =====================
-     CORS
+     CORS (con credentials)
   ===================== */
   app.use(buildCorsMiddleware());
 
   /* =====================
-     Health check (sin rate limit)
+     Health check
   ===================== */
   app.get("/health", (_req, res) => {
     res.status(200).json({ ok: true, service: "tptech-backend" });
@@ -62,7 +65,7 @@ export function createApp() {
   });
 
   /* =====================
-     Error handler (JSON)
+     Error handler
   ===================== */
   app.use(errorHandler);
 
