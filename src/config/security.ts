@@ -1,7 +1,7 @@
 // src/config/security.ts
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import helmet from "helmet";
-import type { RequestHandler } from "express";
+import type { RequestHandler, Request } from "express";
 
 const isProd = process.env.NODE_ENV === "production";
 
@@ -17,6 +17,12 @@ export function buildHelmetMiddleware(): RequestHandler {
   });
 }
 
+function getClientIp(req: Request) {
+  // con app.set("trust proxy", 1) esto suele venir correcto
+  // garantizamos string para ipKeyGenerator
+  return String(req.ip || "");
+}
+
 export function buildRateLimitMiddleware(): RequestHandler {
   return rateLimit({
     windowMs: 15 * 60 * 1000, // 15 min
@@ -25,8 +31,9 @@ export function buildRateLimitMiddleware(): RequestHandler {
     standardHeaders: true,
     legacyHeaders: false,
 
-    // ✅ helper oficial para soportar IPv6 correctamente
-    keyGenerator: ipKeyGenerator,
+    // ✅ FIX TS: keyGenerator debe recibir Request (y opcional Response)
+    // y devolver string. Adaptamos ipKeyGenerator.
+    keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
 
     message: { message: "Demasiadas solicitudes. Intentá de nuevo más tarde." },
   });

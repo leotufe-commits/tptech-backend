@@ -1,8 +1,7 @@
-// BACKEND
 // tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { prisma, setContextTenantId, setContextUserId, clearRequestContext } from "../lib/prisma";
+import { prisma, setContextTenantId, setContextUserId, clearRequestContext } from "../lib/prisma.js";
 import { UserStatus } from "@prisma/client";
 
 /**

@@ -1,13 +1,12 @@
-// BACKEND
 // tptech-backend/src/app.ts
 import express from "express";
 import cookieParser from "cookie-parser";
 
-import routes from "./routes";
-import { requestContextMiddleware } from "./lib/prisma";
-import { errorHandler } from "./middlewares/errorHandler";
-import { buildCorsMiddleware } from "./config/cors";
-import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/security";
+import routes from "./routes/index.js";
+import { requestContextMiddleware } from "./lib/prisma.js";
+import { errorHandler } from "./middlewares/errorHandler.js";
+import { buildCorsMiddleware } from "./config/cors.js";
+import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/security.js";
 
 export function createApp() {
   const app = express();
