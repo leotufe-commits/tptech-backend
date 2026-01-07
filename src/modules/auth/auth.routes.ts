@@ -24,6 +24,9 @@ const router = Router();
    ROUTES
 =========================== */
 
+// ✅ logout (evita 404 y queda protegido)
+router.post("/logout", requireAuth, Auth.logout);
+
 router.get("/me", requireAuth, Auth.me);
 
 router.put(
@@ -36,9 +39,6 @@ router.put(
 router.post("/register", validateBody(registerSchema), Auth.register);
 
 router.post("/login", authLoginLimiter, validateBody(loginSchema), Auth.login);
-
-// ✅ Logout (para que deje de dar 404)
-router.post("/logout", Auth.logout);
 
 router.post(
   "/forgot-password",
