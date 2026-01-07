@@ -7,6 +7,7 @@ import { UserStatus } from "@prisma/client";
 /**
  * GET /users
  * Devuelve usuarios del tenant + roles (para UI)
+ * (Listado liviano: SIN overrides)
  */
 export async function listUsers(req: Request, res: Response) {
   const tenantId = req.tenantId!;
@@ -47,6 +48,63 @@ export async function listUsers(req: Request, res: Response) {
         isSystem: ur.role.isSystem,
       })),
     })),
+  });
+}
+
+/**
+ * GET /users/:id
+ * Detalle (incluye overrides)
+ */
+export async function getUser(req: Request, res: Response) {
+  const tenantId = req.tenantId!;
+  const targetUserId = String(req.params.id);
+
+  const user = await prisma.user.findFirst({
+    where: { id: targetUserId, jewelryId: tenantId },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      status: true,
+      avatarUrl: true,
+      favoriteWarehouseId: true,
+      createdAt: true,
+      updatedAt: true,
+      roles: {
+        select: {
+          role: { select: { id: true, name: true, isSystem: true } },
+        },
+      },
+      permissionOverrides: {
+        select: {
+          permissionId: true,
+          effect: true,
+        },
+      },
+    },
+  });
+
+  if (!user) {
+    return res.status(404).json({ message: "Usuario no encontrado." });
+  }
+
+  return res.json({
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      status: user.status,
+      avatarUrl: user.avatarUrl,
+      favoriteWarehouseId: user.favoriteWarehouseId,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      roles: (user.roles ?? []).map((ur) => ({
+        id: ur.role.id,
+        name: ur.role.name,
+        isSystem: ur.role.isSystem,
+      })),
+      permissionOverrides: user.permissionOverrides ?? [],
+    },
   });
 }
 
@@ -117,6 +175,13 @@ export async function assignRolesToUser(req: Request, res: Response) {
     return res.status(400).json({ message: "roleIds debe ser un array" });
   }
 
+  // ✅ no permitir auto-edición de roles (evita lock-out)
+  if (targetUserId === actorId) {
+    return res.status(400).json({
+      message: "No podés cambiar tus propios roles desde aquí.",
+    });
+  }
+
   const target = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId },
     select: { id: true },
@@ -155,6 +220,13 @@ export async function assignRolesToUser(req: Request, res: Response) {
       skipDuplicates: true,
     });
   }
+
+  // ✅ invalida sesiones/permisos cacheados
+  await prisma.user.update({
+    where: { id: targetUserId },
+    data: { tokenVersion: { increment: 1 } },
+    select: { id: true },
+  });
 
   auditLog(req, {
     action: "users.assign_roles",
@@ -212,6 +284,13 @@ export async function setUserOverride(req: Request, res: Response) {
     update: { effect },
   });
 
+  // ✅ invalida sesiones/permisos cacheados
+  await prisma.user.update({
+    where: { id: targetUserId },
+    data: { tokenVersion: { increment: 1 } },
+    select: { id: true },
+  });
+
   auditLog(req, {
     action: "users.set_override",
     success: true,
@@ -232,8 +311,25 @@ export async function removeUserOverride(req: Request, res: Response) {
   const targetUserId = String(req.params.id);
   const { permissionId } = req.params;
 
+  // ✅ validar pertenencia al tenant (multi-tenant safety)
+  const target = await prisma.user.findFirst({
+    where: { id: targetUserId, jewelryId: tenantId },
+    select: { id: true },
+  });
+
+  if (!target) {
+    return res.status(404).json({ message: "Usuario no encontrado." });
+  }
+
   await prisma.userPermissionOverride.deleteMany({
     where: { userId: targetUserId, permissionId },
+  });
+
+  // ✅ invalida sesiones/permisos cacheados
+  await prisma.user.update({
+    where: { id: targetUserId },
+    data: { tokenVersion: { increment: 1 } },
+    select: { id: true },
   });
 
   auditLog(req, {
