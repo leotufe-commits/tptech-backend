@@ -1,7 +1,12 @@
 // tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { prisma, setContextTenantId, setContextUserId, clearRequestContext } from "../lib/prisma.js";
+import {
+  prisma,
+  setContextTenantId,
+  setContextUserId,
+  clearRequestContext,
+} from "../lib/prisma.js";
 import { UserStatus } from "@prisma/client";
 
 /**
@@ -12,6 +17,8 @@ declare global {
     interface Request {
       userId?: string;
       tenantId?: string;
+      // ✅ para RBAC (cache por request desde requirePermission)
+      permissions?: string[];
     }
   }
 }
@@ -19,6 +26,7 @@ declare global {
 type AccessTokenPayload = {
   sub?: string;
   tenantId?: string;
+  tokenVersion?: number;
   iat?: number;
   exp?: number;
   iss?: string;
@@ -37,18 +45,16 @@ const AUTH_COOKIE = "tptech_session";
  * 2) Cookie httpOnly (fallback)
  */
 function getTokenFromRequest(req: Request): string | null {
-  // 1) Bearer token (prioridad)
+  // 1) Bearer token
   const raw = req.headers.authorization;
   if (raw && typeof raw === "string") {
     const parts = raw.trim().split(/\s+/);
-    if (parts.length >= 2) {
-      const type = parts[0]?.toLowerCase();
-      const token = parts[1];
-      if (type === "bearer" && token) return token;
+    if (parts.length === 2 && parts[0].toLowerCase() === "bearer") {
+      return parts[1];
     }
   }
 
-  // 2) Cookie (fallback)
+  // 2) Cookie
   const anyReq = req as any;
   const cookieToken = anyReq?.cookies?.[AUTH_COOKIE];
   if (cookieToken) return String(cookieToken);
@@ -63,7 +69,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     return res.status(500).json({ message: "JWT_SECRET no está definido en el servidor" });
   }
 
-  // ✅ Limpia el contexto ALS al finalizar el request
+  // Limpia el contexto ALS al finalizar el request
   res.on("finish", () => {
     try {
       clearRequestContext();
@@ -73,7 +79,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   try {
     const token = getTokenFromRequest(req);
     if (!token) {
-      return res.status(401).json({ message: "No autorizado (sin token)" });
+      return res.status(401).json({ code: "NO_TOKEN", message: "No autorizado" });
     }
 
     const payload = jwt.verify(token, JWT_SECRET, {
@@ -81,36 +87,46 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       audience: JWT_AUDIENCE,
     }) as AccessTokenPayload;
 
-    if (!payload?.sub || typeof payload.sub !== "string") {
-      return res.status(401).json({ message: "Token inválido" });
+    if (!payload.sub || !payload.tenantId) {
+      return res.status(401).json({ code: "TOKEN_INVALID", message: "Token inválido" });
     }
 
-    if (!payload?.tenantId || typeof payload.tenantId !== "string") {
-      return res.status(401).json({ message: "Token inválido (sin tenant)" });
+    if (typeof payload.tokenVersion !== "number") {
+      return res.status(401).json({ code: "TOKEN_INVALID", message: "Token inválido" });
     }
-
-    const userId = payload.sub;
-    const tokenTenantId = payload.tenantId;
 
     const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, status: true, jewelryId: true },
+      where: { id: payload.sub },
+      select: {
+        id: true,
+        status: true,
+        jewelryId: true,
+        tokenVersion: true,
+      },
     });
 
     if (!user) {
-      return res.status(401).json({ message: "Usuario no encontrado" });
+      return res.status(401).json({ code: "USER_NOT_FOUND", message: "Usuario no encontrado" });
     }
 
     if (user.status !== UserStatus.ACTIVE) {
-      return res.status(403).json({ message: "Usuario no habilitado" });
+      return res.status(403).json({ code: "USER_DISABLED", message: "Usuario no habilitado" });
     }
 
-    // 🔒 Multi-tenant: el tenant del token debe coincidir con el del usuario
-    if (user.jewelryId !== tokenTenantId) {
-      return res.status(401).json({ message: "Token inválido (tenant no coincide)" });
+    // Multi-tenant
+    if (user.jewelryId !== payload.tenantId) {
+      return res.status(401).json({ code: "TOKEN_INVALID", message: "Token inválido" });
     }
 
-    // Inyectamos contexto
+    // Invalidación inmediata
+    if (user.tokenVersion !== payload.tokenVersion) {
+      return res.status(401).json({
+        code: "SESSION_EXPIRED",
+        message: "Sesión expirada. Iniciá sesión nuevamente.",
+      });
+    }
+
+    // Inyectar contexto
     req.userId = user.id;
     req.tenantId = user.jewelryId;
 
@@ -118,7 +134,18 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     setContextTenantId(user.jewelryId);
 
     return next();
-  } catch {
-    return res.status(401).json({ message: "Token inválido o expirado" });
+  } catch (err: any) {
+    // Token expirado por tiempo
+    if (err?.name === "TokenExpiredError") {
+      return res.status(401).json({
+        code: "TOKEN_EXPIRED",
+        message: "Token expirado",
+      });
+    }
+
+    return res.status(401).json({
+      code: "TOKEN_INVALID",
+      message: "Token inválido",
+    });
   }
 }

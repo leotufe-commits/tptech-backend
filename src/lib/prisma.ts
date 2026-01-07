@@ -18,7 +18,7 @@ export function getRequestContext() {
 
 /**
  * Middleware que inicializa el contexto por request.
- * En index.ts va ANTES de tus rutas.
+ * En app.ts (o server.ts) va ANTES de tus rutas.
  */
 export function requestContextMiddleware(_req: any, _res: any, next: any) {
   als.run({ tenantId: undefined, userId: undefined }, () => next());
@@ -70,21 +70,41 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 /**
- * ✅ Multi-tenant enforcement (Prisma v6) via $extends
+ * ✅ Multi-tenant enforcement via $extends
  *
+ * Importante:
  * - NO tocamos: findUnique / update / delete (requieren where único)
  * - Forzamos tenant en:
- *   - findMany / findFirst
+ *   - findMany / findFirst / findFirstOrThrow
  *   - updateMany / deleteMany
  *   - create / createMany
+ *   - upsert (create + where)
+ *
+ * Nota: Permission es GLOBAL (catálogo) y NO tiene jewelryId -> no debe ir aquí.
  */
-const TENANT_MODELS = new Set<string>(["User", "Role", "Permission", "Warehouse"]);
+const TENANT_MODELS = new Set<string>([
+  "User",
+  "Role",
+  "Warehouse",
+  "UserRole",
+  "RolePermission",
+  "AuditLog",
+]);
 
 const TENANT_FIELD_BY_MODEL: Record<string, string> = {
   User: "jewelryId",
   Role: "jewelryId",
-  Permission: "jewelryId",
   Warehouse: "jewelryId",
+  AuditLog: "jewelryId",
+
+  // pivots: se filtran por el "lado" tenant
+  // - UserRole tiene userId/roleId; no tiene jewelryId.
+  // - RolePermission no tiene jewelryId.
+  // Para estos NO forzamos tenant directo (no existe campo), pero sí evitamos "leaks"
+  // usando constraints a nivel query donde corresponda (en services/controllers).
+  // Igual los dejamos en set por si más adelante agregás jewelryId.
+  UserRole: "",
+  RolePermission: "",
 };
 
 function isTenantModel(model?: string | undefined) {
@@ -92,14 +112,16 @@ function isTenantModel(model?: string | undefined) {
 }
 
 function tenantFieldFor(model: string) {
-  return TENANT_FIELD_BY_MODEL[model] || "jewelryId";
+  return TENANT_FIELD_BY_MODEL[model] ?? "jewelryId";
 }
 
 function mergeWhereWithTenant(where: any, tenantField: string, tenantId: string) {
+  if (!tenantField) return where ?? {};
   return { ...(where ?? {}), [tenantField]: tenantId };
 }
 
 function addTenantToCreateData(data: any, tenantField: string, tenantId: string) {
+  if (!tenantField) return data ?? {};
   return { ...(data ?? {}), [tenantField]: tenantId };
 }
 
@@ -115,21 +137,28 @@ export const prisma = basePrisma.$extends({
         // si no es modelo multi-tenant, no tocamos
         if (!isTenantModel(model)) return query(args);
 
-        const tenantField = tenantFieldFor(model!);
         const tenantId = ctx.tenantId;
+        const tenantField = tenantFieldFor(model!);
 
         const a: any = args ?? {};
 
-        if (operation === "findMany" || operation === "findFirst") {
+        // reads
+        if (
+          operation === "findMany" ||
+          operation === "findFirst" ||
+          operation === "findFirstOrThrow"
+        ) {
           a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
           return query(a);
         }
 
+        // bulk writes
         if (operation === "updateMany" || operation === "deleteMany") {
           a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
           return query(a);
         }
 
+        // creates
         if (operation === "create") {
           a.data = addTenantToCreateData(a.data, tenantField, tenantId);
           return query(a);
@@ -138,6 +167,13 @@ export const prisma = basePrisma.$extends({
         if (operation === "createMany") {
           const data = Array.isArray(a.data) ? a.data : [];
           a.data = data.map((row: any) => addTenantToCreateData(row, tenantField, tenantId));
+          return query(a);
+        }
+
+        // upsert: forzamos tenant en create, y también en where si aplica
+        if (operation === "upsert") {
+          a.create = addTenantToCreateData(a.create, tenantField, tenantId);
+          a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
           return query(a);
         }
 

@@ -37,6 +37,9 @@ router.post("/register", validateBody(registerSchema), Auth.register);
 
 router.post("/login", authLoginLimiter, validateBody(loginSchema), Auth.login);
 
+// ✅ Logout (para que deje de dar 404)
+router.post("/logout", Auth.logout);
+
 router.post(
   "/forgot-password",
   authForgotLimiter,

@@ -6,7 +6,7 @@ import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
-import { UserStatus } from "@prisma/client";
+import { UserStatus, OverrideEffect, PermModule, PermAction } from "@prisma/client";
 import { auditLog } from "../lib/auditLogger.js";
 
 /* =========================
@@ -27,8 +27,16 @@ const AUTH_COOKIE = "tptech_session";
 /* =========================
    HELPERS
 ========================= */
-function signToken(userId: string, tenantId: string) {
-  return jwt.sign({ sub: userId, tenantId }, JWT_SECRET_SAFE, {
+type AccessTokenPayload = {
+  sub: string;
+  tenantId: string;
+  tokenVersion: number;
+};
+
+function signToken(userId: string, tenantId: string, tokenVersion: number) {
+  const payload: AccessTokenPayload = { sub: userId, tenantId, tokenVersion };
+
+  return jwt.sign(payload, JWT_SECRET_SAFE, {
     expiresIn: "7d",
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
@@ -63,6 +71,49 @@ function clearAuthCookie(_req: Request, res: Response) {
   });
 }
 
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr));
+}
+
+function formatPerm(module: string, action: string) {
+  return `${module}:${action}`;
+}
+
+function computeEffectivePermissions(user: {
+  roles: Array<{
+    role: {
+      permissions: Array<{ permission: { module: any; action: any } }>;
+    };
+  }>;
+  permissionOverrides: Array<{ effect: OverrideEffect; permission: { module: any; action: any } }>;
+}) {
+  // 1) permisos por roles
+  const fromRoles: string[] = [];
+  for (const ur of user.roles ?? []) {
+    const rps = ur.role?.permissions ?? [];
+    for (const rp of rps) {
+      fromRoles.push(formatPerm(String(rp.permission.module), String(rp.permission.action)));
+    }
+  }
+
+  // 2) overrides
+  const allow: string[] = [];
+  const deny: string[] = [];
+  for (const ov of user.permissionOverrides ?? []) {
+    const p = formatPerm(String(ov.permission.module), String(ov.permission.action));
+    if (ov.effect === "ALLOW") allow.push(p);
+    if (ov.effect === "DENY") deny.push(p);
+  }
+
+  // 3) aplicar deny sobre roles y sobre allow
+  const base = new Set(uniq(fromRoles));
+  for (const d of deny) base.delete(d);
+  for (const a of allow) base.add(a);
+  for (const d of deny) base.delete(d);
+
+  return Array.from(base).sort();
+}
+
 /* =========================
    ME
 ========================= */
@@ -72,7 +123,22 @@ export async function me(req: Request, res: Response) {
 
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    include: { jewelry: true },
+    include: {
+      jewelry: true,
+      favoriteWarehouse: true,
+      roles: {
+        include: {
+          role: {
+            include: {
+              permissions: { include: { permission: true } },
+            },
+          },
+        },
+      },
+      permissionOverrides: {
+        include: { permission: true },
+      },
+    },
   });
 
   if (!user) return res.status(404).json({ message: "User not found." });
@@ -91,7 +157,26 @@ export async function me(req: Request, res: Response) {
   const safeUser: any = { ...user };
   delete safeUser.password;
 
-  return res.json({ user: safeUser, jewelry: user.jewelry ?? null });
+  // roles resumidos (lo que el front necesita)
+  const roles = (user.roles ?? []).map((ur) => ({
+    id: ur.roleId,
+    name: ur.role?.name,
+    isSystem: ur.role?.isSystem ?? false,
+  }));
+
+  const permissions = computeEffectivePermissions(user);
+
+  // NO devolvemos pivots crudos
+  delete safeUser.roles;
+  delete safeUser.permissionOverrides;
+
+  return res.json({
+    user: safeUser,
+    jewelry: user.jewelry ?? null,
+    roles,
+    permissions,
+    favoriteWarehouse: user.favoriteWarehouse ?? null,
+  });
 }
 
 /* =========================
@@ -137,7 +222,7 @@ export async function updateMyJewelry(req: Request, res: Response) {
 }
 
 /* =========================
-   REGISTER
+   REGISTER  ✅ (ACTUALIZADO)
 ========================= */
 export async function register(req: Request, res: Response) {
   const data = req.body as any;
@@ -155,7 +240,11 @@ export async function register(req: Request, res: Response) {
 
   const hashed = await bcrypt.hash(String(data.password), 10);
 
+  const ALL_MODULES = Object.values(PermModule);
+  const ALL_ACTIONS = Object.values(PermAction);
+
   const result = await prisma.$transaction(async (tx) => {
+    // 1) crear joyería
     const jewelry = await tx.jewelry.create({
       data: {
         name: data.jewelryName.trim(),
@@ -172,6 +261,69 @@ export async function register(req: Request, res: Response) {
       },
     });
 
+    // 2) asegurar catálogo global Permission (idempotente)
+    const permissionsData: { module: PermModule; action: PermAction }[] = [];
+    for (const module of ALL_MODULES) {
+      for (const action of ALL_ACTIONS) {
+        permissionsData.push({ module, action });
+      }
+    }
+
+    await tx.permission.createMany({
+      data: permissionsData,
+      skipDuplicates: true,
+    });
+
+    const allPermissions = await tx.permission.findMany();
+    const permIdByKey = new Map<string, string>();
+    for (const p of allPermissions) permIdByKey.set(`${p.module}:${p.action}`, p.id);
+
+    const pick = (modules: PermModule[], actions: PermAction[]) => {
+      const ids: string[] = [];
+      for (const m of modules) {
+        for (const a of actions) {
+          const id = permIdByKey.get(`${m}:${a}`);
+          if (id) ids.push(id);
+        }
+      }
+      return ids;
+    };
+
+    const OWNER_PERMS = allPermissions.map((p) => p.id);
+    const ADMIN_PERMS = pick(ALL_MODULES as PermModule[], ALL_ACTIONS as PermAction[]);
+    const STAFF_PERMS = pick(ALL_MODULES as PermModule[], [PermAction.VIEW, PermAction.CREATE, PermAction.EDIT]);
+    const READONLY_PERMS = pick(ALL_MODULES as PermModule[], [PermAction.VIEW]);
+
+    const rolesToCreate = [
+      { name: "OWNER", isSystem: true, permIds: OWNER_PERMS },
+      { name: "ADMIN", isSystem: true, permIds: ADMIN_PERMS },
+      { name: "STAFF", isSystem: true, permIds: STAFF_PERMS },
+      { name: "READONLY", isSystem: true, permIds: READONLY_PERMS },
+    ] as const;
+
+    // 3) crear roles system + permisos (para ESTA joyería nueva)
+    let ownerRoleId = "";
+    for (const r of rolesToCreate) {
+      const role = await tx.role.create({
+        data: {
+          name: r.name,
+          jewelryId: jewelry.id,
+          isSystem: r.isSystem,
+        },
+      });
+
+      if (r.name === "OWNER") ownerRoleId = role.id;
+
+      await tx.rolePermission.createMany({
+        data: r.permIds.map((permissionId) => ({
+          roleId: role.id,
+          permissionId,
+        })),
+        skipDuplicates: true,
+      });
+    }
+
+    // 4) crear usuario
     const user = await tx.user.create({
       data: {
         email,
@@ -179,14 +331,41 @@ export async function register(req: Request, res: Response) {
         name: `${data.firstName.trim()} ${data.lastName.trim()}`.trim(),
         status: UserStatus.ACTIVE,
         jewelryId: jewelry.id,
+        tokenVersion: 0,
       },
-      include: { jewelry: true },
     });
 
-    return { user, jewelry };
+    // 5) asignar OWNER
+    await tx.userRole.create({
+      data: {
+        userId: user.id,
+        roleId: ownerRoleId,
+      },
+    });
+
+    // 6) traer user completo para devolver roles/perms reales
+    const fullUser = await tx.user.findUniqueOrThrow({
+      where: { id: user.id },
+      include: {
+        jewelry: true,
+        favoriteWarehouse: true,
+        roles: {
+          include: {
+            role: {
+              include: {
+                permissions: { include: { permission: true } },
+              },
+            },
+          },
+        },
+        permissionOverrides: { include: { permission: true } },
+      },
+    });
+
+    return { user: fullUser, jewelry };
   });
 
-  const token = signToken(result.user.id, result.user.jewelryId);
+  const token = signToken(result.user.id, result.user.jewelryId, result.user.tokenVersion);
 
   // ✅ cookie (httpOnly)
   setAuthCookie(req, res, token);
@@ -202,10 +381,24 @@ export async function register(req: Request, res: Response) {
   const safeUser: any = { ...result.user };
   delete safeUser.password;
 
+  const roles = (result.user.roles ?? []).map((ur) => ({
+    id: ur.roleId,
+    name: ur.role?.name,
+    isSystem: ur.role?.isSystem ?? false,
+  }));
+
+  const permissions = computeEffectivePermissions(result.user as any);
+
+  delete safeUser.roles;
+  delete safeUser.permissionOverrides;
+
   return res.status(201).json({
     user: safeUser,
     jewelry: result.jewelry,
-    token, // ✅ devolver token también
+    roles,
+    permissions,
+    favoriteWarehouse: result.user.favoriteWarehouse ?? null,
+    token,
   });
 }
 
@@ -219,7 +412,22 @@ export async function login(req: Request, res: Response) {
 
   const user = await prisma.user.findUnique({
     where: { email },
-    include: { jewelry: true },
+    include: {
+      jewelry: true,
+      roles: {
+        include: {
+          role: {
+            include: {
+              permissions: { include: { permission: true } },
+            },
+          },
+        },
+      },
+      permissionOverrides: {
+        include: { permission: true },
+      },
+      favoriteWarehouse: true,
+    },
   });
 
   if (!user) {
@@ -265,7 +473,7 @@ export async function login(req: Request, res: Response) {
     return res.status(401).json({ message: "Email o contraseña incorrectos." });
   }
 
-  const token = signToken(user.id, user.jewelryId);
+  const token = signToken(user.id, user.jewelryId, user.tokenVersion);
 
   // ✅ cookie (httpOnly)
   setAuthCookie(req, res, token);
@@ -280,9 +488,23 @@ export async function login(req: Request, res: Response) {
   const safeUser: any = { ...user };
   delete safeUser.password;
 
+  const roles = (user.roles ?? []).map((ur) => ({
+    id: ur.roleId,
+    name: ur.role?.name,
+    isSystem: ur.role?.isSystem ?? false,
+  }));
+
+  const permissions = computeEffectivePermissions(user);
+
+  delete safeUser.roles;
+  delete safeUser.permissionOverrides;
+
   return res.json({
     user: safeUser,
     jewelry: user.jewelry ?? null,
+    roles,
+    permissions,
+    favoriteWarehouse: user.favoriteWarehouse ?? null,
     token, // ✅ devolver token también
   });
 }
@@ -386,7 +608,11 @@ export async function resetPassword(req: Request, res: Response) {
 
     await prisma.user.update({
       where: { id: userId },
-      data: { password: newHash },
+      data: {
+        password: newHash,
+        // opcional: si querés invalidar sesiones al cambiar password:
+        // tokenVersion: { increment: 1 },
+      },
     });
 
     auditLog(req, {
