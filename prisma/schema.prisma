@@ -112,7 +112,7 @@ model User {
   name     String?
   status   UserStatus @default(ACTIVE)
 
-  // invalida tokens al instante
+  // ✅ invalida tokens al instante
   tokenVersion Int @default(0)
 
   // perfil
@@ -120,7 +120,7 @@ model User {
 
   jewelryId String
 
-  // almacén favorito (✅ una sola línea)
+  // ✅ almacén favorito (EN UNA SOLA LÍNEA)
   favoriteWarehouseId String?
   favoriteWarehouse   Warehouse? @relation("UserFavoriteWarehouse", fields: [favoriteWarehouseId], references: [id], onDelete: SetNull)
 
