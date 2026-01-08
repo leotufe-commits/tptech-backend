@@ -335,7 +335,10 @@ export async function register(req, res) {
         roles,
         permissions,
         favoriteWarehouse: result.user.favoriteWarehouse ?? null,
+        // ✅ compatibilidad (si el front ya usa token)
         token,
+        // ✅ nombre estándar para DEV Bearer
+        accessToken: token,
     });
 }
 /* =========================
@@ -428,7 +431,10 @@ export async function login(req, res) {
         roles,
         permissions,
         favoriteWarehouse: user.favoriteWarehouse ?? null,
-        token, // ✅ devolver token también
+        // ✅ compatibilidad
+        token,
+        // ✅ nombre estándar para DEV Bearer
+        accessToken: token,
     });
 }
 /* =========================
