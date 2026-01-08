@@ -1,29 +1,25 @@
 {
   "compilerOptions": {
-    /* ===== Entorno ===== */
     "target": "ES2022",
     "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "types": ["node"],
 
-    /* ===== Output ===== */
+    "types": ["node", "express", "multer"],
+
     "rootDir": "src",
     "outDir": "dist",
     "sourceMap": true,
 
-    /* ===== TypeScript ===== */
     "strict": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
 
-    /* ===== Interop ===== */
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "verbatimModuleSyntax": true,
 
-    /* ===== Limpieza ===== */
     "noUnusedLocals": false,
     "noUnusedParameters": false
   },

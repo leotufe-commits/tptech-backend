@@ -41,7 +41,7 @@ function normalizeName(raw: any) {
  */
 function toPublicUrl(relativePath: string) {
   const base = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-  if (!base) return relativePath; // devuelve relativa
+  if (!base) return relativePath;
   const p = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
   return `${base}${p}`;
 }
@@ -53,8 +53,6 @@ function toPublicUrl(relativePath: string) {
 async function safeDeleteOldAvatar(avatarUrl: string | null) {
   if (!avatarUrl) return;
 
-  // soporta URL absoluta o relativa
-  // nos quedamos con el pathname
   let pathname = avatarUrl;
   try {
     if (avatarUrl.startsWith("http://") || avatarUrl.startsWith("https://")) {
@@ -64,12 +62,9 @@ async function safeDeleteOldAvatar(avatarUrl: string | null) {
     pathname = avatarUrl;
   }
 
-  // solo borramos si está en /uploads/avatars/
   if (!pathname.includes("/uploads/avatars/")) return;
 
-  // convertir a path local:
-  // /uploads/avatars/abc.jpg -> uploads/avatars/abc.jpg
-  const local = pathname.replace(/^\/+/, ""); // quita slash inicial
+  const local = pathname.replace(/^\/+/, "");
   try {
     await fs.unlink(local);
   } catch {
@@ -101,22 +96,19 @@ export async function createUser(req: Request, res: Response) {
     return res.status(400).json({ message: "Email inválido." });
   }
 
-  // normalizar roles
   let roleIds = Array.isArray(body.roleIds) ? body.roleIds : [];
   roleIds = uniqStrings(roleIds.map((r) => String(r || "").trim()).filter(Boolean));
 
   const hasPassword = Boolean(String(body.password || "").trim());
   const desiredStatus = body.status ? String(body.status) : undefined;
 
-  // status default: ACTIVE si hay password, sino PENDING
   const status: UserStatus =
     desiredStatus === "BLOCKED"
       ? UserStatus.BLOCKED
       : hasPassword
-      ? UserStatus.ACTIVE
-      : UserStatus.PENDING;
+        ? UserStatus.ACTIVE
+        : UserStatus.PENDING;
 
-  // email único (global)
   const existing = await prisma.user.findUnique({
     where: { email },
     select: { id: true },
@@ -133,7 +125,6 @@ export async function createUser(req: Request, res: Response) {
     return res.status(409).json({ message: "El email ya está registrado." });
   }
 
-  // validar roles pertenecen al tenant (si mandan roleIds)
   if (roleIds.length) {
     const roles = await prisma.role.findMany({
       where: { id: { in: roleIds }, jewelryId: tenantId, deletedAt: null },
@@ -156,7 +147,7 @@ export async function createUser(req: Request, res: Response) {
         name,
         status,
         jewelryId: tenantId,
-        password: passwordHash ?? "", // ✅ compat con tu modelo (string requerido)
+        password: passwordHash ?? "",
         tokenVersion: 0,
       },
       select: {
@@ -211,7 +202,6 @@ export async function createUser(req: Request, res: Response) {
 
 /* =========================
    GET /users
-   Listado (sin overrides)
 ========================= */
 export async function listUsers(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -258,7 +248,6 @@ export async function listUsers(req: Request, res: Response) {
 
 /* =========================
    GET /users/:id
-   Detalle (con overrides)
 ========================= */
 export async function getUser(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -345,7 +334,7 @@ export async function updateUserStatus(req: Request, res: Response) {
     where: { id: targetUserId },
     data: {
       status,
-      tokenVersion: { increment: 1 }, // invalida sesiones
+      tokenVersion: { increment: 1 },
     },
     select: {
       id: true,
@@ -556,40 +545,26 @@ export async function removeUserOverride(req: Request, res: Response) {
 
 /* =========================
    AVATAR (ME)
-   PUT    /users/me/avatar   (multipart field: avatar)
-   DELETE /users/me/avatar
 ========================= */
-
-/**
- * PUT /users/me/avatar
- * Requiere middleware multer en la ruta: upload.single("avatar")
- * Espera: req.file
- */
 export async function updateMyAvatar(req: Request, res: Response) {
   const actorId = req.userId!;
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  // Multer pone el archivo en req.file
+  // ✅ Tipo correcto (viene de @types/multer)
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) {
     return res.status(400).json({ message: "Falta archivo avatar (multipart field: avatar)." });
   }
 
-  // Validación básica server-side
   if (!file.mimetype?.startsWith("image/")) {
     return res.status(400).json({ message: "El archivo debe ser una imagen." });
   }
 
-  // ubicamos el path público (asumiendo /uploads estático)
-  // Si tu storage ya define file.filename dentro de uploads/avatars, esto queda perfecto.
-  // Ej: uploads/avatars/xxx.jpg -> /uploads/avatars/xxx.jpg
-  const normalized = file.path.replace(/\\/g, "/"); // windows safe
+  const normalized = file.path.replace(/\\/g, "/");
   const idx = normalized.indexOf("uploads/");
   const publicRelative = idx >= 0 ? `/${normalized.slice(idx)}` : `/uploads/avatars/${file.filename}`;
 
-  // usamos filename único real (si tu multer NO lo hace, te dejo fallback aquí)
-  // Si tu multer ya genera nombres únicos, este fallback no se usa.
   const ext = path.extname(file.originalname || "") || "";
   const ensureUniqueName =
     file.filename && file.filename.includes(".")
@@ -598,7 +573,6 @@ export async function updateMyAvatar(req: Request, res: Response) {
 
   const avatarUrl = ensureUniqueName ? `/uploads/avatars/${ensureUniqueName}` : publicRelative;
 
-  // Traemos avatar previo para borrar el archivo local si corresponde
   const prev = await prisma.user.findFirst({
     where: { id: actorId, jewelryId: tenantId },
     select: { avatarUrl: true, id: true },
@@ -608,16 +582,13 @@ export async function updateMyAvatar(req: Request, res: Response) {
     return res.status(404).json({ message: "Usuario no encontrado." });
   }
 
-  // Si el multer NO generó filename único, movemos/renombramos el archivo a nombre único
-  // (esto evita cache y colisiones)
   if (ensureUniqueName) {
     const targetFsPath = `uploads/avatars/${ensureUniqueName}`;
     try {
       await fs.mkdir("uploads/avatars", { recursive: true });
       await fs.rename(file.path, targetFsPath);
     } catch {
-      // si falla, no rompemos, pero el publicRelative podría apuntar a algo no ideal
-      // en ese caso usamos publicRelative original
+      // ignore
     }
   }
 
@@ -636,7 +607,6 @@ export async function updateMyAvatar(req: Request, res: Response) {
     },
   });
 
-  // intentamos borrar avatar anterior si era local
   await safeDeleteOldAvatar(prev.avatarUrl);
 
   auditLog(req, {
@@ -650,10 +620,6 @@ export async function updateMyAvatar(req: Request, res: Response) {
   return res.json({ ok: true, avatarUrl: updated.avatarUrl, user: updated });
 }
 
-/**
- * DELETE /users/me/avatar
- * Quita avatar del usuario logueado
- */
 export async function removeMyAvatar(req: Request, res: Response) {
   const actorId = req.userId!;
   const tenantId = requireTenantId(req, res);
