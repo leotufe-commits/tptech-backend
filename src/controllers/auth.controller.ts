@@ -398,7 +398,12 @@ export async function register(req: Request, res: Response) {
     roles,
     permissions,
     favoriteWarehouse: result.user.favoriteWarehouse ?? null,
+
+    // ✅ compatibilidad (si el front ya usa token)
     token,
+
+    // ✅ nombre estándar para DEV Bearer
+    accessToken: token,
   });
 }
 
@@ -505,7 +510,12 @@ export async function login(req: Request, res: Response) {
     roles,
     permissions,
     favoriteWarehouse: user.favoriteWarehouse ?? null,
-    token, // ✅ devolver token también
+
+    // ✅ compatibilidad
+    token,
+
+    // ✅ nombre estándar para DEV Bearer
+    accessToken: token,
   });
 }
 
@@ -610,10 +620,12 @@ export async function resetPassword(req: Request, res: Response) {
       where: { id: userId },
       data: {
         password: newHash,
-        // opcional: si querés invalidar sesiones al cambiar password:
-        // tokenVersion: { increment: 1 },
+        tokenVersion: { increment: 1 }, // ✅ AJUSTE: invalida todas las sesiones activas
       },
     });
+
+    // ✅ AJUSTE (recomendado): si el navegador tenía cookie activa, la limpiamos
+    clearAuthCookie(req, res);
 
     auditLog(req, {
       action: "auth.reset_password",
