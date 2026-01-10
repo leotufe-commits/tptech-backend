@@ -8,11 +8,183 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-/**
- * =========================
- * ENUMS
- * =========================
- */
+/// *
+///  * =========================
+///  * JOYERÍA (EMPRESA)
+///  * =========================
+model Jewelry {
+  id           String      @id @default(cuid())
+  name         String
+  firstName    String
+  lastName     String
+  phoneCountry String
+  phoneNumber  String
+  street       String
+  number       String
+  city         String
+  province     String
+  postalCode   String
+  country      String
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  auditLogs    AuditLog[]
+  roles        Role[]
+  users        User[]
+  warehouses   Warehouse[]
+
+  @@index([createdAt])
+}
+
+/// *
+///  * =========================
+///  * ALMACENES
+///  * =========================
+model Warehouse {
+  id             String   @id @default(cuid())
+  jewelryId      String
+  name           String
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  favoredByUsers User[]   @relation("UserFavoriteWarehouse")
+  jewelry        Jewelry  @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+
+  @@unique([jewelryId, name])
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+}
+
+/// *
+///  * =========================
+///  * USUARIOS
+///  * =========================
+model User {
+  id                  String                   @id @default(cuid())
+  email               String                   @unique
+  password            String
+  name                String?
+  status              UserStatus               @default(ACTIVE)
+  tokenVersion        Int                      @default(0)
+  avatarUrl           String?
+  jewelryId           String
+  favoriteWarehouseId String?
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+  auditLogs           AuditLog[]
+  favoriteWarehouse   Warehouse?               @relation("UserFavoriteWarehouse", fields: [favoriteWarehouseId], references: [id])
+  jewelry             Jewelry                  @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  permissionOverrides UserPermissionOverride[]
+  roles               UserRole[]
+
+  @@index([jewelryId])
+  @@index([jewelryId, status])
+  @@index([favoriteWarehouseId])
+}
+
+/// *
+///  * =========================
+///  * ROLES / PERMISOS
+///  * =========================
+model Role {
+  id          String           @id @default(cuid())
+  jewelryId   String
+  name        String
+  isSystem    Boolean          @default(false)
+  deletedAt   DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  displayName String?
+  jewelry     Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@unique([jewelryId, name])
+  @@index([jewelryId])
+  @@index([jewelryId, deletedAt])
+}
+
+/// *
+///  * Catálogo de permisos (global)
+model Permission {
+  id        String                   @id @default(cuid())
+  module    PermModule
+  action    PermAction
+  createdAt DateTime                 @default(now())
+  roles     RolePermission[]
+  overrides UserPermissionOverride[]
+
+  @@unique([module, action])
+  @@index([module])
+}
+
+/// *
+///  * Role <-> Permission
+model RolePermission {
+  roleId       String
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+}
+
+/// *
+///  * User <-> Role
+model UserRole {
+  userId String
+  roleId String
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+}
+
+/// *
+///  * Overrides por usuario
+model UserPermissionOverride {
+  id           String         @id @default(cuid())
+  userId       String
+  permissionId String
+  effect       OverrideEffect
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  permission   Permission     @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permissionId])
+  @@index([permissionId])
+}
+
+/// *
+///  * =========================
+///  * AUDITORÍA
+///  * =========================
+model AuditLog {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  action    String
+  success   Boolean
+  userId    String?
+  jewelryId String?
+  ip        String?
+  userAgent String?
+  meta      Json?
+  jewelry   Jewelry? @relation(fields: [jewelryId], references: [id])
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([action])
+  @@index([success])
+  @@index([jewelryId, createdAt])
+  @@index([userId, createdAt])
+}
+
+/// *
+///  * =========================
+///  * ENUMS
+///  * =========================
 enum UserStatus {
   ACTIVE
   PENDING
@@ -46,214 +218,4 @@ enum PermAction {
 enum OverrideEffect {
   ALLOW
   DENY
-}
-
-/**
- * =========================
- * JOYERÍA (EMPRESA)
- * =========================
- */
-model Jewelry {
-  id           String @id @default(cuid())
-  name         String
-  firstName    String
-  lastName     String
-  phoneCountry String
-  phoneNumber  String
-  street       String
-  number       String
-  city         String
-  province     String
-  postalCode   String
-  country      String
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  users      User[]
-  warehouses Warehouse[]
-  roles      Role[]
-  auditLogs  AuditLog[]
-
-  @@index([createdAt])
-}
-
-/**
- * =========================
- * ALMACENES
- * =========================
- */
-model Warehouse {
-  id        String  @id @default(cuid())
-  jewelryId String
-  name      String
-  isActive  Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  jewelry        Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  favoredByUsers User[]  @relation("UserFavoriteWarehouse")
-
-  @@unique([jewelryId, name])
-  @@index([jewelryId])
-  @@index([jewelryId, isActive])
-}
-
-/**
- * =========================
- * USUARIOS
- * =========================
- */
-model User {
-  id       String     @id @default(cuid())
-  email    String     @unique
-  password String
-  name     String?
-  status   UserStatus @default(ACTIVE)
-
-  // ✅ invalida tokens al instante
-  tokenVersion Int @default(0)
-
-  // perfil
-  avatarUrl String?
-
-  jewelryId String
-
-  // ✅ almacén favorito (EN UNA SOLA LÍNEA)
-  favoriteWarehouseId String?
-  favoriteWarehouse   Warehouse? @relation("UserFavoriteWarehouse", fields: [favoriteWarehouseId], references: [id], onDelete: SetNull)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  jewelry   Jewelry    @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  auditLogs AuditLog[]
-
-  roles               UserRole[]
-  permissionOverrides UserPermissionOverride[]
-
-  @@index([jewelryId])
-  @@index([jewelryId, status])
-  @@index([favoriteWarehouseId])
-}
-
-/**
- * =========================
- * ROLES / PERMISOS
- * =========================
- */
-model Role {
-  id        String @id @default(cuid())
-  jewelryId String
-
-  name      String
-  isSystem  Boolean   @default(false)
-  deletedAt DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  jewelry Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-
-  users       UserRole[]
-  permissions RolePermission[]
-
-  @@unique([jewelryId, name])
-  @@index([jewelryId])
-  @@index([jewelryId, deletedAt])
-}
-
-/**
- * Catálogo de permisos (global)
- */
-model Permission {
-  id     String     @id @default(cuid())
-  module PermModule
-  action PermAction
-
-  createdAt DateTime @default(now())
-
-  roles     RolePermission[]
-  overrides UserPermissionOverride[]
-
-  @@unique([module, action])
-  @@index([module])
-}
-
-/**
- * Role <-> Permission
- */
-model RolePermission {
-  roleId       String
-  permissionId String
-
-  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
-  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
-
-  @@id([roleId, permissionId])
-  @@index([permissionId])
-}
-
-/**
- * User <-> Role
- */
-model UserRole {
-  userId String
-  roleId String
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
-
-  @@id([userId, roleId])
-  @@index([roleId])
-}
-
-/**
- * Overrides por usuario
- */
-model UserPermissionOverride {
-  id           String         @id @default(cuid())
-  userId       String
-  permissionId String
-  effect       OverrideEffect
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, permissionId])
-  @@index([permissionId])
-}
-
-/**
- * =========================
- * AUDITORÍA
- * =========================
- */
-model AuditLog {
-  id        String   @id @default(cuid())
-  createdAt DateTime @default(now())
-
-  action  String
-  success Boolean
-
-  userId    String?
-  jewelryId String?
-
-  ip        String?
-  userAgent String?
-
-  meta Json?
-
-  user    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  jewelry Jewelry? @relation(fields: [jewelryId], references: [id], onDelete: SetNull)
-
-  @@index([createdAt])
-  @@index([action])
-  @@index([success])
-  @@index([jewelryId, createdAt])
-  @@index([userId, createdAt])
 }

@@ -1,88 +1,66 @@
 // tptech-backend/src/modules/users/users.routes.ts
 import { Router } from "express";
+import multer from "multer";
+import path from "node:path";
+import crypto from "node:crypto";
+
 import { requireAuth } from "../../middlewares/requireAuth.js";
-import { requirePermission } from "../../middlewares/requirePermission.js";
-import { validateBody } from "../../middlewares/validate.js";
-
-import updateUserStatusSchema, {
-  assignRolesSchema,
-  userOverrideSchema,
-  createUserSchema,
-} from "./users.schemas.js";
-
 import * as Users from "../../controllers/users.controller.js";
 
 const router = Router();
 
-// =========================
-// Base: /users
-// =========================
+// ✅ protegemos todo el módulo
 router.use(requireAuth);
 
-/**
- * POST /users
- * Crear usuario (requiere ADMIN)
- */
-router.post(
-  "/",
-  requirePermission("USERS_ROLES", "ADMIN"),
-  validateBody(createUserSchema),
-  Users.createUser
-);
+/* =========================
+   Multer storage
+   - Guarda en: uploads/avatars
+   - Nombre único para evitar cache y colisiones
+========================= */
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, "uploads/avatars");
+  },
+  filename: (req, file, cb) => {
+    const userId = req.userId || "user";
+    const ext = path.extname(file.originalname || "") || "";
+    const name = `avatar_${userId}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${ext}`;
+    cb(null, name);
+  },
+});
 
-/**
- * GET /users
- * Listado liviano (sin overrides)
- */
-router.get("/", requirePermission("USERS_ROLES", "VIEW"), Users.listUsers);
+function fileFilter(_req: any, file: Express.Multer.File, cb: multer.FileFilterCallback) {
+  if (!file.mimetype?.startsWith("image/")) {
+    return cb(new Error("El archivo debe ser una imagen"));
+  }
+  cb(null, true);
+}
 
-/**
- * GET /users/:id
- * Detalle del usuario (incluye overrides)
- */
-router.get("/:id", requirePermission("USERS_ROLES", "ADMIN"), Users.getUser);
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+  },
+});
 
-/**
- * PATCH /users/:id/status
- * Activar / Bloquear usuario
- */
-router.patch(
-  "/:id/status",
-  requirePermission("USERS_ROLES", "EDIT"),
-  validateBody(updateUserStatusSchema),
-  Users.updateUserStatus
-);
+/* =========================
+   USERS CRUD / ADMIN
+========================= */
+router.post("/", Users.createUser);
+router.get("/", Users.listUsers);
+router.get("/:id", Users.getUser);
 
-/**
- * PUT /users/:id/roles
- * Asignar roles al usuario
- */
-router.put(
-  "/:id/roles",
-  requirePermission("USERS_ROLES", "ADMIN"),
-  validateBody(assignRolesSchema),
-  Users.assignRolesToUser
-);
+router.patch("/:id/status", Users.updateUserStatus);
+router.put("/:id/roles", Users.assignRolesToUser);
 
-/**
- * POST /users/:id/overrides
- * Setear override (ALLOW / DENY)
- */
-router.post(
-  "/:id/overrides",
-  requirePermission("USERS_ROLES", "ADMIN"),
-  validateBody(userOverrideSchema),
-  Users.setUserOverride
-);
+router.post("/:id/overrides", Users.setUserOverride);
+router.delete("/:id/overrides/:permissionId", Users.removeUserOverride);
 
-/**
- * DELETE /users/:id/overrides/:permissionId
- * Eliminar override
- */
-router.delete(
-  "/:id/overrides/:permissionId",
-  requirePermission("USERS_ROLES", "ADMIN"),
-  Users.removeUserOverride
-);
+/* =========================
+   AVATAR (ME)
+========================= */
+router.put("/me/avatar", upload.single("avatar"), Users.updateMyAvatar);
+router.delete("/me/avatar", Users.removeMyAvatar);
 
 export default router;

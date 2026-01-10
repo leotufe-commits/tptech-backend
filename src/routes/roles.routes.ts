@@ -1,8 +1,16 @@
-// src/routes/roles.routes.ts
 import { Router } from "express";
 import { requireAuth } from "../middlewares/requireAuth.js";
 import { validateBody } from "../middlewares/validate.js";
-import * as Roles from "../controllers/roles.controller.js";
+
+import {
+  listRoles,
+  getRole,
+  createRole,
+  updateRole,
+  updateRolePermissions,
+  deleteRole,
+} from "../controllers/roles.controller.js";
+
 import {
   createRoleSchema,
   updateRoleSchema,
@@ -11,41 +19,41 @@ import {
 
 const router = Router();
 
-// secure-by-default
+// todo roles es privado
 router.use(requireAuth);
 
 /**
  * GET /roles
- * Lista roles del tenant
  */
-router.get("/", Roles.listRoles);
+router.get("/", listRoles);
+
+/**
+ * GET /roles/:id   ✅ ESTA ES LA QUE TE FALTA (por eso te tira Cannot GET)
+ */
+router.get("/:id", getRole);
 
 /**
  * POST /roles
- * Crear rol custom
  */
-router.post("/", validateBody(createRoleSchema), Roles.createRole);
+router.post("/", validateBody(createRoleSchema), createRole);
 
 /**
  * PATCH /roles/:id
- * Renombrar rol
  */
-router.patch("/:id", validateBody(updateRoleSchema), Roles.updateRole);
+router.patch("/:id", validateBody(updateRoleSchema), updateRole);
 
 /**
  * PATCH /roles/:id/permissions
- * Reemplaza permisos del rol
  */
 router.patch(
   "/:id/permissions",
   validateBody(updateRolePermissionsSchema),
-  Roles.updateRolePermissions
+  updateRolePermissions
 );
 
 /**
  * DELETE /roles/:id
- * Elimina rol si no tiene usuarios asignados
  */
-router.delete("/:id", Roles.deleteRole);
+router.delete("/:id", deleteRole);
 
 export default router;

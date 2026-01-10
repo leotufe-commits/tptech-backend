@@ -1,10 +1,16 @@
 import { Router } from "express";
 import { requireAuth } from "../middlewares/requireAuth.js";
-import * as Permissions from "../controllers/permissions.controller.js";
+import { requirePermission } from "../middlewares/requirePermission.js";
+import { listPermissions } from "../controllers/permissions.controller.js";
 
 const router = Router();
 
-// base: /permissions
-router.get("/", requireAuth, Permissions.listPermissions);
+router.use(requireAuth);
+
+router.get(
+  "/",
+  requirePermission("USERS_ROLES", "ADMIN"),
+  listPermissions
+);
 
 export default router;

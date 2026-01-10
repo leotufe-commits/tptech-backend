@@ -53,9 +53,9 @@ function setAuthCookie(_req: Request, res: Response, token: string) {
 
   res.cookie(AUTH_COOKIE, token, {
     httpOnly: true,
-    secure: isProd, // ✅ solo true en prod
+    secure: isProd,
     sameSite: isProd ? "none" : "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 días
+    maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/",
   });
 }
@@ -79,14 +79,19 @@ function formatPerm(module: string, action: string) {
   return `${module}:${action}`;
 }
 
-function computeEffectivePermissions(user: {
+type ComputeUserShape = {
   roles: Array<{
     role: {
       permissions: Array<{ permission: { module: any; action: any } }>;
     };
   }>;
-  permissionOverrides: Array<{ effect: OverrideEffect; permission: { module: any; action: any } }>;
-}) {
+  permissionOverrides: Array<{
+    effect: OverrideEffect;
+    permission: { module: any; action: any };
+  }>;
+};
+
+function computeEffectivePermissions(user: ComputeUserShape) {
   // 1) permisos por roles
   const fromRoles: string[] = [];
   for (const ur of user.roles ?? []) {
@@ -105,7 +110,7 @@ function computeEffectivePermissions(user: {
     if (ov.effect === "DENY") deny.push(p);
   }
 
-  // 3) aplicar deny sobre roles y sobre allow
+  // 3) aplicar deny sobre roles y allow
   const base = new Set(uniq(fromRoles));
   for (const d of deny) base.delete(d);
   for (const a of allow) base.add(a);
@@ -113,6 +118,8 @@ function computeEffectivePermissions(user: {
 
   return Array.from(base).sort();
 }
+
+const s = (v: any) => String(v ?? "").trim();
 
 /* =========================
    ME
@@ -157,16 +164,14 @@ export async function me(req: Request, res: Response) {
   const safeUser: any = { ...user };
   delete safeUser.password;
 
-  // roles resumidos (lo que el front necesita)
   const roles = (user.roles ?? []).map((ur) => ({
     id: ur.roleId,
     name: ur.role?.name,
     isSystem: ur.role?.isSystem ?? false,
   }));
 
-  const permissions = computeEffectivePermissions(user);
+  const permissions = computeEffectivePermissions(user as any);
 
-  // NO devolvemos pivots crudos
   delete safeUser.roles;
   delete safeUser.permissionOverrides;
 
@@ -197,17 +202,17 @@ export async function updateMyJewelry(req: Request, res: Response) {
   const updated = await prisma.jewelry.update({
     where: { id: meUser.jewelryId },
     data: {
-      name: data.name.trim(),
-      firstName: data.firstName.trim(),
-      lastName: data.lastName.trim(),
-      phoneCountry: data.phoneCountry.trim(),
-      phoneNumber: data.phoneNumber.trim(),
-      street: data.street.trim(),
-      number: data.number.trim(),
-      city: data.city.trim(),
-      province: data.province.trim(),
-      postalCode: data.postalCode.trim(),
-      country: data.country.trim(),
+      name: s(data.name),
+      firstName: s(data.firstName),
+      lastName: s(data.lastName),
+      phoneCountry: s(data.phoneCountry),
+      phoneNumber: s(data.phoneNumber),
+      street: s(data.street),
+      number: s(data.number),
+      city: s(data.city),
+      province: s(data.province),
+      postalCode: s(data.postalCode),
+      country: s(data.country),
     },
   });
 
@@ -222,11 +227,11 @@ export async function updateMyJewelry(req: Request, res: Response) {
 }
 
 /* =========================
-   REGISTER  ✅ (ACTUALIZADO)
+   REGISTER
 ========================= */
 export async function register(req: Request, res: Response) {
   const data = req.body as any;
-  const email = String(data.email).toLowerCase().trim();
+  const email = s(data.email).toLowerCase();
 
   const existing = await prisma.user.findUnique({ where: { email } });
   if (existing) {
@@ -238,7 +243,7 @@ export async function register(req: Request, res: Response) {
     return res.status(409).json({ message: "El email ya está registrado." });
   }
 
-  const hashed = await bcrypt.hash(String(data.password), 10);
+  const hashed = await bcrypt.hash(String(data.password ?? ""), 10);
 
   const ALL_MODULES = Object.values(PermModule);
   const ALL_ACTIONS = Object.values(PermAction);
@@ -247,17 +252,17 @@ export async function register(req: Request, res: Response) {
     // 1) crear joyería
     const jewelry = await tx.jewelry.create({
       data: {
-        name: data.jewelryName.trim(),
-        firstName: data.firstName.trim(),
-        lastName: data.lastName.trim(),
-        phoneCountry: data.phoneCountry.trim(),
-        phoneNumber: data.phoneNumber.trim(),
-        street: data.street.trim(),
-        number: data.number.trim(),
-        city: data.city.trim(),
-        province: data.province.trim(),
-        postalCode: data.postalCode.trim(),
-        country: data.country.trim(),
+        name: s(data.jewelryName),
+        firstName: s(data.firstName),
+        lastName: s(data.lastName),
+        phoneCountry: s(data.phoneCountry),
+        phoneNumber: s(data.phoneNumber),
+        street: s(data.street),
+        number: s(data.number),
+        city: s(data.city),
+        province: s(data.province),
+        postalCode: s(data.postalCode),
+        country: s(data.country),
       },
     });
 
@@ -291,7 +296,11 @@ export async function register(req: Request, res: Response) {
 
     const OWNER_PERMS = allPermissions.map((p) => p.id);
     const ADMIN_PERMS = pick(ALL_MODULES as PermModule[], ALL_ACTIONS as PermAction[]);
-    const STAFF_PERMS = pick(ALL_MODULES as PermModule[], [PermAction.VIEW, PermAction.CREATE, PermAction.EDIT]);
+    const STAFF_PERMS = pick(ALL_MODULES as PermModule[], [
+      PermAction.VIEW,
+      PermAction.CREATE,
+      PermAction.EDIT,
+    ]);
     const READONLY_PERMS = pick(ALL_MODULES as PermModule[], [PermAction.VIEW]);
 
     const rolesToCreate = [
@@ -328,7 +337,7 @@ export async function register(req: Request, res: Response) {
       data: {
         email,
         password: hashed,
-        name: `${data.firstName.trim()} ${data.lastName.trim()}`.trim(),
+        name: `${s(data.firstName)} ${s(data.lastName)}`.trim(),
         status: UserStatus.ACTIVE,
         jewelryId: jewelry.id,
         tokenVersion: 0,
@@ -366,8 +375,6 @@ export async function register(req: Request, res: Response) {
   });
 
   const token = signToken(result.user.id, result.user.jewelryId, result.user.tokenVersion);
-
-  // ✅ cookie (httpOnly)
   setAuthCookie(req, res, token);
 
   auditLog(req, {
@@ -398,11 +405,7 @@ export async function register(req: Request, res: Response) {
     roles,
     permissions,
     favoriteWarehouse: result.user.favoriteWarehouse ?? null,
-
-    // ✅ compatibilidad (si el front ya usa token)
     token,
-
-    // ✅ nombre estándar para DEV Bearer
     accessToken: token,
   });
 }
@@ -412,8 +415,8 @@ export async function register(req: Request, res: Response) {
 ========================= */
 export async function login(req: Request, res: Response) {
   const data = req.body as any;
-  const email = String(data.email).toLowerCase().trim();
-  const password = String(data.password || "");
+  const email = s(data.email).toLowerCase();
+  const password = String(data.password ?? "");
 
   const user = await prisma.user.findUnique({
     where: { email },
@@ -479,8 +482,6 @@ export async function login(req: Request, res: Response) {
   }
 
   const token = signToken(user.id, user.jewelryId, user.tokenVersion);
-
-  // ✅ cookie (httpOnly)
   setAuthCookie(req, res, token);
 
   auditLog(req, {
@@ -499,7 +500,7 @@ export async function login(req: Request, res: Response) {
     isSystem: ur.role?.isSystem ?? false,
   }));
 
-  const permissions = computeEffectivePermissions(user);
+  const permissions = computeEffectivePermissions(user as any);
 
   delete safeUser.roles;
   delete safeUser.permissionOverrides;
@@ -510,11 +511,7 @@ export async function login(req: Request, res: Response) {
     roles,
     permissions,
     favoriteWarehouse: user.favoriteWarehouse ?? null,
-
-    // ✅ compatibilidad
     token,
-
-    // ✅ nombre estándar para DEV Bearer
     accessToken: token,
   });
 }
@@ -532,7 +529,6 @@ export async function logout(req: Request, res: Response) {
     tenantId: req.tenantId,
   });
 
-  // ✅ estándar + compatible con apiFetch (maneja 204)
   return res.status(204).send();
 }
 
@@ -541,7 +537,7 @@ export async function logout(req: Request, res: Response) {
 ========================= */
 export async function forgotPassword(req: Request, res: Response) {
   const data = req.body as any;
-  const email = String(data.email).toLowerCase().trim();
+  const email = s(data.email).toLowerCase();
 
   const user = await prisma.user.findUnique({ where: { email } });
 
@@ -614,17 +610,16 @@ export async function resetPassword(req: Request, res: Response) {
       return res.status(401).json({ message: "Token inválido." });
     }
 
-    const newHash = await bcrypt.hash(String(data.newPassword), 10);
+    const newHash = await bcrypt.hash(String(data.newPassword ?? ""), 10);
 
     await prisma.user.update({
       where: { id: userId },
       data: {
         password: newHash,
-        tokenVersion: { increment: 1 }, // ✅ AJUSTE: invalida todas las sesiones activas
+        tokenVersion: { increment: 1 }, // ✅ invalida sesiones previas
       },
     });
 
-    // ✅ AJUSTE (recomendado): si el navegador tenía cookie activa, la limpiamos
     clearAuthCookie(req, res);
 
     auditLog(req, {

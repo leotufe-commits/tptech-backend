@@ -1,29 +1,29 @@
-// tptech-backend/src/routes/index.ts
 import { Router } from "express";
 
 import { requireAuth } from "../middlewares/requireAuth.js";
 
 import authRoutes from "../modules/auth/auth.routes.js";
 import movimientosRoutes from "../modules/movimientos/movimientos.routes.js";
-
-import usersRoutes from "../modules/users/users.routes.js";
-
-// rutas centralizadas
 import rolesRoutes from "./roles.routes.js";
-import permissionsRoutes from "./permissions.routes.js";
+import permissionsRoutes from "./permissions.routes.js"; // si existe en tu proyecto
 
 const router = Router();
 
-/** Público */
+/**
+ * Público
+ */
 router.use("/auth", authRoutes);
 
-/** Privado */
+/**
+ * Privado
+ */
 const privateRouter = Router();
 privateRouter.use(requireAuth);
 
 privateRouter.use("/movimientos", movimientosRoutes);
-privateRouter.use("/users", usersRoutes);
 privateRouter.use("/roles", rolesRoutes);
+
+// si tenés endpoint /permissions (tu front lo usa)
 privateRouter.use("/permissions", permissionsRoutes);
 
 router.use(privateRouter);
