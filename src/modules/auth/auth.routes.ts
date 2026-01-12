@@ -1,4 +1,4 @@
-// src/modules/auth/auth.routes.ts
+// tptech-backend/src/modules/auth/auth.routes.ts
 import { Router } from "express";
 
 import { requireAuth } from "../../middlewares/requireAuth.js";
@@ -18,24 +18,40 @@ import {
   updateJewelrySchema,
 } from "./auth.schemas.js";
 
-// ✅ NUEVO
 import { uploadJewelryFiles } from "../../middlewares/uploadJewelryFiles.js";
 import { parseJsonBodyField } from "../../middlewares/parseJsonBodyField.js";
 
 const router = Router();
 
+/**
+ * Wrapper para capturar errores de multer y responder JSON
+ */
+function withMulter(mw: any) {
+  return (req: any, res: any, next: any) => {
+    mw(req, res, (err: any) => {
+      if (!err) return next();
+
+      // MulterError o Error normal
+      const msg =
+        err?.message ||
+        (err?.code === "LIMIT_FILE_SIZE" ? "Archivo demasiado grande." : "Error subiendo archivos.");
+
+      return res.status(400).json({ message: msg });
+    });
+  };
+}
+
 /* ===========================
    ROUTES
 =========================== */
 
-// ✅ logout (evita 404 y queda protegido)
 router.post("/logout", requireAuth, Auth.logout);
 
 router.get("/me", requireAuth, Auth.me);
 
 /**
  * ✅ Soporta:
- * - JSON (como hoy)
+ * - JSON
  * - multipart/form-data con:
  *    - data: JSON string
  *    - logo: File
@@ -44,28 +60,20 @@ router.get("/me", requireAuth, Auth.me);
 router.put(
   "/me/jewelry",
   requireAuth,
-  uploadJewelryFiles,               // 1) recibe archivos si vienen
-  parseJsonBodyField("data"),       // 2) si viene data (string JSON) => lo pasa a req.body
-  validateBody(updateJewelrySchema),// 3) valida el body ya parseado
-  Auth.updateMyJewelry              // 4) guarda
+  withMulter(uploadJewelryFiles),
+  parseJsonBodyField("data"),
+  validateBody(updateJewelrySchema),
+  Auth.updateMyJewelry
 );
+
+router.delete("/me/jewelry/logo", requireAuth, Auth.deleteMyJewelryLogo);
+
+router.delete("/me/jewelry/attachments/:id", requireAuth, Auth.deleteMyJewelryAttachment);
 
 router.post("/register", validateBody(registerSchema), Auth.register);
-
 router.post("/login", authLoginLimiter, validateBody(loginSchema), Auth.login);
 
-router.post(
-  "/forgot-password",
-  authForgotLimiter,
-  validateBody(forgotSchema),
-  Auth.forgotPassword
-);
-
-router.post(
-  "/reset-password",
-  authResetLimiter,
-  validateBody(resetSchema),
-  Auth.resetPassword
-);
+router.post("/forgot-password", authForgotLimiter, validateBody(forgotSchema), Auth.forgotPassword);
+router.post("/reset-password", authResetLimiter, validateBody(resetSchema), Auth.resetPassword);
 
 export default router;

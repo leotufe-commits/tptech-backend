@@ -1,6 +1,10 @@
-// src/modules/auth/auth.schemas.ts
+// tptech-backend/src/modules/auth/auth.schemas.ts
 import { z } from "zod";
 
+/* =========================
+   REGISTER
+   (estricto, como decidimos)
+========================= */
 export const registerSchema = z.object({
   email: z.string().email(),
   password: z.string().min(6),
@@ -20,6 +24,9 @@ export const registerSchema = z.object({
   country: z.string().min(1),
 });
 
+/* =========================
+   LOGIN / PASSWORD
+========================= */
 export const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
@@ -34,19 +41,22 @@ export const resetSchema = z.object({
   newPassword: z.string().min(6),
 });
 
+/* =========================
+   UPDATE EMPRESA / JOYERÍA
+========================= */
 /**
- * ✅ UPDATE empresa/joyería
- * - name requerido (Nombre de fantasía)
- * - el resto es opcional y permite ""
- * - agrega campos nuevos de empresa
- *
- * Importante: permite tanto JSON como multipart parseado (parseJsonBodyField("data"))
+ * Reglas:
+ * - name es el ÚNICO obligatorio
+ * - el resto:
+ *    - puede no venir
+ *    - puede venir como string vacío ""
+ * - compatible con JSON y multipart (parseJsonBodyField)
  */
 export const updateJewelrySchema = z.object({
-  // requerido
+  // obligatorio
   name: z.string().min(1),
 
-  // opcionales (permiten string vacío)
+  // opcionales (aceptan "")
   firstName: z.string().optional(),
   lastName: z.string().optional(),
 
@@ -60,7 +70,7 @@ export const updateJewelrySchema = z.object({
   postalCode: z.string().optional(),
   country: z.string().optional(),
 
-  // ✅ nuevos campos empresa
+  // empresa
   logoUrl: z.string().optional(),
   legalName: z.string().optional(),
   cuit: z.string().optional(),

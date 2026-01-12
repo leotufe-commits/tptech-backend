@@ -25,20 +25,9 @@ export function createApp() {
 
   /* =====================
      Parsers
-     - json para requests normales
-     - urlencoded para forms sin archivos
-     - multipart con archivos lo maneja multer por ruta
   ===================== */
   app.use(express.json({ limit: "1mb" }));
-  app.use(express.urlencoded({ extended: true, limit: "1mb" }));
   app.use(cookieParser());
-
-  /* =====================
-     Static uploads
-     ✅ sirve logo/adjuntos en: /uploads/...
-     (asegurate de no commitear uploads al repo)
-  ===================== */
-  app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
   /* =====================
      Request Context (ALS)
@@ -50,6 +39,25 @@ export function createApp() {
      CORS (con credentials)
   ===================== */
   app.use(buildCorsMiddleware());
+
+  /* =====================
+     Static: uploads
+     - Permite abrir logo/adjuntos por URL pública
+     - Ej: /uploads/jewelry/<file>
+  ===================== */
+  const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+
+  app.use(
+    "/uploads",
+    express.static(UPLOADS_DIR, {
+      // si piden un archivo que no existe, que siga y caiga en 404 normal
+      fallthrough: true,
+      setHeaders(res) {
+        // cache leve (ajustable)
+        res.setHeader("Cache-Control", "public, max-age=3600");
+      },
+    })
+  );
 
   /* =====================
      Health check
