@@ -1,6 +1,7 @@
 // tptech-backend/src/app.ts
 import express from "express";
 import cookieParser from "cookie-parser";
+import path from "node:path";
 
 import routes from "./routes/index.js";
 import { requestContextMiddleware } from "./lib/prisma.js";
@@ -24,9 +25,20 @@ export function createApp() {
 
   /* =====================
      Parsers
+     - json para requests normales
+     - urlencoded para forms sin archivos
+     - multipart con archivos lo maneja multer por ruta
   ===================== */
   app.use(express.json({ limit: "1mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "1mb" }));
   app.use(cookieParser());
+
+  /* =====================
+     Static uploads
+     ✅ sirve logo/adjuntos en: /uploads/...
+     (asegurate de no commitear uploads al repo)
+  ===================== */
+  app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
   /* =====================
      Request Context (ALS)

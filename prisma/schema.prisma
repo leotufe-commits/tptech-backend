@@ -13,7 +13,7 @@ datasource db {
 ///  * JOYERÍA (EMPRESA)
 ///  * =========================
 model Jewelry {
-  id           String      @id @default(cuid())
+  id           String   @id @default(cuid())
   name         String
   firstName    String
   lastName     String
@@ -25,13 +25,48 @@ model Jewelry {
   province     String
   postalCode   String
   country      String
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
+
+  /// ✅ NUEVOS CAMPOS (Empresa)
+  /// Defaults para no romper registros existentes
+  logoUrl      String   @default("")
+  legalName    String   @default("")
+  cuit         String   @default("")
+  ivaCondition String   @default("")
+  email        String   @default("")
+  website      String   @default("")
+  notes        String   @default("")
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
   auditLogs    AuditLog[]
   roles        Role[]
   users        User[]
   warehouses   Warehouse[]
 
+  /// ✅ Adjuntos (nueva relación)
+  attachments  JewelryAttachment[]
+
+  @@index([createdAt])
+}
+
+/// *
+///  * =========================
+///  * ADJUNTOS DE EMPRESA
+///  * =========================
+model JewelryAttachment {
+  id        String   @id @default(cuid())
+  jewelryId String
+  jewelry   Jewelry  @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+
+  url       String
+  filename  String
+  mimeType  String
+  size      Int
+
+  createdAt DateTime @default(now())
+
+  @@index([jewelryId])
   @@index([createdAt])
 }
 
@@ -134,8 +169,8 @@ model RolePermission {
 model UserRole {
   userId String
   roleId String
-  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@id([userId, roleId])
   @@index([roleId])

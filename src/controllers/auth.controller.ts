@@ -119,7 +119,24 @@ function computeEffectivePermissions(user: ComputeUserShape) {
   return Array.from(base).sort();
 }
 
+// ✅ normalizador: SIEMPRE string (incluye "")
 const s = (v: any) => String(v ?? "").trim();
+
+/**
+ * Construye base pública para URLs de archivos.
+ * - Si seteás PUBLIC_BASE_URL en env (recomendado en prod), lo usa.
+ * - Si no, usa protocolo + host del request.
+ */
+function publicBaseUrl(req: Request) {
+  const envBase = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "");
+  if (envBase) return envBase;
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+/** extrae filename de multer (diskStorage) */
+function fileUrl(req: Request, filename: string) {
+  return `${publicBaseUrl(req)}/uploads/jewelry/${encodeURIComponent(filename)}`;
+}
 
 /* =========================
    ME
@@ -185,7 +202,11 @@ export async function me(req: Request, res: Response) {
 }
 
 /* =========================
-   UPDATE JEWELRY
+   UPDATE JEWELRY (JSON + multipart)
+   - guarda campos "vacíos" también
+   - soporta logo + attachments via multer fields:
+     - logo (1)
+     - attachments (N)
 ========================= */
 export async function updateMyJewelry(req: Request, res: Response) {
   const userId = req.userId!;
@@ -199,12 +220,28 @@ export async function updateMyJewelry(req: Request, res: Response) {
   if (!meUser) return res.status(404).json({ message: "User not found." });
   if (!meUser.jewelryId) return res.status(400).json({ message: "Jewelry not set for user." });
 
+  // multer fields()
+  const files = (req as any).files as
+    | {
+        logo?: Express.Multer.File[];
+        attachments?: Express.Multer.File[];
+      }
+    | undefined;
+
+  const logoFile = files?.logo?.[0] ?? null;
+  const attachments = files?.attachments ?? [];
+
+  // Si subieron logo, generamos URL pública
+  const newLogoUrl = logoFile ? fileUrl(req, logoFile.filename) : undefined;
+
+  // 1) Update de Jewelry (incluye campos "empresa" + los existentes)
+  // ⚠️ Si alguno de estos campos todavía NO existe en tu schema.prisma,
+  // Prisma va a fallar al compilar. En ese caso agregalos (te dejo abajo el schema).
   const updated = await prisma.jewelry.update({
     where: { id: meUser.jewelryId },
     data: {
+      // existentes
       name: s(data.name),
-      firstName: s(data.firstName),
-      lastName: s(data.lastName),
       phoneCountry: s(data.phoneCountry),
       phoneNumber: s(data.phoneNumber),
       street: s(data.street),
@@ -213,7 +250,45 @@ export async function updateMyJewelry(req: Request, res: Response) {
       province: s(data.province),
       postalCode: s(data.postalCode),
       country: s(data.country),
-    },
+
+      // nuevos (empresa)
+      legalName: s(data.legalName),
+      cuit: s(data.cuit),
+      ivaCondition: s(data.ivaCondition),
+      email: s(data.email),
+      website: s(data.website),
+      notes: String(data.notes ?? ""),
+
+      // logoUrl: solo si subieron archivo, si no mantenemos lo que venga por body (compatibilidad)
+      ...(newLogoUrl
+        ? { logoUrl: newLogoUrl }
+        : { logoUrl: s(data.logoUrl) }),
+    } as any,
+  });
+
+  // 2) Persistencia de adjuntos (si existe el modelo JewelryAttachment)
+  // Si todavía no lo tenés, agregalo al schema (abajo) y migrá.
+  if (attachments.length > 0) {
+    // Evitar crash si todavía no existe el modelo:
+    // si no existe, TypeScript/Prisma te va a avisar en build.
+    await prisma.jewelryAttachment.createMany({
+      data: attachments.map((f) => ({
+        jewelryId: meUser.jewelryId!,
+        url: fileUrl(req, f.filename),
+        filename: f.originalname,
+        mimeType: f.mimetype,
+        size: f.size,
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  // 3) Devolver joyería + adjuntos para refrescar UI
+  const jewelryWithAttachments = await prisma.jewelry.findUnique({
+    where: { id: meUser.jewelryId },
+    include: {
+      attachments: true, // relación JewelryAttachment[]
+    } as any,
   });
 
   auditLog(req, {
@@ -221,9 +296,13 @@ export async function updateMyJewelry(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: meUser.jewelryId,
+    meta: {
+      logoUploaded: !!logoFile,
+      attachmentsUploaded: attachments.length,
+    },
   });
 
-  return res.json(updated);
+  return res.json(jewelryWithAttachments ?? updated);
 }
 
 /* =========================
@@ -318,7 +397,8 @@ export async function register(req: Request, res: Response) {
           name: r.name,
           jewelryId: jewelry.id,
           isSystem: r.isSystem,
-        },
+          permIds: undefined as any,
+        } as any,
       });
 
       if (r.name === "OWNER") ownerRoleId = role.id;

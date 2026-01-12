@@ -18,6 +18,10 @@ import {
   updateJewelrySchema,
 } from "./auth.schemas.js";
 
+// ✅ NUEVO
+import { uploadJewelryFiles } from "../../middlewares/uploadJewelryFiles.js";
+import { parseJsonBodyField } from "../../middlewares/parseJsonBodyField.js";
+
 const router = Router();
 
 /* ===========================
@@ -29,11 +33,21 @@ router.post("/logout", requireAuth, Auth.logout);
 
 router.get("/me", requireAuth, Auth.me);
 
+/**
+ * ✅ Soporta:
+ * - JSON (como hoy)
+ * - multipart/form-data con:
+ *    - data: JSON string
+ *    - logo: File
+ *    - attachments: File[]
+ */
 router.put(
   "/me/jewelry",
   requireAuth,
-  validateBody(updateJewelrySchema),
-  Auth.updateMyJewelry
+  uploadJewelryFiles,               // 1) recibe archivos si vienen
+  parseJsonBodyField("data"),       // 2) si viene data (string JSON) => lo pasa a req.body
+  validateBody(updateJewelrySchema),// 3) valida el body ya parseado
+  Auth.updateMyJewelry              // 4) guarda
 );
 
 router.post("/register", validateBody(registerSchema), Auth.register);
