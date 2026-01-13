@@ -8,7 +8,7 @@ import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
 import { UserStatus, OverrideEffect, PermModule, PermAction } from "@prisma/client";
-import { auditLog } from "../lib/auditLogger.js";
+import { auditLog as writeAuditLog } from "../lib/auditLogger.js";
 
 /* =========================
    ENV / CONST
@@ -98,7 +98,9 @@ function computeEffectivePermissions(user: ComputeUserShape) {
   for (const ur of user.roles ?? []) {
     const rps = ur.role?.permissions ?? [];
     for (const rp of rps) {
-      fromRoles.push(formatPerm(String(rp.permission.module), String(rp.permission.action)));
+      fromRoles.push(
+        formatPerm(String(rp.permission.module), String(rp.permission.action))
+      );
     }
   }
 
@@ -276,7 +278,7 @@ export async function me(req: Request, res: Response) {
   if (!user) return res.status(404).json({ message: "User not found." });
 
   if (user.status !== UserStatus.ACTIVE) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.me",
       success: false,
       userId: user.id,
@@ -312,10 +314,6 @@ export async function me(req: Request, res: Response) {
 
 /* =========================
    UPDATE JEWELRY (JSON + multipart)
-   - soporta logo + attachments via multer fields:
-     - logo (1)
-     - attachments (N)
-     - attachments[] (N) ✅
 ========================= */
 export async function updateMyJewelry(req: Request, res: Response) {
   const userId = (req as any).userId as string;
@@ -329,28 +327,15 @@ export async function updateMyJewelry(req: Request, res: Response) {
   if (!meUser) return res.status(404).json({ message: "User not found." });
   if (!meUser.jewelryId) return res.status(400).json({ message: "Jewelry not set for user." });
 
-  // multer fields()
   const files = (req as any).files as
     | {
         logo?: Array<{ filename: string; originalname: string; mimetype: string; size: number }>;
-        attachments?: Array<{
-          filename: string;
-          originalname: string;
-          mimetype: string;
-          size: number;
-        }>;
-        "attachments[]"?: Array<{
-          filename: string;
-          originalname: string;
-          mimetype: string;
-          size: number;
-        }>;
+        attachments?: Array<{ filename: string; originalname: string; mimetype: string; size: number }>;
+        "attachments[]"?: Array<{ filename: string; originalname: string; mimetype: string; size: number }>;
       }
     | undefined;
 
   const logoFile = files?.logo?.[0] ?? null;
-
-  // ✅ robusto: si llegan ambos, se unen
   const attachments = [...(files?.attachments ?? []), ...(files?.["attachments[]"] ?? [])];
 
   const newLogoUrl = logoFile ? fileUrl(req, logoFile.filename) : undefined;
@@ -409,7 +394,6 @@ export async function updateMyJewelry(req: Request, res: Response) {
     }
   }
 
-  // ✅ devolver SIEMPRE attachments (si existe el modelo)
   try {
     const jewelry = await prisma.jewelry.findUnique({
       where: { id: meUser.jewelryId },
@@ -425,7 +409,7 @@ export async function updateMyJewelry(req: Request, res: Response) {
       atts = [];
     }
 
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "jewelry.update_profile",
       success: true,
       userId,
@@ -467,12 +451,12 @@ export async function deleteMyJewelryLogo(req: Request, res: Response) {
       data: { logoUrl: "" } as any,
     });
   } catch {
-    // si el schema no tiene logoUrl, no rompemos
+    // no-op
   }
 
   if (prevFilename) await tryDeleteUploadFile(prevFilename);
 
-  auditLog(req, {
+  writeAuditLog(req, {
     action: "jewelry.delete_logo",
     success: true,
     userId,
@@ -517,7 +501,7 @@ export async function deleteMyJewelryAttachment(req: Request, res: Response) {
 
     if (storageFilename) await tryDeleteUploadFile(storageFilename);
 
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "jewelry.delete_attachment",
       success: true,
       userId,
@@ -540,7 +524,7 @@ export async function register(req: Request, res: Response) {
 
   const existing = await prisma.user.findUnique({ where: { email } });
   if (existing) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.register",
       success: false,
       meta: { email, reason: "email_already_registered" },
@@ -660,7 +644,7 @@ export async function register(req: Request, res: Response) {
   const token = signToken(result.user.id, result.user.jewelryId, result.user.tokenVersion);
   setAuthCookie(req, res, token);
 
-  auditLog(req, {
+  writeAuditLog(req, {
     action: "auth.register",
     success: true,
     userId: result.user.id,
@@ -701,17 +685,16 @@ export async function login(req: Request, res: Response) {
   const email = s(data.email).toLowerCase();
   const password = String(data.password ?? "");
 
-  // ✅ select liviano (evita include gigante)
   const user = await prisma.user.findUnique({
     where: { email },
     select: {
       ...(authUserSelect as any),
-      password: true, // ✅ solo acá lo pedimos
+      password: true,
     },
   });
 
   if (!user) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.login",
       success: false,
       meta: { email, reason: "user_not_found" },
@@ -720,7 +703,7 @@ export async function login(req: Request, res: Response) {
   }
 
   if (user.status !== UserStatus.ACTIVE) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.login",
       success: false,
       userId: user.id,
@@ -731,7 +714,7 @@ export async function login(req: Request, res: Response) {
   }
 
   if (!password) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.login",
       success: false,
       userId: user.id,
@@ -743,7 +726,7 @@ export async function login(req: Request, res: Response) {
 
   const ok = await bcrypt.compare(password, user.password);
   if (!ok) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.login",
       success: false,
       userId: user.id,
@@ -756,7 +739,7 @@ export async function login(req: Request, res: Response) {
   const token = signToken(user.id, user.jewelryId, user.tokenVersion);
   setAuthCookie(req, res, token);
 
-  auditLog(req, {
+  writeAuditLog(req, {
     action: "auth.login",
     success: true,
     userId: user.id,
@@ -794,7 +777,7 @@ export async function login(req: Request, res: Response) {
 export async function logout(req: Request, res: Response) {
   clearAuthCookie(req, res);
 
-  auditLog(req, {
+  writeAuditLog(req, {
     action: "auth.logout",
     success: true,
     userId: (req as any).userId,
@@ -814,7 +797,7 @@ export async function forgotPassword(req: Request, res: Response) {
   const user = await prisma.user.findUnique({ where: { email } });
 
   if (!user) {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.forgot_password",
       success: true,
       meta: { email, userFound: false },
@@ -833,7 +816,7 @@ export async function forgotPassword(req: Request, res: Response) {
   const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
   await sendResetEmail(email, resetLink);
 
-  auditLog(req, {
+  writeAuditLog(req, {
     action: "auth.forgot_password",
     success: true,
     userId: user.id,
@@ -857,7 +840,7 @@ export async function resetPassword(req: Request, res: Response) {
     }) as any;
 
     if (!payload?.sub || payload?.type !== "reset" || !payload?.jti) {
-      auditLog(req, {
+      writeAuditLog(req, {
         action: "auth.reset_password",
         success: false,
         meta: { reason: "invalid_token_payload" },
@@ -873,7 +856,7 @@ export async function resetPassword(req: Request, res: Response) {
     });
 
     if (!user) {
-      auditLog(req, {
+      writeAuditLog(req, {
         action: "auth.reset_password",
         success: false,
         meta: { reason: "user_not_found" },
@@ -893,7 +876,7 @@ export async function resetPassword(req: Request, res: Response) {
 
     clearAuthCookie(req, res);
 
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.reset_password",
       success: true,
       userId: user.id,
@@ -903,7 +886,7 @@ export async function resetPassword(req: Request, res: Response) {
 
     return res.json({ ok: true });
   } catch {
-    auditLog(req, {
+    writeAuditLog(req, {
       action: "auth.reset_password",
       success: false,
       meta: { reason: "jwt_verify_failed" },
