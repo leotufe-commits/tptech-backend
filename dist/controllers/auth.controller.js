@@ -5,8 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
-import { UserStatus, OverrideEffect, PermModule, PermAction } from "@prisma/client";
-import { auditLog as writeAuditLog } from "../lib/auditLogger.js";
+import { UserStatus, OverrideEffect, PermModule, PermAction, } from "@prisma/client";
+import { auditLog } from "../lib/auditLogger.js";
 /* =========================
    ENV / CONST
 ========================= */
@@ -71,9 +71,9 @@ function computeEffectivePermissions(user) {
     const deny = [];
     for (const ov of user.permissionOverrides ?? []) {
         const p = formatPerm(String(ov.permission.module), String(ov.permission.action));
-        if (ov.effect === OverrideEffect.ALLOW)
+        if (ov.effect === "ALLOW")
             allow.push(p);
-        if (ov.effect === OverrideEffect.DENY)
+        if (ov.effect === "DENY")
             deny.push(p);
     }
     // 3) aplicar deny sobre roles y allow
@@ -129,110 +129,61 @@ async function tryDeleteUploadFile(storageFilename) {
     }
 }
 /* =========================
-   DB SELECTS (performance)
-========================= */
-// ✅ OJO: en Prisma no podés mezclar "select" con "include".
-//     Dejamos TODO en select para que compile y sea consistente.
-const authUserSelect = {
-    id: true,
-    email: true,
-    name: true,
-    status: true,
-    avatarUrl: true,
-    jewelryId: true,
-    tokenVersion: true,
-    createdAt: true,
-    updatedAt: true,
-    jewelry: {
-        select: {
-            id: true,
-            name: true,
-            firstName: true,
-            lastName: true,
-            phoneCountry: true,
-            phoneNumber: true,
-            street: true,
-            number: true,
-            city: true,
-            province: true,
-            postalCode: true,
-            country: true,
-            legalName: true,
-            cuit: true,
-            ivaCondition: true,
-            email: true,
-            website: true,
-            notes: true,
-            logoUrl: true,
-            createdAt: true,
-            updatedAt: true,
-            attachments: true, // si tu schema tiene JewelryAttachment via relation
-        },
-    },
-    favoriteWarehouse: {
-        select: {
-            id: true,
-            name: true,
-        },
-    },
-    roles: {
-        select: {
-            roleId: true,
-            role: {
-                select: {
-                    id: true,
-                    name: true, // técnico (OWNER/ADMIN/...)
-                    displayName: true, // visible
-                    isSystem: true,
-                    deletedAt: true,
-                    permissions: {
-                        select: {
-                            permission: { select: { module: true, action: true } },
-                        },
-                    },
-                },
-            },
-        },
-    },
-    permissionOverrides: {
-        select: {
-            effect: true,
-            permission: { select: { module: true, action: true } },
-        },
-    },
-};
-function mapRolesForClient(user) {
-    return (user.roles ?? [])
-        .map((ur) => {
-        const r = ur.role;
-        if (!r)
-            return null;
-        return {
-            id: r.id,
-            name: r.displayName ?? r.name, // ✅ visible
-            code: r.name, // ✅ técnico
-            isSystem: r.isSystem ?? false,
-        };
-    })
-        .filter(Boolean);
-}
-/* =========================
    ME
 ========================= */
 export async function me(req, res) {
     const userId = req.userId;
-    const tenantId = req.tenantId;
-    if (!userId || !tenantId)
+    if (!userId)
         return res.status(401).json({ message: "Unauthorized" });
-    // ✅ Seguridad multi-tenant: filtramos también por jewelryId
-    const user = await prisma.user.findFirst({
-        where: { id: userId, jewelryId: tenantId },
-        select: authUserSelect,
-    });
+    // 1) Intento: incluir attachments si el schema lo soporta
+    let user = null;
+    try {
+        user = await prisma.user.findUnique({
+            where: { id: userId },
+            include: {
+                jewelry: { include: { attachments: true } },
+                favoriteWarehouse: true,
+                roles: {
+                    include: {
+                        role: {
+                            include: {
+                                permissions: { include: { permission: true } },
+                            },
+                        },
+                    },
+                },
+                permissionOverrides: {
+                    include: { permission: true },
+                },
+            },
+        });
+    }
+    catch {
+        // 2) Fallback: schema sin attachments
+        user = await prisma.user.findUnique({
+            where: { id: userId },
+            include: {
+                jewelry: true,
+                favoriteWarehouse: true,
+                roles: {
+                    include: {
+                        role: {
+                            include: {
+                                permissions: { include: { permission: true } },
+                            },
+                        },
+                    },
+                },
+                permissionOverrides: {
+                    include: { permission: true },
+                },
+            },
+        });
+    }
     if (!user)
         return res.status(404).json({ message: "User not found." });
     if (user.status !== UserStatus.ACTIVE) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.me",
             success: false,
             userId: user.id,
@@ -241,19 +192,16 @@ export async function me(req, res) {
         });
         return res.status(403).json({ message: "Usuario no habilitado." });
     }
-    const roles = mapRolesForClient(user);
+    const safeUser = { ...user };
+    delete safeUser.password;
+    const roles = (user.roles ?? []).map((ur) => ({
+        id: ur.roleId,
+        name: ur.role?.name,
+        isSystem: ur.role?.isSystem ?? false,
+    }));
     const permissions = computeEffectivePermissions(user);
-    // ✅ user “safe” explícito (evita filtrar cosas de más)
-    const safeUser = {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatarUrl: user.avatarUrl,
-        status: user.status,
-        jewelryId: user.jewelryId,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-    };
+    delete safeUser.roles;
+    delete safeUser.permissionOverrides;
     return res.json({
         user: safeUser,
         jewelry: user.jewelry ?? null,
@@ -264,6 +212,10 @@ export async function me(req, res) {
 }
 /* =========================
    UPDATE JEWELRY (JSON + multipart)
+   - soporta logo + attachments via multer fields:
+     - logo (1)
+     - attachments (N)
+     - attachments[] (N) ✅
 ========================= */
 export async function updateMyJewelry(req, res) {
     const userId = req.userId;
@@ -276,9 +228,14 @@ export async function updateMyJewelry(req, res) {
         return res.status(404).json({ message: "User not found." });
     if (!meUser.jewelryId)
         return res.status(400).json({ message: "Jewelry not set for user." });
+    // multer fields()
     const files = req.files;
     const logoFile = files?.logo?.[0] ?? null;
-    const attachments = [...(files?.attachments ?? []), ...(files?.["attachments[]"] ?? [])];
+    // ✅ robusto: si llegan ambos, se unen
+    const attachments = [
+        ...(files?.attachments ?? []),
+        ...(files?.["attachments[]"] ?? []),
+    ];
     const newLogoUrl = logoFile ? fileUrl(req, logoFile.filename) : undefined;
     const baseUpdateData = {
         name: s(data.name),
@@ -328,9 +285,11 @@ export async function updateMyJewelry(req, res) {
             });
         }
         catch (e) {
+            // ✅ NUNCA más silencioso: te muestra el motivo real en local/prod
             console.error("❌ jewelryAttachment.createMany failed:", e);
         }
     }
+    // ✅ devolver SIEMPRE attachments (si existe el modelo)
     try {
         const jewelry = await prisma.jewelry.findUnique({
             where: { id: meUser.jewelryId },
@@ -345,16 +304,20 @@ export async function updateMyJewelry(req, res) {
         catch {
             atts = [];
         }
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "jewelry.update_profile",
             success: true,
             userId,
             tenantId: meUser.jewelryId,
-            meta: { logoUploaded: !!logoFile, attachmentsUploaded: attachments.length },
+            meta: {
+                logoUploaded: !!logoFile,
+                attachmentsUploaded: attachments.length,
+            },
         });
         return res.json({ ...(jewelry ?? updated), attachments: atts });
     }
     catch {
+        // fallback
         return res.json(updated);
     }
 }
@@ -384,11 +347,11 @@ export async function deleteMyJewelryLogo(req, res) {
         });
     }
     catch {
-        // no-op
+        // si el schema no tiene logoUrl, no rompemos
     }
     if (prevFilename)
         await tryDeleteUploadFile(prevFilename);
-    writeAuditLog(req, {
+    auditLog(req, {
         action: "jewelry.delete_logo",
         success: true,
         userId,
@@ -426,7 +389,7 @@ export async function deleteMyJewelryAttachment(req, res) {
         });
         if (storageFilename)
             await tryDeleteUploadFile(storageFilename);
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "jewelry.delete_attachment",
             success: true,
             userId,
@@ -436,6 +399,7 @@ export async function deleteMyJewelryAttachment(req, res) {
         return res.status(204).send();
     }
     catch {
+        // si el modelo no existe todavía o hubo error
         return res.status(404).json({ message: "Adjunto no encontrado." });
     }
 }
@@ -447,7 +411,7 @@ export async function register(req, res) {
     const email = s(data.email).toLowerCase();
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.register",
             success: false,
             meta: { email, reason: "email_already_registered" },
@@ -542,35 +506,49 @@ export async function register(req, res) {
             },
         });
         await tx.userRole.create({
-            data: { userId: user.id, roleId: ownerRoleId },
+            data: {
+                userId: user.id,
+                roleId: ownerRoleId,
+            },
         });
         const fullUser = await tx.user.findUniqueOrThrow({
             where: { id: user.id },
-            select: authUserSelect,
+            include: {
+                jewelry: true,
+                favoriteWarehouse: true,
+                roles: {
+                    include: {
+                        role: {
+                            include: {
+                                permissions: { include: { permission: true } },
+                            },
+                        },
+                    },
+                },
+                permissionOverrides: { include: { permission: true } },
+            },
         });
         return { user: fullUser, jewelry };
     });
     const token = signToken(result.user.id, result.user.jewelryId, result.user.tokenVersion);
     setAuthCookie(req, res, token);
-    writeAuditLog(req, {
+    auditLog(req, {
         action: "auth.register",
         success: true,
         userId: result.user.id,
         tenantId: result.user.jewelryId,
         meta: { email },
     });
-    const roles = mapRolesForClient(result.user);
+    const safeUser = { ...result.user };
+    delete safeUser.password;
+    const roles = (result.user.roles ?? []).map((ur) => ({
+        id: ur.roleId,
+        name: ur.role?.name,
+        isSystem: ur.role?.isSystem ?? false,
+    }));
     const permissions = computeEffectivePermissions(result.user);
-    const safeUser = {
-        id: result.user.id,
-        email: result.user.email,
-        name: result.user.name,
-        avatarUrl: result.user.avatarUrl,
-        status: result.user.status,
-        jewelryId: result.user.jewelryId,
-        createdAt: result.user.createdAt,
-        updatedAt: result.user.updatedAt,
-    };
+    delete safeUser.roles;
+    delete safeUser.permissionOverrides;
     return res.status(201).json({
         user: safeUser,
         jewelry: result.jewelry,
@@ -590,13 +568,25 @@ export async function login(req, res) {
     const password = String(data.password ?? "");
     const user = await prisma.user.findUnique({
         where: { email },
-        select: {
-            ...authUserSelect,
-            password: true,
+        include: {
+            jewelry: true,
+            roles: {
+                include: {
+                    role: {
+                        include: {
+                            permissions: { include: { permission: true } },
+                        },
+                    },
+                },
+            },
+            permissionOverrides: {
+                include: { permission: true },
+            },
+            favoriteWarehouse: true,
         },
     });
     if (!user) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.login",
             success: false,
             meta: { email, reason: "user_not_found" },
@@ -604,7 +594,7 @@ export async function login(req, res) {
         return res.status(401).json({ message: "Email o contraseña incorrectos." });
     }
     if (user.status !== UserStatus.ACTIVE) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.login",
             success: false,
             userId: user.id,
@@ -614,7 +604,7 @@ export async function login(req, res) {
         return res.status(403).json({ message: "Usuario no habilitado." });
     }
     if (!password) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.login",
             success: false,
             userId: user.id,
@@ -625,7 +615,7 @@ export async function login(req, res) {
     }
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.login",
             success: false,
             userId: user.id,
@@ -636,24 +626,22 @@ export async function login(req, res) {
     }
     const token = signToken(user.id, user.jewelryId, user.tokenVersion);
     setAuthCookie(req, res, token);
-    writeAuditLog(req, {
+    auditLog(req, {
         action: "auth.login",
         success: true,
         userId: user.id,
         tenantId: user.jewelryId,
     });
-    const roles = mapRolesForClient(user);
+    const safeUser = { ...user };
+    delete safeUser.password;
+    const roles = (user.roles ?? []).map((ur) => ({
+        id: ur.roleId,
+        name: ur.role?.name,
+        isSystem: ur.role?.isSystem ?? false,
+    }));
     const permissions = computeEffectivePermissions(user);
-    const safeUser = {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatarUrl: user.avatarUrl,
-        status: user.status,
-        jewelryId: user.jewelryId,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-    };
+    delete safeUser.roles;
+    delete safeUser.permissionOverrides;
     return res.json({
         user: safeUser,
         jewelry: user.jewelry ?? null,
@@ -669,7 +657,7 @@ export async function login(req, res) {
 ========================= */
 export async function logout(req, res) {
     clearAuthCookie(req, res);
-    writeAuditLog(req, {
+    auditLog(req, {
         action: "auth.logout",
         success: true,
         userId: req.userId,
@@ -685,7 +673,7 @@ export async function forgotPassword(req, res) {
     const email = s(data.email).toLowerCase();
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.forgot_password",
             success: true,
             meta: { email, userFound: false },
@@ -700,7 +688,7 @@ export async function forgotPassword(req, res) {
     });
     const resetLink = `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
     await sendResetEmail(email, resetLink);
-    writeAuditLog(req, {
+    auditLog(req, {
         action: "auth.forgot_password",
         success: true,
         userId: user.id,
@@ -720,7 +708,7 @@ export async function resetPassword(req, res) {
             audience: JWT_AUDIENCE,
         });
         if (!payload?.sub || payload?.type !== "reset" || !payload?.jti) {
-            writeAuditLog(req, {
+            auditLog(req, {
                 action: "auth.reset_password",
                 success: false,
                 meta: { reason: "invalid_token_payload" },
@@ -733,7 +721,7 @@ export async function resetPassword(req, res) {
             select: { id: true, jewelryId: true },
         });
         if (!user) {
-            writeAuditLog(req, {
+            auditLog(req, {
                 action: "auth.reset_password",
                 success: false,
                 meta: { reason: "user_not_found" },
@@ -749,7 +737,7 @@ export async function resetPassword(req, res) {
             },
         });
         clearAuthCookie(req, res);
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.reset_password",
             success: true,
             userId: user.id,
@@ -759,7 +747,7 @@ export async function resetPassword(req, res) {
         return res.json({ ok: true });
     }
     catch {
-        writeAuditLog(req, {
+        auditLog(req, {
             action: "auth.reset_password",
             success: false,
             meta: { reason: "jwt_verify_failed" },
