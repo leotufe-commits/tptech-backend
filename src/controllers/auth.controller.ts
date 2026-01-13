@@ -107,8 +107,8 @@ function computeEffectivePermissions(user: ComputeUserShape) {
   const deny: string[] = [];
   for (const ov of user.permissionOverrides ?? []) {
     const p = formatPerm(String(ov.permission.module), String(ov.permission.action));
-    if (ov.effect === "ALLOW") allow.push(p);
-    if (ov.effect === "DENY") deny.push(p);
+    if (ov.effect === OverrideEffect.ALLOW) allow.push(p);
+    if (ov.effect === OverrideEffect.DENY) deny.push(p);
   }
 
   // 3) aplicar deny sobre roles y allow
@@ -168,7 +168,8 @@ async function tryDeleteUploadFile(storageFilename: string) {
    DB SELECTS (performance)
 ========================= */
 
-// Select liviano y consistente para /me y login/register
+// ✅ OJO: en Prisma no podés mezclar "select" con "include".
+//     Dejamos TODO en select para que compile y sea consistente.
 const authUserSelect = {
   id: true,
   email: true,
@@ -181,12 +182,38 @@ const authUserSelect = {
   updatedAt: true,
 
   jewelry: {
-    include: {
-      attachments: true,
-    },
+    select: {
+      id: true,
+      name: true,
+      firstName: true,
+      lastName: true,
+      phoneCountry: true,
+      phoneNumber: true,
+      street: true,
+      number: true,
+      city: true,
+      province: true,
+      postalCode: true,
+      country: true,
+      legalName: true,
+      cuit: true,
+      ivaCondition: true,
+      email: true,
+      website: true,
+      notes: true,
+      logoUrl: true,
+      createdAt: true,
+      updatedAt: true,
+      attachments: true, // si tu schema tiene JewelryAttachment via relation
+    } as any,
   },
 
-  favoriteWarehouse: true,
+  favoriteWarehouse: {
+    select: {
+      id: true,
+      name: true,
+    } as any,
+  },
 
   roles: {
     select: {
@@ -235,8 +262,8 @@ function mapRolesForClient(user: any) {
    ME
 ========================= */
 export async function me(req: Request, res: Response) {
-  const userId = req.userId;
-  const tenantId = req.tenantId;
+  const userId = (req as any).userId;
+  const tenantId = (req as any).tenantId;
 
   if (!userId || !tenantId) return res.status(401).json({ message: "Unauthorized" });
 
@@ -291,7 +318,7 @@ export async function me(req: Request, res: Response) {
      - attachments[] (N) ✅
 ========================= */
 export async function updateMyJewelry(req: Request, res: Response) {
-  const userId = req.userId!;
+  const userId = (req as any).userId as string;
   const data = req.body as any;
 
   const meUser = await prisma.user.findUnique({
@@ -416,7 +443,7 @@ export async function updateMyJewelry(req: Request, res: Response) {
    DELETE JEWELRY LOGO
 ========================= */
 export async function deleteMyJewelryLogo(req: Request, res: Response) {
-  const userId = req.userId!;
+  const userId = (req as any).userId as string;
 
   const meUser = await prisma.user.findUnique({
     where: { id: userId },
@@ -459,7 +486,7 @@ export async function deleteMyJewelryLogo(req: Request, res: Response) {
    DELETE JEWELRY ATTACHMENT
 ========================= */
 export async function deleteMyJewelryAttachment(req: Request, res: Response) {
-  const userId = req.userId!;
+  const userId = (req as any).userId as string;
   const attachmentId = String(req.params.id || "").trim();
 
   if (!attachmentId) return res.status(400).json({ message: "ID inválido." });
@@ -770,8 +797,8 @@ export async function logout(req: Request, res: Response) {
   auditLog(req, {
     action: "auth.logout",
     success: true,
-    userId: req.userId,
-    tenantId: req.tenantId,
+    userId: (req as any).userId,
+    tenantId: (req as any).tenantId,
   });
 
   return res.status(204).send();
