@@ -1,4 +1,4 @@
-// src/middlewares/requirePermission.ts
+// tptech-backend/src/middlewares/requirePermission.ts
 import type { Request, Response, NextFunction } from "express";
 import { prisma } from "../lib/prisma.js";
 import { OverrideEffect } from "@prisma/client";
@@ -28,16 +28,25 @@ export function requirePermission(module: string, action: string) {
         where: { id: userId, jewelryId: tenantId },
         select: {
           roles: {
-            include: {
+            select: {
               role: {
                 select: {
                   deletedAt: true,
-                  permissions: { include: { permission: true } },
+                  permissions: {
+                    select: {
+                      permission: { select: { module: true, action: true } },
+                    },
+                  },
                 },
               },
             },
           },
-          permissionOverrides: { include: { permission: true } },
+          permissionOverrides: {
+            select: {
+              effect: true,
+              permission: { select: { module: true, action: true } },
+            },
+          },
         },
       });
 
@@ -68,13 +77,10 @@ export function requirePermission(module: string, action: string) {
       for (const a of allow) effective.add(a);
       for (const d of deny) effective.delete(d);
 
-      // ✅ SIEMPRE asignamos un array (evita TS18048)
       req.permissions = Array.from(effective);
     }
 
-    // ✅ guard para TS (y por seguridad)
     const perms = req.permissions ?? [];
-
     if (!perms.includes(wanted)) {
       return res.status(403).json({
         message: "No tenés permisos para realizar esta acción.",

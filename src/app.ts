@@ -5,6 +5,7 @@ import path from "node:path";
 
 import routes from "./routes/index.js";
 import { requestContextMiddleware } from "./lib/prisma.js";
+import { perfLogger } from "./middlewares/perfLogger.js";
 import { errorHandler } from "./middlewares/errorHandler.js";
 import { buildCorsMiddleware } from "./config/cors.js";
 import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/security.js";
@@ -34,6 +35,13 @@ export function createApp() {
      ⚠️ ANTES de rutas
   ===================== */
   app.use(requestContextMiddleware);
+
+  /* =====================
+     PERF logger (auditoría)
+     - loguea lentos (>= slowMs) en prod
+     - loguea todo en dev
+  ===================== */
+  app.use(perfLogger({ slowMs: 700 }));
 
   /* =====================
      CORS (con credentials)

@@ -33,12 +33,12 @@ function normalizeName(raw: any) {
   return s.length ? s : null;
 }
 
-/**
- * Construye URL pública para archivos.
- * - Si tu avatarUrl se guarda como "/uploads/avatars/xxx.jpg", ya es suficiente para el frontend
- *   si tu backend sirve /uploads como estático.
- * - Si querés URL absoluta, seteá PUBLIC_BASE_URL (ej: https://tu-backend.onrender.com)
- */
+function clampInt(v: any, def: number, min: number, max: number) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
 function toPublicUrl(relativePath: string) {
   const base = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
   if (!base) return relativePath;
@@ -46,10 +46,6 @@ function toPublicUrl(relativePath: string) {
   return `${base}${p}`;
 }
 
-/**
- * Intenta borrar un archivo anterior si es local y está en /uploads/avatars.
- * No rompe si falla.
- */
 async function safeDeleteOldAvatar(avatarUrl: string | null) {
   if (!avatarUrl) return;
 
@@ -72,6 +68,12 @@ async function safeDeleteOldAvatar(avatarUrl: string | null) {
   }
 }
 
+/** hash random para usuarios PENDING (evita guardar password vacío) */
+async function randomPasswordHash() {
+  const raw = crypto.randomBytes(24).toString("hex");
+  return bcrypt.hash(raw, 10);
+}
+
 /* =========================
    POST /users
    Crear usuario (ADMIN)
@@ -92,9 +94,7 @@ export async function createUser(req: Request, res: Response) {
   const email = normalizeEmail(body.email);
   const name = normalizeName(body.name);
 
-  if (!email) {
-    return res.status(400).json({ message: "Email inválido." });
-  }
+  if (!email) return res.status(400).json({ message: "Email inválido." });
 
   let roleIds = Array.isArray(body.roleIds) ? body.roleIds : [];
   roleIds = uniqStrings(roleIds.map((r) => String(r || "").trim()).filter(Boolean));
@@ -109,6 +109,7 @@ export async function createUser(req: Request, res: Response) {
         ? UserStatus.ACTIVE
         : UserStatus.PENDING;
 
+  // email global único
   const existing = await prisma.user.findUnique({
     where: { email },
     select: { id: true },
@@ -125,6 +126,7 @@ export async function createUser(req: Request, res: Response) {
     return res.status(409).json({ message: "El email ya está registrado." });
   }
 
+  // validar roles (tenant)
   if (roleIds.length) {
     const roles = await prisma.role.findMany({
       where: { id: { in: roleIds }, jewelryId: tenantId, deletedAt: null },
@@ -138,7 +140,9 @@ export async function createUser(req: Request, res: Response) {
     }
   }
 
-  const passwordHash = hasPassword ? await bcrypt.hash(String(body.password), 10) : null;
+  const passwordHash = hasPassword
+    ? await bcrypt.hash(String(body.password), 10)
+    : await randomPasswordHash();
 
   const created = await prisma.$transaction(async (tx) => {
     const user = await tx.user.create({
@@ -147,7 +151,7 @@ export async function createUser(req: Request, res: Response) {
         name,
         status,
         jewelryId: tenantId,
-        password: passwordHash ?? "",
+        password: passwordHash,
         tokenVersion: 0,
       },
       select: {
@@ -164,28 +168,25 @@ export async function createUser(req: Request, res: Response) {
 
     if (roleIds.length) {
       await tx.userRole.createMany({
-        data: roleIds.map((roleId) => ({
-          userId: user.id,
-          roleId,
-        })),
+        data: roleIds.map((roleId) => ({ userId: user.id, roleId })),
         skipDuplicates: true,
       });
     }
 
+    // roles (filtrados por tenant)
     const roles = await tx.userRole.findMany({
       where: { userId: user.id },
       select: {
-        role: { select: { id: true, name: true, isSystem: true } },
+        role: { select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true } },
       },
     });
 
     return {
       ...user,
-      roles: roles.map((ur) => ({
-        id: ur.role.id,
-        name: ur.role.name,
-        isSystem: ur.role.isSystem,
-      })),
+      roles: roles
+        .map((ur) => ur.role)
+        .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
     };
   });
 
@@ -202,32 +203,67 @@ export async function createUser(req: Request, res: Response) {
 
 /* =========================
    GET /users
+   ✅ LIVIANO + PAGINADO + SEARCH
+   Query:
+   - q (email/nombre)
+   - status (ACTIVE/BLOCKED/PENDING)
+   - page (1..)
+   - limit (1..100)
 ========================= */
 export async function listUsers(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const users = await prisma.user.findMany({
-    where: { jewelryId: tenantId },
-    select: {
-      id: true,
-      email: true,
-      name: true,
-      status: true,
-      avatarUrl: true,
-      favoriteWarehouseId: true,
-      createdAt: true,
-      updatedAt: true,
-      roles: {
-        select: {
-          role: { select: { id: true, name: true, isSystem: true } },
+  const q = String((req.query.q ?? "") as any).trim();
+  const status = String((req.query.status ?? "") as any).trim().toUpperCase();
+  const page = clampInt(req.query.page, 1, 1, 10_000);
+  const limit = clampInt(req.query.limit, 30, 1, 100);
+  const skip = (page - 1) * limit;
+
+  const where: any = { jewelryId: tenantId };
+
+  if (status === "ACTIVE" || status === "BLOCKED" || status === "PENDING") {
+    where.status = status;
+  }
+
+  if (q) {
+    where.OR = [
+      { email: { contains: q, mode: "insensitive" } },
+      { name: { contains: q, mode: "insensitive" } },
+    ];
+  }
+
+  const [total, users] = await prisma.$transaction([
+    prisma.user.count({ where }),
+    prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        status: true,
+        avatarUrl: true,
+        favoriteWarehouseId: true,
+        createdAt: true,
+        updatedAt: true,
+        roles: {
+          select: {
+            role: {
+              select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true },
+            },
+          },
         },
       },
-    },
-    orderBy: { createdAt: "asc" },
-  });
+      orderBy: { createdAt: "asc" },
+      skip,
+      take: limit,
+    }),
+  ]);
 
   return res.json({
+    page,
+    limit,
+    total,
     users: users.map((u) => ({
       id: u.id,
       email: u.email,
@@ -237,23 +273,24 @@ export async function listUsers(req: Request, res: Response) {
       favoriteWarehouseId: u.favoriteWarehouseId,
       createdAt: u.createdAt,
       updatedAt: u.updatedAt,
-      roles: (u.roles ?? []).map((ur) => ({
-        id: ur.role.id,
-        name: ur.role.name,
-        isSystem: ur.role.isSystem,
-      })),
+      roles: (u.roles ?? [])
+        .map((ur) => ur.role)
+        .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
     })),
   });
 }
 
 /* =========================
    GET /users/:id
+   ✅ DETALLE (incluye overrides)
 ========================= */
 export async function getUser(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const targetUserId = String(req.params.id);
+  const targetUserId = String(req.params.id || "").trim();
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
 
   const user = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId },
@@ -268,7 +305,9 @@ export async function getUser(req: Request, res: Response) {
       updatedAt: true,
       roles: {
         select: {
-          role: { select: { id: true, name: true, isSystem: true } },
+          role: {
+            select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true },
+          },
         },
       },
       permissionOverrides: {
@@ -280,9 +319,7 @@ export async function getUser(req: Request, res: Response) {
     },
   });
 
-  if (!user) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
 
   return res.json({
     user: {
@@ -294,11 +331,10 @@ export async function getUser(req: Request, res: Response) {
       favoriteWarehouseId: user.favoriteWarehouseId,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
-      roles: (user.roles ?? []).map((ur) => ({
-        id: ur.role.id,
-        name: ur.role.name,
-        isSystem: ur.role.isSystem,
-      })),
+      roles: (user.roles ?? [])
+        .map((ur) => ur.role)
+        .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
       permissionOverrides: user.permissionOverrides ?? [],
     },
   });
@@ -312,13 +348,13 @@ export async function updateUserStatus(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const targetUserId = String(req.params.id);
+  const targetUserId = String(req.params.id || "").trim();
   const { status } = req.body as { status: UserStatus };
 
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
+
   if (targetUserId === actorId) {
-    return res.status(400).json({
-      message: "No podés cambiar tu propio estado desde aquí.",
-    });
+    return res.status(400).json({ message: "No podés cambiar tu propio estado desde aquí." });
   }
 
   const target = await prisma.user.findFirst({
@@ -326,9 +362,7 @@ export async function updateUserStatus(req: Request, res: Response) {
     select: { id: true },
   });
 
-  if (!target) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
   const updated = await prisma.user.update({
     where: { id: targetUserId },
@@ -368,19 +402,19 @@ export async function assignRolesToUser(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const targetUserId = String(req.params.id);
+  const targetUserId = String(req.params.id || "").trim();
   let { roleIds } = req.body as { roleIds: string[] };
+
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
 
   if (!Array.isArray(roleIds)) {
     return res.status(400).json({ message: "roleIds debe ser un array" });
   }
 
-  roleIds = uniqStrings(roleIds.map((r) => String(r || "").trim()).filter((r) => r.length > 0));
+  roleIds = uniqStrings(roleIds.map((r) => String(r || "").trim()).filter(Boolean));
 
   if (targetUserId === actorId) {
-    return res.status(400).json({
-      message: "No podés cambiar tus propios roles desde aquí.",
-    });
+    return res.status(400).json({ message: "No podés cambiar tus propios roles desde aquí." });
   }
 
   const target = await prisma.user.findFirst({
@@ -388,9 +422,7 @@ export async function assignRolesToUser(req: Request, res: Response) {
     select: { id: true },
   });
 
-  if (!target) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
   const roles = await prisma.role.findMany({
     where: {
@@ -402,29 +434,25 @@ export async function assignRolesToUser(req: Request, res: Response) {
   });
 
   if (roles.length !== roleIds.length) {
-    return res.status(400).json({
-      message: "Uno o más roles no son válidos para esta joyería.",
-    });
+    return res.status(400).json({ message: "Uno o más roles no son válidos para esta joyería." });
   }
 
-  await prisma.userRole.deleteMany({
-    where: { userId: targetUserId },
-  });
+  await prisma.$transaction(async (tx) => {
+    await tx.userRole.deleteMany({ where: { userId: targetUserId } });
 
-  if (roleIds.length) {
-    await prisma.userRole.createMany({
-      data: roleIds.map((roleId) => ({
-        userId: targetUserId,
-        roleId,
-      })),
-      skipDuplicates: true,
+    if (roleIds.length) {
+      await tx.userRole.createMany({
+        data: roleIds.map((roleId) => ({ userId: targetUserId, roleId })),
+        skipDuplicates: true,
+      });
+    }
+
+    // invalidar sesión
+    await tx.user.update({
+      where: { id: targetUserId },
+      data: { tokenVersion: { increment: 1 } },
+      select: { id: true },
     });
-  }
-
-  await prisma.user.update({
-    where: { id: targetUserId },
-    data: { tokenVersion: { increment: 1 } },
-    select: { id: true },
   });
 
   auditLog(req, {
@@ -446,29 +474,28 @@ export async function setUserOverride(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const targetUserId = String(req.params.id);
+  const targetUserId = String(req.params.id || "").trim();
   const { permissionId, effect } = req.body as {
     permissionId: string;
     effect: "ALLOW" | "DENY";
   };
+
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
+  if (!permissionId) return res.status(400).json({ message: "permissionId requerido." });
 
   const user = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId },
     select: { id: true },
   });
 
-  if (!user) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
 
   const perm = await prisma.permission.findUnique({
     where: { id: permissionId },
     select: { id: true },
   });
 
-  if (!perm) {
-    return res.status(404).json({ message: "Permiso no encontrado." });
-  }
+  if (!perm) return res.status(404).json({ message: "Permiso no encontrado." });
 
   const override = await prisma.userPermissionOverride.upsert({
     where: {
@@ -510,17 +537,18 @@ export async function removeUserOverride(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const targetUserId = String(req.params.id);
-  const { permissionId } = req.params;
+  const targetUserId = String(req.params.id || "").trim();
+  const permissionId = String(req.params.permissionId || "").trim();
+
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
+  if (!permissionId) return res.status(400).json({ message: "permissionId inválido." });
 
   const target = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId },
     select: { id: true },
   });
 
-  if (!target) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
   await prisma.userPermissionOverride.deleteMany({
     where: { userId: targetUserId, permissionId },
@@ -551,7 +579,6 @@ export async function updateMyAvatar(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  // ✅ Tipo correcto (viene de @types/multer)
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) {
     return res.status(400).json({ message: "Falta archivo avatar (multipart field: avatar)." });
@@ -578,9 +605,7 @@ export async function updateMyAvatar(req: Request, res: Response) {
     select: { avatarUrl: true, id: true },
   });
 
-  if (!prev) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!prev) return res.status(404).json({ message: "Usuario no encontrado." });
 
   if (ensureUniqueName) {
     const targetFsPath = `uploads/avatars/${ensureUniqueName}`;
@@ -630,9 +655,7 @@ export async function removeMyAvatar(req: Request, res: Response) {
     select: { avatarUrl: true, id: true },
   });
 
-  if (!prev) {
-    return res.status(404).json({ message: "Usuario no encontrado." });
-  }
+  if (!prev) return res.status(404).json({ message: "Usuario no encontrado." });
 
   const updated = await prisma.user.update({
     where: { id: actorId },
