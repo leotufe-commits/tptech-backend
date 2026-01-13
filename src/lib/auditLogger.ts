@@ -1,31 +1,32 @@
-// src/lib/auditLogger.ts
 import type { Request } from "express";
 
-type AuditEvent = {
+type AuditEventInput = {
   action: string;
   success: boolean;
-  userId?: string;
-  tenantId?: string;
-  ip?: string;
-  userAgent?: string;
-  meta?: Record<string, any>;
+  userId?: string | null;
+  tenantId?: string | null;
+  ip?: string | null;
+  userAgent?: string | null;
+  meta?: unknown;
+};
+
+type AuditEvent = AuditEventInput & {
   timestamp: string;
 };
 
 /**
  * Logger de auditoría de seguridad.
- * Por ahora escribe en consola, listo para:
- * - persistir en DB
- * - enviar a un servicio externo
- * - escribir a archivo
+ * - Seguro para TypeScript
+ * - Compatible con Prisma JsonValue
+ * - No rompe consola ni DB
  */
-export function auditLog(req: Request, event: Omit<AuditEvent, "timestamp">) {
+export function auditLog(req: Request, event: AuditEventInput) {
   const log: AuditEvent = {
     timestamp: new Date().toISOString(),
-    userId: req.userId,
-    tenantId: req.tenantId,
-    ip: req.ip,
-    userAgent: req.headers["user-agent"],
+    userId: req.userId ?? null,
+    tenantId: req.tenantId ?? null,
+    ip: req.ip ?? null,
+    userAgent: req.headers["user-agent"] ?? null,
     ...event,
   };
 

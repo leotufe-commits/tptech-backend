@@ -2,9 +2,11 @@ import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { prisma } from "../lib/prisma.js";
 import { setContextTenantId, setContextUserId } from "../lib/prisma.js";
+import { OverrideEffect } from "@prisma/client";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
+const JWT_SECRET_SAFE: string = JWT_SECRET;
 
 const JWT_ISSUER = process.env.JWT_ISSUER || "tptech";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "tptech-web";
@@ -35,7 +37,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET, {
+    const payload = jwt.verify(token, JWT_SECRET_SAFE, {
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
     }) as any;
@@ -59,9 +61,9 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       return res.status(401).json({ message: "Sesión expirada" });
     }
 
-    // set req
-    (req as any).userId = user.id;
-    (req as any).tenantId = user.jewelryId;
+    // set req (tipado ya viene por express.d.ts)
+    req.userId = user.id;
+    req.tenantId = user.jewelryId;
 
     // ALS (multi-tenant)
     setContextUserId(user.id);
@@ -75,7 +77,9 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
           select: {
             role: {
               select: {
-                permissions: { select: { permission: { select: { module: true, action: true } } } },
+                permissions: {
+                  select: { permission: { select: { module: true, action: true } } },
+                },
               },
             },
           },
@@ -100,8 +104,8 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const deny = new Set<string>();
     for (const ov of full?.permissionOverrides ?? []) {
       const key = `${ov.permission.module}:${ov.permission.action}`;
-      if (ov.effect === "ALLOW") allow.add(key);
-      if (ov.effect === "DENY") deny.add(key);
+      if (ov.effect === OverrideEffect.ALLOW) allow.add(key);
+      if (ov.effect === OverrideEffect.DENY) deny.add(key);
     }
 
     const base = new Set(perms);
@@ -109,7 +113,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     for (const a of allow) base.add(a);
     for (const d of deny) base.delete(d);
 
-    (req as any).permissions = Array.from(base);
+    req.permissions = Array.from(base);
 
     return next();
   } catch {
