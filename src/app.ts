@@ -14,20 +14,22 @@ export function createApp() {
   const app = express();
 
   /* =====================
+     Proxy (Render)
+     ✅ antes de todo lo que use req.protocol / secure cookies
+  ===================== */
+  app.set("trust proxy", 1);
+
+  /* =====================
      Seguridad básica
   ===================== */
   app.disable("x-powered-by");
   app.use(buildHelmetMiddleware());
 
   /* =====================
-     Proxy (Render)
-  ===================== */
-  app.set("trust proxy", 1);
-
-  /* =====================
      Parsers
   ===================== */
   app.use(express.json({ limit: "1mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "1mb" }));
   app.use(cookieParser());
 
   /* =====================
@@ -50,16 +52,17 @@ export function createApp() {
 
   /* =====================
      Static: uploads
-     - Permite abrir logo/adjuntos por URL pública
-     - Ej: /uploads/jewelry/<file>
+     - Permite abrir avatares / logos / adjuntos por URL pública
+     - Ej: /uploads/avatars/<file>  |  /uploads/jewelry/<file>
   ===================== */
   const UPLOADS_DIR = path.join(process.cwd(), "uploads");
 
   app.use(
     "/uploads",
     express.static(UPLOADS_DIR, {
-      // si piden un archivo que no existe, que siga y caiga en 404 normal
-      fallthrough: true,
+      index: false,
+      // si no existe el archivo, devolvemos 404 acá
+      fallthrough: false,
       setHeaders(res) {
         // cache leve (ajustable)
         res.setHeader("Cache-Control", "public, max-age=3600");

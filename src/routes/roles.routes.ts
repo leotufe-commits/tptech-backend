@@ -1,5 +1,5 @@
+// tptech-backend/src/routes/roles.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/requireAuth.js";
 import { validateBody } from "../middlewares/validate.js";
 
 import {
@@ -19,8 +19,12 @@ import {
 
 const router = Router();
 
-// todo roles es privado
-router.use(requireAuth);
+/**
+ * ✅ NOTA IMPORTANTE
+ * En src/routes/index.ts ya estás aplicando:
+ *   privateRouter.use(requireAuth)
+ * Por eso acá NO se vuelve a aplicar requireAuth.
+ */
 
 /**
  * GET /roles
@@ -28,7 +32,7 @@ router.use(requireAuth);
 router.get("/", listRoles);
 
 /**
- * GET /roles/:id   ✅ ESTA ES LA QUE TE FALTA (por eso te tira Cannot GET)
+ * GET /roles/:id
  */
 router.get("/:id", getRole);
 
@@ -45,11 +49,7 @@ router.patch("/:id", validateBody(updateRoleSchema), updateRole);
 /**
  * PATCH /roles/:id/permissions
  */
-router.patch(
-  "/:id/permissions",
-  validateBody(updateRolePermissionsSchema),
-  updateRolePermissions
-);
+router.patch("/:id/permissions", validateBody(updateRolePermissionsSchema), updateRolePermissions);
 
 /**
  * DELETE /roles/:id

@@ -1,31 +1,32 @@
+// tptech-backend/src/routes/index.ts
 import { Router } from "express";
 
 import { requireAuth } from "../middlewares/requireAuth.js";
 
 import authRoutes from "../modules/auth/auth.routes.js";
 import movimientosRoutes from "../modules/movimientos/movimientos.routes.js";
+
+// Users ya está en modules ✅
+import usersRoutes from "../modules/users/users.routes.js";
+
+// Roles/Permissions todavía están en /routes (ok por ahora)
 import rolesRoutes from "./roles.routes.js";
 import permissionsRoutes from "./permissions.routes.js";
-import usersRoutes from "./users.routes.js"; // ✅ IMPORTANTE
 
 const router = Router();
 
-/**
- * =====================
- * Público
- * =====================
- */
+/* =====================
+   Público
+===================== */
 router.use("/auth", authRoutes);
 
-/**
- * =====================
- * Privado (requiere login)
- * =====================
- */
+/* =====================
+   Privado (requiere login)
+===================== */
 const privateRouter = Router();
 privateRouter.use(requireAuth);
 
-// 🔹 Usuarios (LO QUE FALTABA)
+// 🔹 Usuarios
 privateRouter.use("/users", usersRoutes);
 
 // 🔹 Otros módulos

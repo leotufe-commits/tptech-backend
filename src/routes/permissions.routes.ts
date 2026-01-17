@@ -1,16 +1,15 @@
+// tptech-backend/src/routes/permissions.routes.ts
 import { Router } from "express";
-import { requireAuth } from "../middlewares/requireAuth.js";
 import { requirePermission } from "../middlewares/requirePermission.js";
 import { listPermissions } from "../controllers/permissions.controller.js";
 
 const router = Router();
 
-router.use(requireAuth);
+/**
+ * NOTA:
+ * requireAuth ya se aplica en src/routes/index.ts (privateRouter.use(requireAuth)).
+ */
 
-router.get(
-  "/",
-  requirePermission("USERS_ROLES", "ADMIN"),
-  listPermissions
-);
+router.get("/", requirePermission("USERS_ROLES", "ADMIN"), listPermissions);
 
 export default router;

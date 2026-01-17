@@ -16,6 +16,12 @@ import {
   forgotSchema,
   resetSchema,
   updateJewelrySchema,
+
+  // ✅ NUEVO (PIN)
+  pinSetSchema,
+  pinDisableSchema,
+  pinUnlockSchema,
+  pinSwitchSchema,
 } from "./auth.schemas.js";
 
 import { uploadJewelryFiles } from "../../middlewares/uploadJewelryFiles.js";
@@ -34,7 +40,9 @@ function withMulter(mw: any) {
       // MulterError o Error normal
       const msg =
         err?.message ||
-        (err?.code === "LIMIT_FILE_SIZE" ? "Archivo demasiado grande." : "Error subiendo archivos.");
+        (err?.code === "LIMIT_FILE_SIZE"
+          ? "Archivo demasiado grande."
+          : "Error subiendo archivos.");
 
       return res.status(400).json({ message: msg });
     });
@@ -45,18 +53,11 @@ function withMulter(mw: any) {
    ROUTES
 =========================== */
 
+// sesión
 router.post("/logout", requireAuth, Auth.logout);
-
 router.get("/me", requireAuth, Auth.me);
 
-/**
- * ✅ Soporta:
- * - JSON
- * - multipart/form-data con:
- *    - data: JSON string
- *    - logo: File
- *    - attachments: File[]
- */
+// jewelry profile (JSON + multipart)
 router.put(
   "/me/jewelry",
   requireAuth,
@@ -67,13 +68,62 @@ router.put(
 );
 
 router.delete("/me/jewelry/logo", requireAuth, Auth.deleteMyJewelryLogo);
+router.delete(
+  "/me/jewelry/attachments/:id",
+  requireAuth,
+  Auth.deleteMyJewelryAttachment
+);
 
-router.delete("/me/jewelry/attachments/:id", requireAuth, Auth.deleteMyJewelryAttachment);
-
+// auth público
 router.post("/register", validateBody(registerSchema), Auth.register);
 router.post("/login", authLoginLimiter, validateBody(loginSchema), Auth.login);
+router.post(
+  "/forgot-password",
+  authForgotLimiter,
+  validateBody(forgotSchema),
+  Auth.forgotPassword
+);
+router.post(
+  "/reset-password",
+  authResetLimiter,
+  validateBody(resetSchema),
+  Auth.resetPassword
+);
 
-router.post("/forgot-password", authForgotLimiter, validateBody(forgotSchema), Auth.forgotPassword);
-router.post("/reset-password", authResetLimiter, validateBody(resetSchema), Auth.resetPassword);
+/* ===========================
+   ✅ PIN (solo dentro del sistema)
+   - NO existe login por PIN desde afuera
+   - Todo requiere requireAuth
+=========================== */
+
+// configurar/cambiar PIN (usuario actual)
+router.post("/me/pin/set", requireAuth, validateBody(pinSetSchema), Auth.setMyPin);
+
+// desactivar PIN (requiere PIN actual)
+router.post(
+  "/me/pin/disable",
+  requireAuth,
+  validateBody(pinDisableSchema),
+  Auth.disableMyPin
+);
+
+// desbloquear pantalla (validación PIN del usuario actual)
+router.post(
+  "/me/pin/unlock",
+  requireAuth,
+  validateBody(pinUnlockSchema),
+  Auth.unlockWithPin
+);
+
+// lista de usuarios para quick switch (si la joyería lo habilita)
+router.get("/me/pin/quick-users", requireAuth, Auth.quickUsers);
+
+// cambiar de usuario rápido (si la joyería lo habilita)
+router.post(
+  "/me/pin/switch",
+  requireAuth,
+  validateBody(pinSwitchSchema),
+  Auth.switchUserWithPin
+);
 
 export default router;

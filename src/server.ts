@@ -1,9 +1,10 @@
 // src/server.ts
 import dotenv from "dotenv";
-import { createApp } from "./app.js";
-import { getEnv } from "./config/env.js";
 
 dotenv.config();
+
+import { createApp } from "./app.js";
+import { getEnv } from "./config/env.js";
 
 const env = getEnv();
 

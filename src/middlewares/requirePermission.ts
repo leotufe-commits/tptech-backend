@@ -1,83 +1,20 @@
 // tptech-backend/src/middlewares/requirePermission.ts
 import type { Request, Response, NextFunction } from "express";
-import { prisma } from "../lib/prisma.js";
-import { OverrideEffect } from "@prisma/client";
 
 /**
  * requirePermission(module, action)
+ * ✅ Usa req.permissions (calculado por requireAuth)
+ * ✅ NO consulta Prisma
  *
  * Regla:
- * - Permisos efectivos = roles + overrides
- * - DENY siempre gana sobre ALLOW
- * - Cache en req.permissions (por request)
+ * - Si el permiso requerido no está en req.permissions => 403
  */
 export function requirePermission(module: string, action: string) {
   const wanted = `${module}:${action}`;
 
-  return async (req: Request, res: Response, next: NextFunction) => {
-    const userId = req.userId;
-    const tenantId = req.tenantId;
-
-    if (!userId || !tenantId) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.userId || !req.tenantId) {
       return res.status(401).json({ message: "No autenticado" });
-    }
-
-    // ✅ cache por request (siempre dejamos un array asignado)
-    if (!req.permissions) {
-      const user = await prisma.user.findFirst({
-        where: { id: userId, jewelryId: tenantId },
-        select: {
-          roles: {
-            select: {
-              role: {
-                select: {
-                  deletedAt: true,
-                  permissions: {
-                    select: {
-                      permission: { select: { module: true, action: true } },
-                    },
-                  },
-                },
-              },
-            },
-          },
-          permissionOverrides: {
-            select: {
-              effect: true,
-              permission: { select: { module: true, action: true } },
-            },
-          },
-        },
-      });
-
-      if (!user) {
-        return res.status(401).json({ message: "Usuario no encontrado" });
-      }
-
-      const fromRoles: string[] = [];
-      for (const ur of user.roles ?? []) {
-        const role = ur.role;
-        if (!role || role.deletedAt) continue;
-
-        for (const rp of role.permissions ?? []) {
-          fromRoles.push(`${rp.permission.module}:${rp.permission.action}`);
-        }
-      }
-
-      const allow: string[] = [];
-      const deny: string[] = [];
-      for (const ov of user.permissionOverrides ?? []) {
-        const p = `${ov.permission.module}:${ov.permission.action}`;
-        if (ov.effect === OverrideEffect.ALLOW) allow.push(p);
-        if (ov.effect === OverrideEffect.DENY) deny.push(p);
-      }
-
-      const effective = new Set<string>(fromRoles);
-      for (const d of deny) effective.delete(d);
-      for (const a of allow) effective.add(a);
-      for (const d of deny) effective.delete(d);
-
-      req.permissions = Array.from(effective);
     }
 
     const perms = req.permissions ?? [];
@@ -85,6 +22,31 @@ export function requirePermission(module: string, action: string) {
       return res.status(403).json({
         message: "No tenés permisos para realizar esta acción.",
         required: wanted,
+      });
+    }
+
+    return next();
+  };
+}
+
+/**
+ * ✅ EXTRA (opcional): si algún día querés permitir "cualquiera de estos permisos"
+ * Ej: requireAnyPermission(["USERS_ROLES:ADMIN", "USERS_ROLES:EDIT"])
+ */
+export function requireAnyPermission(wanted: string[]) {
+  const wantedList = Array.isArray(wanted) ? wanted : [];
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.userId || !req.tenantId) {
+      return res.status(401).json({ message: "No autenticado" });
+    }
+
+    const perms = req.permissions ?? [];
+    const ok = wantedList.some((w) => perms.includes(w));
+
+    if (!ok) {
+      return res.status(403).json({
+        message: "No tenés permisos para realizar esta acción.",
+        requiredAny: wantedList,
       });
     }
 

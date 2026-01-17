@@ -2,12 +2,19 @@
 import { z } from "zod";
 
 /* =========================
+   HELPERS
+========================= */
+const email = z.string().email();
+const password = z.string().min(6);
+const pin4 = z.string().regex(/^\d{4}$/, "El PIN debe tener 4 dígitos.");
+
+/* =========================
    REGISTER
    (estricto, como decidimos)
 ========================= */
 export const registerSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(6),
+  email,
+  password,
 
   jewelryName: z.string().min(1),
   firstName: z.string().min(1),
@@ -28,17 +35,17 @@ export const registerSchema = z.object({
    LOGIN / PASSWORD
 ========================= */
 export const loginSchema = z.object({
-  email: z.string().email(),
+  email,
   password: z.string().min(1),
 });
 
 export const forgotSchema = z.object({
-  email: z.string().email(),
+  email,
 });
 
 export const resetSchema = z.object({
   token: z.string().min(10),
-  newPassword: z.string().min(6),
+  newPassword: password,
 });
 
 /* =========================
@@ -78,4 +85,30 @@ export const updateJewelrySchema = z.object({
   email: z.string().optional(),
   website: z.string().optional(),
   notes: z.string().optional(),
+});
+
+/* =========================
+   ✅ PIN (SOLO DENTRO DEL SISTEMA)
+   - nunca login externo
+========================= */
+
+// crear / cambiar PIN del usuario actual
+export const pinSetSchema = z.object({
+  pin: pin4,
+});
+
+// desactivar PIN (requiere PIN actual)
+export const pinDisableSchema = z.object({
+  pin: pin4,
+});
+
+// desbloquear pantalla (PIN del usuario actual)
+export const pinUnlockSchema = z.object({
+  pin: pin4,
+});
+
+// cambio rápido de usuario (si la joyería lo permite)
+export const pinSwitchSchema = z.object({
+  targetUserId: z.string().min(1),
+  pin: pin4,
 });

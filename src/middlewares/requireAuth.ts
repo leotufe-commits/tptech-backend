@@ -1,8 +1,8 @@
+// tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { prisma } from "../lib/prisma.js";
-import { setContextTenantId, setContextUserId } from "../lib/prisma.js";
-import { OverrideEffect } from "@prisma/client";
+import { OverrideEffect, UserStatus } from "@prisma/client";
+import { prisma, setContextTenantId, setContextUserId } from "../lib/prisma.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
@@ -22,11 +22,15 @@ function getTokenFromReq(req: Request): string | null {
     if (m?.[1]) return m[1].trim();
   }
 
-  // 2) Cookie (prod)
+  // 2) Cookie
   const c = (req as any).cookies?.[AUTH_COOKIE];
   if (typeof c === "string" && c.trim()) return c.trim();
 
   return null;
+}
+
+function toPermKey(module: any, action: any) {
+  return `${String(module)}:${String(action)}`;
 }
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -42,26 +46,71 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       audience: JWT_AUDIENCE,
     }) as any;
 
-    const userId = String(payload?.sub || "");
-    const tenantId = String(payload?.tenantId || "");
-    const tokenVersion = Number(payload?.tokenVersion ?? 0);
+    // soporta payloads: tenantId o jewelryId
+    const userId = String(payload?.sub || payload?.userId || "");
+    const tenantId = String(payload?.tenantId || payload?.jewelryId || payload?.tenant || "");
+
+    // soporta tokenVersion o tv
+    const tokenVersion = Number(payload?.tokenVersion ?? payload?.tv ?? 0);
 
     if (!userId || !tenantId) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    // Validación “extra” (opcional pero recomendada): tokenVersion
+    /**
+     * ✅ 1 sola query:
+     * - valida que el user exista en ese tenant
+     * - valida deletedAt null
+     * - trae roles/overrides para req.permissions
+     */
     const user = await prisma.user.findFirst({
-      where: { id: userId, jewelryId: tenantId },
-      select: { id: true, jewelryId: true, tokenVersion: true, status: true },
+      where: {
+        id: userId,
+        jewelryId: tenantId,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        jewelryId: true,
+        tokenVersion: true,
+        status: true,
+        roles: {
+          select: {
+            role: {
+              select: {
+                jewelryId: true,
+                deletedAt: true,
+                permissions: {
+                  select: {
+                    permission: { select: { module: true, action: true } },
+                  },
+                },
+              },
+            },
+          },
+        },
+        permissionOverrides: {
+          select: {
+            effect: true,
+            permission: { select: { module: true, action: true } },
+          },
+        },
+      },
     });
 
     if (!user) return res.status(401).json({ message: "Unauthorized" });
-    if ((user as any).tokenVersion !== tokenVersion) {
+
+    // si está bloqueado / no activo, cortamos acá
+    if (user.status !== UserStatus.ACTIVE) {
+      return res.status(403).json({ message: "Usuario no habilitado." });
+    }
+
+    // tokenVersion mismatch => sesión inválida
+    if (user.tokenVersion !== tokenVersion) {
       return res.status(401).json({ message: "Sesión expirada" });
     }
 
-    // set req (tipado ya viene por express.d.ts)
+    // set req (tipado viene por express.d.ts)
     req.userId = user.id;
     req.tenantId = user.jewelryId;
 
@@ -69,48 +118,36 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     setContextUserId(user.id);
     setContextTenantId(user.jewelryId);
 
-    // permissions para requirePermission
-    const full = await prisma.user.findFirst({
-      where: { id: user.id, jewelryId: user.jewelryId },
-      select: {
-        roles: {
-          select: {
-            role: {
-              select: {
-                permissions: {
-                  select: { permission: { select: { module: true, action: true } } },
-                },
-              },
-            },
-          },
-        },
-        permissionOverrides: {
-          select: { effect: true, permission: { select: { module: true, action: true } } },
-        },
-      },
-    });
+    // ✅ calcular permisos efectivos
+    const base = new Set<string>();
 
-    const perms: string[] = [];
+    // roles -> base (solo roles del tenant + no borrados)
+    for (const ur of user.roles ?? []) {
+      const role = ur.role;
+      if (!role) continue;
+      if (role.jewelryId !== user.jewelryId) continue;
+      if (role.deletedAt) continue;
 
-    // roles
-    for (const ur of full?.roles ?? []) {
-      for (const rp of ur.role?.permissions ?? []) {
-        perms.push(`${rp.permission.module}:${rp.permission.action}`);
+      for (const rp of role.permissions ?? []) {
+        base.add(toPermKey(rp.permission.module, rp.permission.action));
       }
     }
 
-    // overrides
+    // overrides: DENY pisa todo, ALLOW suma si no fue denegado
     const allow = new Set<string>();
     const deny = new Set<string>();
-    for (const ov of full?.permissionOverrides ?? []) {
-      const key = `${ov.permission.module}:${ov.permission.action}`;
-      if (ov.effect === OverrideEffect.ALLOW) allow.add(key);
+
+    for (const ov of user.permissionOverrides ?? []) {
+      const key = toPermKey(ov.permission.module, ov.permission.action);
       if (ov.effect === OverrideEffect.DENY) deny.add(key);
+      if (ov.effect === OverrideEffect.ALLOW) allow.add(key);
     }
 
-    const base = new Set(perms);
+    // aplicar deny primero
     for (const d of deny) base.delete(d);
+    // luego allow
     for (const a of allow) base.add(a);
+    // y deny vuelve a pisar por seguridad
     for (const d of deny) base.delete(d);
 
     req.permissions = Array.from(base);
