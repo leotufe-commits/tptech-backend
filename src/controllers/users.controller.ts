@@ -1,5 +1,6 @@
 // tptech-backend/src/controllers/users.controller.ts
 import type { Request, Response } from "express";
+import type { Prisma } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma.js";
 import { auditLog } from "../lib/auditLogger.js";
@@ -12,7 +13,7 @@ import fs from "node:fs/promises";
    HELPERS
 ========================= */
 function requireTenantId(req: Request, res: Response): string | null {
-  const tenantId = (req as any).tenantId;
+  const tenantId = (req as any).tenantId as string | undefined;
   if (!tenantId) {
     res.status(400).json({ message: "Tenant no definido en el request." });
     return null;
@@ -124,7 +125,7 @@ function isValidPin4(v: any): v is string {
 }
 
 function requireAdminUsersRoles(req: Request, res: Response): boolean {
-  const perms = (req as any).permissions ?? [];
+  const perms = ((req as any).permissions ?? []) as unknown[];
   if (!Array.isArray(perms) || !perms.includes("USERS_ROLES:ADMIN")) {
     res.status(403).json({ message: "No tenés permisos para realizar esta acción." });
     return false;
@@ -271,7 +272,6 @@ export async function removeMyQuickPin(req: Request, res: Response) {
     quickPinUpdatedAt: updated.quickPinUpdatedAt,
   });
 }
-
 /* =========================
    ✅ QUICK PIN (ADMIN)
    PUT /users/:id/quick-pin
@@ -306,7 +306,7 @@ export async function updateUserQuickPin(req: Request, res: Response) {
     where: { id: targetUserId },
     data: {
       quickPinHash: hash,
-      quickPinEnabled: true, // ✅ si setea PIN, queda habilitado
+      quickPinEnabled: true,
       quickPinUpdatedAt: new Date(),
       quickPinFailedCount: 0,
       quickPinLockedUntil: null,
@@ -432,7 +432,7 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
   return res.json({
     ok: true,
     hasQuickPin: Boolean(updated.quickPinHash),
-    pinEnabled: Boolean(updated.quickPinEnabled),
+    pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
   });
 }
 
@@ -459,12 +459,11 @@ export async function createUser(req: Request, res: Response) {
   if (!email) return res.status(400).json({ message: "Email inválido." });
 
   let roleIds = Array.isArray(body.roleIds) ? body.roleIds : [];
-  roleIds = uniqStrings(roleIds.map((r) => String(r || "").trim()).filter(Boolean));
+  roleIds = uniqStrings(roleIds.map((r: string) => String(r || "").trim()).filter(Boolean));
 
   const hasPassword = Boolean(String(body.password || "").trim());
   const desiredStatus = body.status ? String(body.status) : undefined;
 
-  // Si no mandan password => PENDING
   const status: UserStatus =
     desiredStatus === "BLOCKED"
       ? UserStatus.BLOCKED
@@ -474,7 +473,6 @@ export async function createUser(req: Request, res: Response) {
       ? UserStatus.ACTIVE
       : UserStatus.PENDING;
 
-  // ✅ email debe validarse por tenant (multi-tenant)
   const existing = await prisma.user.findFirst({
     where: {
       jewelryId: tenantId,
@@ -511,7 +509,7 @@ export async function createUser(req: Request, res: Response) {
     ? await bcrypt.hash(String(body.password), 10)
     : await randomPasswordHash();
 
-  const created = await prisma.$transaction(async (tx) => {
+  const created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const user = await tx.user.create({
       data: {
         email,
@@ -522,7 +520,6 @@ export async function createUser(req: Request, res: Response) {
         tokenVersion: 0,
         deletedAt: null,
 
-        // ✅ Quick PIN por default: no configurado, no habilitado
         quickPinHash: null,
         quickPinEnabled: false,
         quickPinUpdatedAt: null,
@@ -543,7 +540,7 @@ export async function createUser(req: Request, res: Response) {
 
     if (roleIds.length) {
       await tx.userRole.createMany({
-        data: roleIds.map((roleId) => ({ userId: user.id, roleId })),
+        data: roleIds.map((roleId: string) => ({ userId: user.id, roleId })),
         skipDuplicates: true,
       });
     }
@@ -557,12 +554,15 @@ export async function createUser(req: Request, res: Response) {
       },
     });
 
+    type UR = (typeof roles)[number];
+    type R = UR["role"];
+
     return {
       ...user,
       roles: roles
-        .map((ur) => ur.role)
-        .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
-        .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
+        .map((ur: UR) => ur.role as R)
+        .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
     };
   });
 
@@ -580,15 +580,13 @@ export async function createUser(req: Request, res: Response) {
 /* =========================
    GET /users
    ✅ LIVIANO + PAGINADO + SEARCH
-   Nota seguridad:
-   - NO devolvemos quickPinHash, solo hasQuickPin/pinEnabled
 ========================= */
 export async function listUsers(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const q = String((req.query.q ?? "") as any).trim();
-  const status = String((req.query.status ?? "") as any).trim().toUpperCase();
+  const q = String(req.query.q ?? "").trim();
+  const status = String(req.query.status ?? "").trim().toUpperCase();
   const page = clampInt(req.query.page, 1, 1, 10_000);
   const limit = clampInt(req.query.limit, 30, 1, 100);
   const skip = (page - 1) * limit;
@@ -620,7 +618,6 @@ export async function listUsers(req: Request, res: Response) {
         createdAt: true,
         updatedAt: true,
 
-        // ✅ para calcular hasQuickPin/pinEnabled (NO se devuelven tal cual)
         quickPinHash: true,
         quickPinEnabled: true,
 
@@ -638,11 +635,15 @@ export async function listUsers(req: Request, res: Response) {
     }),
   ]);
 
+  type U = (typeof users)[number];
+  type UR = U["roles"][number];
+  type R = UR["role"];
+
   return res.json({
     page,
     limit,
     total,
-    users: users.map((u) => ({
+    users: users.map((u: U) => ({
       id: u.id,
       email: u.email,
       name: u.name,
@@ -656,9 +657,9 @@ export async function listUsers(req: Request, res: Response) {
       pinEnabled: Boolean(u.quickPinHash) && Boolean(u.quickPinEnabled),
 
       roles: (u.roles ?? [])
-        .map((ur) => ur.role)
-        .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
-        .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
+        .map((ur: UR) => ur.role as R)
+        .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
     })),
   });
 }
@@ -729,6 +730,10 @@ export async function getUser(req: Request, res: Response) {
 
   if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
 
+  type U = typeof user;
+  type UR = U["roles"][number];
+  type R = UR["role"];
+
   return res.json({
     user: {
       id: user.id,
@@ -763,19 +768,17 @@ export async function getUser(req: Request, res: Response) {
       quickPinLockedUntil: user.quickPinLockedUntil,
 
       roles: (user.roles ?? [])
-        .map((ur) => ur.role)
-        .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
-        .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
+        .map((ur: UR) => ur.role as R)
+        .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
 
       permissionOverrides: user.permissionOverrides ?? [],
       attachments: user.attachments ?? [],
     },
   });
 }
-
 /* =========================
    PATCH /users/:id
-   ✅ EDITA DATOS PERSONALES / DIRECCIÓN / NOTAS
 ========================= */
 export async function updateUserProfile(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -814,8 +817,6 @@ export async function updateUserProfile(req: Request, res: Response) {
 
   if ("name" in body) data.name = normalizeName(body.name);
 
-  // ✅ Todos estos campos son String @default("") en Prisma
-  // Nunca enviamos null. Si viene vacío => "".
   const setOpt = (key: string, value: any) => {
     const v = normOpt(value);
     if (v !== undefined) data[key] = v;
@@ -959,7 +960,7 @@ export async function assignRolesToUser(req: Request, res: Response) {
     return res.status(400).json({ message: "roleIds debe ser un array" });
   }
 
-  roleIds = uniqStrings(roleIds.map((r) => String(r || "").trim()).filter(Boolean));
+  roleIds = uniqStrings(roleIds.map((r: string) => String(r || "").trim()).filter(Boolean));
 
   if (targetUserId === actorId) {
     return res.status(400).json({ message: "No podés cambiar tus propios roles desde aquí." });
@@ -985,12 +986,12 @@ export async function assignRolesToUser(req: Request, res: Response) {
     return res.status(400).json({ message: "Uno o más roles no son válidos para esta joyería." });
   }
 
-  await prisma.$transaction(async (tx) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     await tx.userRole.deleteMany({ where: { userId: targetUserId } });
 
     if (roleIds.length) {
       await tx.userRole.createMany({
-        data: roleIds.map((roleId) => ({ userId: targetUserId, roleId })),
+        data: roleIds.map((roleId: string) => ({ userId: targetUserId, roleId })),
         skipDuplicates: true,
       });
     }
@@ -1446,7 +1447,6 @@ export async function removeUserAvatarForUser(req: Request, res: Response) {
 
   return res.json({ ok: true, avatarUrl: null, user: updated });
 }
-
 /* =========================
    ✅ SOFT DELETE USER (ADMIN)
 ========================= */
@@ -1473,7 +1473,7 @@ export async function softDeleteUser(req: Request, res: Response) {
   const suffix = crypto.randomBytes(6).toString("hex");
   const freedEmail = `deleted__${target.id}__${now.getTime()}__${suffix}@deleted.local`;
 
-  await prisma.$transaction(async (tx) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     await tx.userPermissionOverride.deleteMany({ where: { userId: targetUserId } });
     await tx.userRole.deleteMany({ where: { userId: targetUserId } });
 
@@ -1487,7 +1487,6 @@ export async function softDeleteUser(req: Request, res: Response) {
         email: freedEmail,
         name: null,
 
-        // limpiamos PIN
         quickPinHash: null,
         quickPinEnabled: false,
         quickPinUpdatedAt: new Date(),
@@ -1510,18 +1509,14 @@ export async function softDeleteUser(req: Request, res: Response) {
 
   return res.json({ ok: true });
 }
+
 /* =========================
    ✅ USER ATTACHMENTS (ADMIN)
-   PUT /users/:id/attachments   (multipart field: attachments)
-   DELETE /users/:id/attachments/:attachmentId
 ========================= */
 
 function publicBaseUrl(req: Request) {
-  // 1) Preferimos PUBLIC_BASE_URL (Render) para que quede fijo y correcto
   const envBase = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
   if (envBase) return envBase;
-
-  // 2) Fallback local: arma con host actual
   return `${req.protocol}://${req.get("host")}`;
 }
 
@@ -1557,7 +1552,6 @@ export async function uploadUserAttachments(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  // ✅ ADMIN only
   if (!requireAdminUsersRoles(req, res)) return;
 
   const targetUserId = String(req.params.id || "").trim();
@@ -1580,8 +1574,10 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     return res.status(400).json({ message: "No se recibieron archivos (field: attachments)." });
   }
 
+  type F = (typeof files)[number];
+
   const created = await prisma.userAttachment.createMany({
-    data: files.map((f) => {
+    data: files.map((f: F) => {
       const rel = `/uploads/user-attachments/${f.filename}`;
       return {
         userId: targetUserId,
@@ -1653,21 +1649,27 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     },
   });
 
+  if (!updated) {
+    return res.json({ ok: true, createdCount: created.count, user: null });
+  }
+
+  type U = typeof updated;
+  type UR = U["roles"][number];
+  type R = UR["role"];
+
   return res.json({
     ok: true,
     createdCount: created.count,
-    user: updated
-      ? {
-          ...updated,
-          hasQuickPin: Boolean(updated.quickPinHash),
-          pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
-          roles: (updated.roles ?? [])
-            .map((ur: any) => ur.role)
-            .filter((r: any) => r && r.jewelryId === tenantId && !r.deletedAt)
-            .map((r: any) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
-          permissionOverrides: updated.permissionOverrides ?? [],
-        }
-      : null,
+    user: {
+      ...updated,
+      hasQuickPin: Boolean(updated.quickPinHash),
+      pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
+      roles: (updated.roles ?? [])
+        .map((ur: UR) => ur.role as R)
+        .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
+      permissionOverrides: updated.permissionOverrides ?? [],
+    },
   });
 }
 
@@ -1676,7 +1678,6 @@ export async function deleteUserAttachment(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  // ✅ ADMIN only
   if (!requireAdminUsersRoles(req, res)) return;
 
   const targetUserId = String(req.params.id || "").trim();

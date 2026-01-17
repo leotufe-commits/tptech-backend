@@ -23,9 +23,11 @@ export async function listPermissions(_req: Request, res: Response) {
       orderBy: [{ module: "asc" }, { action: "asc" }],
     });
 
+    type Row = (typeof permissions)[number];
+
     // Mantengo el formato actual (array) para no romper el frontend
     return res.json(
-      permissions.map((p) => ({
+      permissions.map((p: Row) => ({
         id: p.id,
         module: p.module,
         action: p.action,

@@ -1,5 +1,6 @@
 // tptech-backend/src/controllers/roles.controller.ts
 import type { Request, Response } from "express";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { auditLog } from "../lib/auditLogger.js";
 
@@ -16,7 +17,7 @@ import { auditLog } from "../lib/auditLogger.js";
  */
 export async function listRoles(req: Request, res: Response) {
   try {
-    const tenantId = req.tenantId;
+    const tenantId = (req as any).tenantId as string | undefined;
     if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
 
     const roles = await prisma.role.findMany({
@@ -32,8 +33,10 @@ export async function listRoles(req: Request, res: Response) {
       orderBy: { createdAt: "asc" },
     });
 
+    type Row = (typeof roles)[number];
+
     return res.json(
-      roles.map((r) => ({
+      roles.map((r: Row) => ({
         id: r.id,
         name: r.displayName ?? r.name, // visible
         code: r.name, // técnico
@@ -52,7 +55,7 @@ export async function listRoles(req: Request, res: Response) {
  */
 export async function getRole(req: Request, res: Response) {
   try {
-    const tenantId = req.tenantId;
+    const tenantId = (req as any).tenantId as string | undefined;
     if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
 
     const roleId = String(req.params.id || "");
@@ -77,6 +80,8 @@ export async function getRole(req: Request, res: Response) {
 
     if (!role) return res.status(404).json({ message: "Rol no encontrado" });
 
+    type RP = (typeof role.permissions)[number];
+
     return res.json({
       role: {
         id: role.id,
@@ -84,8 +89,8 @@ export async function getRole(req: Request, res: Response) {
         code: role.name,
         isSystem: role.isSystem,
         usersCount: role._count.users,
-        permissionIds: role.permissions.map((rp) => rp.permissionId),
-        permissions: role.permissions.map((rp) => ({
+        permissionIds: role.permissions.map((rp: RP) => rp.permissionId),
+        permissions: role.permissions.map((rp: RP) => ({
           id: rp.permissionId,
           module: rp.permission.module,
           action: rp.permission.action,
@@ -102,10 +107,11 @@ export async function getRole(req: Request, res: Response) {
  */
 export async function createRole(req: Request, res: Response) {
   try {
-    const tenantId = req.tenantId;
+    const tenantId = (req as any).tenantId as string | undefined;
+    const userId = (req as any).userId as string | undefined;
     if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
 
-    const name = String(req.body?.name || "").trim();
+    const name = String((req as any).body?.name || "").trim();
     if (!name) return res.status(400).json({ message: "name requerido" });
 
     const existing = await prisma.role.findFirst({
@@ -120,7 +126,7 @@ export async function createRole(req: Request, res: Response) {
     }
 
     if (existing && existing.deletedAt !== null) {
-      const restored = await prisma.$transaction(async (tx) => {
+      const restored = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const role = await tx.role.update({
           where: { id: existing.id },
           data: {
@@ -138,7 +144,7 @@ export async function createRole(req: Request, res: Response) {
       auditLog(req, {
         action: "roles.restore",
         success: true,
-        userId: req.userId,
+        userId,
         tenantId,
         meta: { roleId: restored.id, name },
       });
@@ -158,7 +164,7 @@ export async function createRole(req: Request, res: Response) {
     auditLog(req, {
       action: "roles.create",
       success: true,
-      userId: req.userId,
+      userId,
       tenantId,
       meta: { roleId: role.id, name },
     });
@@ -174,13 +180,14 @@ export async function createRole(req: Request, res: Response) {
  */
 export async function updateRole(req: Request, res: Response) {
   try {
-    const tenantId = req.tenantId;
+    const tenantId = (req as any).tenantId as string | undefined;
+    const userId = (req as any).userId as string | undefined;
     if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
 
     const roleId = String(req.params.id || "");
     if (!roleId) return res.status(400).json({ message: "roleId requerido" });
 
-    const name = String(req.body?.name || "").trim();
+    const name = String((req as any).body?.name || "").trim();
     if (!name) return res.status(400).json({ message: "name requerido" });
 
     const role = await prisma.role.findFirst({
@@ -203,7 +210,7 @@ export async function updateRole(req: Request, res: Response) {
       auditLog(req, {
         action: "roles.rename_display",
         success: true,
-        userId: req.userId,
+        userId,
         tenantId,
         meta: { roleId, displayName: name },
       });
@@ -233,7 +240,7 @@ export async function updateRole(req: Request, res: Response) {
     auditLog(req, {
       action: "roles.rename",
       success: true,
-      userId: req.userId,
+      userId,
       tenantId,
       meta: { roleId, name },
     });
@@ -249,14 +256,15 @@ export async function updateRole(req: Request, res: Response) {
  */
 export async function updateRolePermissions(req: Request, res: Response) {
   try {
-    const tenantId = req.tenantId;
+    const tenantId = (req as any).tenantId as string | undefined;
+    const userId = (req as any).userId as string | undefined;
     if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
 
     const roleId = String(req.params.id || "");
     if (!roleId) return res.status(400).json({ message: "roleId requerido" });
 
-    const permissionIds = Array.isArray(req.body?.permissionIds)
-      ? (req.body.permissionIds as string[])
+    const permissionIds = Array.isArray((req as any).body?.permissionIds)
+      ? (((req as any).body.permissionIds as unknown[]) as string[])
       : [];
 
     const role = await prisma.role.findFirst({
@@ -274,7 +282,7 @@ export async function updateRolePermissions(req: Request, res: Response) {
 
     if (permissionIds.length) {
       await prisma.rolePermission.createMany({
-        data: permissionIds.map((pid) => ({ roleId, permissionId: pid })),
+        data: permissionIds.map((pid: string) => ({ roleId, permissionId: pid })),
         skipDuplicates: true,
       });
     }
@@ -282,7 +290,7 @@ export async function updateRolePermissions(req: Request, res: Response) {
     auditLog(req, {
       action: "roles.update_permissions",
       success: true,
-      userId: req.userId,
+      userId,
       tenantId,
       meta: { roleId, permissionIds },
     });
@@ -298,7 +306,8 @@ export async function updateRolePermissions(req: Request, res: Response) {
  */
 export async function deleteRole(req: Request, res: Response) {
   try {
-    const tenantId = req.tenantId;
+    const tenantId = (req as any).tenantId as string | undefined;
+    const userId = (req as any).userId as string | undefined;
     if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
 
     const roleId = String(req.params.id || "");
@@ -321,7 +330,7 @@ export async function deleteRole(req: Request, res: Response) {
       });
     }
 
-    await prisma.$transaction(async (tx) => {
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.role.update({
         where: { id: roleId },
         data: { deletedAt: new Date() },
@@ -333,7 +342,7 @@ export async function deleteRole(req: Request, res: Response) {
     auditLog(req, {
       action: "roles.delete",
       success: true,
-      userId: req.userId,
+      userId,
       tenantId,
       meta: { roleId },
     });

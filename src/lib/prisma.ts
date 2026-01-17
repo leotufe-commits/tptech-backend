@@ -1,6 +1,8 @@
 // tptech-backend/src/lib/prisma.ts
 import "dotenv/config";
-import PrismaClientPkg from "@prisma/client";
+import type { Request, Response, NextFunction } from "express";
+
+import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -22,7 +24,7 @@ export function getRequestContext() {
 /**
  * Middleware que inicializa el contexto por request.
  */
-export function requestContextMiddleware(_req: any, _res: any, next: any) {
+export function requestContextMiddleware(_req: Request, _res: Response, next: NextFunction) {
   als.run({ tenantId: undefined, userId: undefined }, () => next());
 }
 
@@ -59,21 +61,27 @@ export function clearRequestContext() {
 /**
  * Prisma singleton + adapter
  */
-const { PrismaClient } = PrismaClientPkg;
-
 type PrismaGlobal = {
-  prisma?: InstanceType<typeof PrismaClient>;
+  prisma?: PrismaClient;
   prismaAdapter?: PrismaPg;
 };
+
 const globalForPrisma = globalThis as unknown as PrismaGlobal;
 
-function getAdapter() {
+function getAdapter(): PrismaPg {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL no está definida");
-  return globalForPrisma.prismaAdapter ?? new PrismaPg({ connectionString: url });
+
+  // 🔒 Reusar adapter en dev para evitar múltiples conexiones
+  if (globalForPrisma.prismaAdapter) return globalForPrisma.prismaAdapter;
+
+  // PrismaPg acepta connectionString pero los tipos a veces no calzan perfecto según versión
+  const adapter = new PrismaPg({ connectionString: url } as any);
+  globalForPrisma.prismaAdapter = adapter;
+  return adapter;
 }
 
-const basePrisma =
+const basePrisma: PrismaClient =
   globalForPrisma.prisma ??
   new PrismaClient({
     adapter: getAdapter(),
@@ -81,18 +89,12 @@ const basePrisma =
 
 if (process.env.NODE_ENV !== "production") {
   globalForPrisma.prisma = basePrisma;
-  globalForPrisma.prismaAdapter = getAdapter();
 }
 
 /**
  * Multi-tenant enforcement
  */
-const TENANT_MODELS = new Set<string>([
-  "User",
-  "Role",
-  "Warehouse",
-  "AuditLog",
-]);
+const TENANT_MODELS = new Set<string>(["User", "Role", "Warehouse", "AuditLog"]);
 
 const TENANT_FIELD_BY_MODEL: Record<string, string> = {
   User: "jewelryId",
@@ -118,12 +120,24 @@ function addTenantToCreateData(data: any, field: string, tenantId: string) {
 }
 
 /**
- * 👉 ESTE EXPORT ES EL QUE FALTABA
+ * Prisma con enforcement multi-tenant
+ *
+ * ⚠️ Importante:
+ * - Tipamos explícitamente el parámetro de $allOperations como `any`
+ *   para evitar TS7006 (implicit any) en build estricto de Render.
+ * - Exportamos `prisma` como PrismaClient para evitar casts problemáticos.
  */
-export const prisma = basePrisma.$extends({
+export const prisma: PrismaClient = basePrisma.$extends({
   query: {
     $allModels: {
-      async $allOperations({ model, operation, args, query }) {
+      async $allOperations(params: any) {
+        const { model, operation, args, query } = params as {
+          model?: string;
+          operation: string;
+          args: any;
+          query: (a: any) => any;
+        };
+
         const ctx = getRequestContext();
         if (!ctx?.tenantId) return query(args);
         if (!isTenantModel(model)) return query(args);
@@ -132,11 +146,7 @@ export const prisma = basePrisma.$extends({
         const tenantField = tenantFieldFor(model!);
         const a: any = args ?? {};
 
-        if (
-          operation === "findMany" ||
-          operation === "findFirst" ||
-          operation === "findFirstOrThrow"
-        ) {
+        if (operation === "findMany" || operation === "findFirst" || operation === "findFirstOrThrow") {
           a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
           return query(a);
         }
