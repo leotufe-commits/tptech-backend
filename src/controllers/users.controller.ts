@@ -1510,33 +1510,42 @@ export async function softDeleteUser(req: Request, res: Response) {
 
   return res.json({ ok: true });
 }
-
 /* =========================
    ✅ USER ATTACHMENTS (ADMIN)
    PUT /users/:id/attachments   (multipart field: attachments)
    DELETE /users/:id/attachments/:attachmentId
 ========================= */
-function safeDeleteByUrlIfLocalUserAttachment(url: string | null) {
-  return (async () => {
-    if (!url) return;
+function publicBaseUrl(req: Request) {
+  const envBase = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+  if (envBase) return envBase;
+  return `${req.protocol}://${req.get("host")}`;
+}
 
-    const s = String(url || "");
-    if (!s.includes("/uploads/user-attachments/")) return;
+function toPublicUrlFromReq(req: Request, relativePath: string) {
+  const base = publicBaseUrl(req);
+  const p = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
+  return `${base}${p}`;
+}
 
-    const filename = filenameFromAnyUrl(s);
-    if (!filename) return;
+async function safeDeleteByUrlIfLocalUserAttachment(url: string | null) {
+  if (!url) return;
 
-    const safeName = path.basename(filename);
-    if (!safeName) return;
+  const s = String(url || "");
+  if (!s.includes("/uploads/user-attachments/")) return;
 
-    const abs = path.join(process.cwd(), "uploads", "user-attachments", safeName);
+  const filename = filenameFromAnyUrl(s);
+  if (!filename) return;
 
-    try {
-      await fs.unlink(abs);
-    } catch {
-      // ignore
-    }
-  })();
+  const safeName = path.basename(filename);
+  if (!safeName) return;
+
+  const abs = path.join(process.cwd(), "uploads", "user-attachments", safeName);
+
+  try {
+    await fs.unlink(abs);
+  } catch {
+    // ignore
+  }
 }
 
 export async function uploadUserAttachments(req: Request, res: Response) {
@@ -1553,7 +1562,13 @@ export async function uploadUserAttachments(req: Request, res: Response) {
   });
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
-  const files = ((req as any).files ?? []) as Express.Multer.File[];
+  const files = ((req as any).files ?? []) as Array<{
+    filename: string;
+    originalname?: string;
+    mimetype?: string;
+    size?: number;
+  }>;
+
   if (!Array.isArray(files) || files.length === 0) {
     return res.status(400).json({ message: "No se recibieron archivos (field: attachments)." });
   }
@@ -1563,7 +1578,7 @@ export async function uploadUserAttachments(req: Request, res: Response) {
       const rel = `/uploads/user-attachments/${f.filename}`;
       return {
         userId: targetUserId,
-        url: toPublicUrl(rel),
+        url: toPublicUrlFromReq(req, rel),
         filename: f.originalname || f.filename,
         mimeType: f.mimetype || "application/octet-stream",
         size: f.size ?? 0,
@@ -1571,10 +1586,6 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     }),
     skipDuplicates: true,
   });
-
-  // ✅ robusto para TS / Prisma versions
-  const createdCount =
-    typeof (created as any)?.count === "number" ? (created as any).count : files.length;
 
   await prisma.user.update({
     where: { id: targetUserId },
@@ -1626,7 +1637,9 @@ export async function uploadUserAttachments(req: Request, res: Response) {
       },
       roles: {
         select: {
-          role: { select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true } },
+          role: {
+            select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true },
+          },
         },
       },
       permissionOverrides: { select: { permissionId: true, effect: true } },
@@ -1635,12 +1648,13 @@ export async function uploadUserAttachments(req: Request, res: Response) {
 
   return res.json({
     ok: true,
-    createdCount,
+    createdCount: created.count,
     user: updated
       ? {
           ...updated,
           hasQuickPin: Boolean((updated as any).quickPinHash),
-          pinEnabled: Boolean((updated as any).quickPinHash) && Boolean((updated as any).quickPinEnabled),
+          pinEnabled:
+            Boolean((updated as any).quickPinHash) && Boolean((updated as any).quickPinEnabled),
           roles: ((updated as any).roles ?? [])
             .map((ur: any) => ur.role)
             .filter((r: any) => r && r.jewelryId === tenantId && !r.deletedAt)
@@ -1668,10 +1682,14 @@ export async function deleteUserAttachment(req: Request, res: Response) {
   });
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
-  const att = await prisma.userAttachment.findFirst({
-    where: { id: attachmentId, userId: targetUserId },
-    select: { id: true, url: true },
-  });
+const att = await prisma.userAttachment.findFirst({
+  where: {
+    id: attachmentId,
+    userId: targetUserId,
+    user: { jewelryId: tenantId, deletedAt: null },
+  },
+  select: { id: true, url: true },
+});
   if (!att) return res.status(404).json({ message: "Adjunto no encontrado." });
 
   await prisma.userAttachment.delete({ where: { id: att.id } });
