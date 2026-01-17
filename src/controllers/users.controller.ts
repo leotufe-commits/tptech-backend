@@ -474,8 +474,12 @@ export async function createUser(req: Request, res: Response) {
       ? UserStatus.ACTIVE
       : UserStatus.PENDING;
 
-  const existing = await prisma.user.findUnique({
-    where: { email },
+  // ✅ email debe validarse por tenant (multi-tenant)
+  const existing = await prisma.user.findFirst({
+    where: {
+      jewelryId: tenantId,
+      email,
+    },
     select: { id: true, deletedAt: true },
   });
 
@@ -1568,6 +1572,10 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     skipDuplicates: true,
   });
 
+  // ✅ robusto para TS / Prisma versions
+  const createdCount =
+    typeof (created as any)?.count === "number" ? (created as any).count : files.length;
+
   await prisma.user.update({
     where: { id: targetUserId },
     data: { tokenVersion: { increment: 1 } },
@@ -1627,17 +1635,17 @@ export async function uploadUserAttachments(req: Request, res: Response) {
 
   return res.json({
     ok: true,
-    createdCount: created.count,
+    createdCount,
     user: updated
       ? {
           ...updated,
-          hasQuickPin: Boolean(updated.quickPinHash),
-          pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
-          roles: (updated.roles ?? [])
+          hasQuickPin: Boolean((updated as any).quickPinHash),
+          pinEnabled: Boolean((updated as any).quickPinHash) && Boolean((updated as any).quickPinEnabled),
+          roles: ((updated as any).roles ?? [])
             .map((ur: any) => ur.role)
             .filter((r: any) => r && r.jewelryId === tenantId && !r.deletedAt)
             .map((r: any) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
-          permissionOverrides: updated.permissionOverrides ?? [],
+          permissionOverrides: (updated as any).permissionOverrides ?? [],
         }
       : null,
   });

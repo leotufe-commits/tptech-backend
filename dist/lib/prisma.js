@@ -1,4 +1,7 @@
+// tptech-backend/src/lib/prisma.ts
+import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 const als = new AsyncLocalStorage();
 export function getRequestContext() {
@@ -41,36 +44,31 @@ export function clearRequestContext() {
     store.userId = undefined;
     store.tenantId = undefined;
 }
-/**
- * Prisma base singleton
- */
 const globalForPrisma = globalThis;
+function getAdapter() {
+    const url = process.env.DATABASE_URL;
+    if (!url)
+        throw new Error("❌ DATABASE_URL no está seteada en el entorno");
+    return globalForPrisma.prismaAdapter ?? new PrismaPg({ connectionString: url });
+}
 const basePrisma = globalForPrisma.prisma ??
     new PrismaClient({
-    // log: ["error", "warn"],
+        adapter: getAdapter(),
+        // log: ["error", "warn"],
     });
 if (process.env.NODE_ENV !== "production") {
     globalForPrisma.prisma = basePrisma;
+    globalForPrisma.prismaAdapter = getAdapter();
 }
 /**
  * ✅ Multi-tenant enforcement via $extends
  *
- * Importante:
- * - NO tocamos: findUnique / update / delete (requieren where único)
- * - Forzamos tenant en:
- *   - findMany / findFirst / findFirstOrThrow
- *   - updateMany / deleteMany
- *   - create / createMany
- *   - upsert (create + where)
- *
- * Nota: Permission es GLOBAL (catálogo) y NO tiene jewelryId -> no debe ir aquí.
+ * Nota: Permission es GLOBAL (catálogo) y NO tiene jewelryId -> no debe filtrarse por tenant.
  */
 const TENANT_MODELS = new Set([
     "User",
     "Role",
     "Warehouse",
-    "UserRole",
-    "RolePermission",
     "AuditLog",
 ]);
 const TENANT_FIELD_BY_MODEL = {
@@ -78,14 +76,6 @@ const TENANT_FIELD_BY_MODEL = {
     Role: "jewelryId",
     Warehouse: "jewelryId",
     AuditLog: "jewelryId",
-    // pivots: se filtran por el "lado" tenant
-    // - UserRole tiene userId/roleId; no tiene jewelryId.
-    // - RolePermission no tiene jewelryId.
-    // Para estos NO forzamos tenant directo (no existe campo), pero sí evitamos "leaks"
-    // usando constraints a nivel query donde corresponda (en services/controllers).
-    // Igual los dejamos en set por si más adelante agregás jewelryId.
-    UserRole: "",
-    RolePermission: "",
 };
 function isTenantModel(model) {
     return !!model && TENANT_MODELS.has(model);
@@ -118,9 +108,7 @@ export const prisma = basePrisma.$extends({
                 const tenantField = tenantFieldFor(model);
                 const a = args ?? {};
                 // reads
-                if (operation === "findMany" ||
-                    operation === "findFirst" ||
-                    operation === "findFirstOrThrow") {
+                if (operation === "findMany" || operation === "findFirst" || operation === "findFirstOrThrow") {
                     a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
                     return query(a);
                 }
@@ -139,7 +127,7 @@ export const prisma = basePrisma.$extends({
                     a.data = data.map((row) => addTenantToCreateData(row, tenantField, tenantId));
                     return query(a);
                 }
-                // upsert: forzamos tenant en create, y también en where si aplica
+                // upsert
                 if (operation === "upsert") {
                     a.create = addTenantToCreateData(a.create, tenantField, tenantId);
                     a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
