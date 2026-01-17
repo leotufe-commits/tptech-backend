@@ -22,6 +22,14 @@ function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+function requireUsersRolesAdmin(req: any, res: any, next: any) {
+  const perms = req?.permissions ?? [];
+  if (!Array.isArray(perms) || !perms.includes("USERS_ROLES:ADMIN")) {
+    return res.status(403).json({ message: "No tenés permisos para realizar esta acción." });
+  }
+  next();
+}
+
 /* =========================
    Multer storage (avatars)
    - Guarda en: uploads/avatars
@@ -46,11 +54,7 @@ const avatarStorage = multer.diskStorage({
   },
 });
 
-function avatarFileFilter(
-  _req: any,
-  file: Express.Multer.File,
-  cb: multer.FileFilterCallback
-) {
+function avatarFileFilter(_req: any, file: Express.Multer.File, cb: multer.FileFilterCallback) {
   if (!file.mimetype?.startsWith("image/")) {
     return cb(new Error("El archivo debe ser una imagen"));
   }
@@ -71,7 +75,7 @@ const uploadAvatar = multer({
 const USER_ATT_DIR = path.join(process.cwd(), "uploads", "user-attachments");
 ensureDir(USER_ATT_DIR);
 
-const attStorage = multer.diskStorage({
+const userAttStorage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     ensureDir(USER_ATT_DIR);
     cb(null, USER_ATT_DIR);
@@ -89,7 +93,7 @@ const attStorage = multer.diskStorage({
 
 // Adjuntos: permitimos pdf/imágenes/docs (no filtramos por mimetype)
 const uploadUserAttachments = multer({
-  storage: attStorage,
+  storage: userAttStorage,
   limits: {
     fileSize: 20 * 1024 * 1024, // 20MB por archivo
     files: 10,
@@ -100,7 +104,7 @@ const uploadUserAttachments = multer({
    FAVORITE WAREHOUSE
 ========================= */
 router.patch("/me/favorite-warehouse", Users.updateMyFavoriteWarehouse);
-router.patch("/:id/favorite-warehouse", Users.updateUserFavoriteWarehouse);
+router.patch("/:id/favorite-warehouse", requireUsersRolesAdmin, Users.updateUserFavoriteWarehouse);
 
 /* =========================
    ✅ CLAVE RÁPIDA (PIN)
@@ -108,11 +112,11 @@ router.patch("/:id/favorite-warehouse", Users.updateUserFavoriteWarehouse);
 router.put("/me/quick-pin", Users.updateMyQuickPin);
 router.delete("/me/quick-pin", Users.removeMyQuickPin);
 
-router.put("/:id/quick-pin", Users.updateUserQuickPin);
-router.delete("/:id/quick-pin", Users.removeUserQuickPin);
+router.put("/:id/quick-pin", requireUsersRolesAdmin, Users.updateUserQuickPin);
+router.delete("/:id/quick-pin", requireUsersRolesAdmin, Users.removeUserQuickPin);
 
 /** ✅ habilitar/deshabilitar acceso por PIN (sin mostrar ni cambiar el PIN) */
-router.patch("/:id/quick-pin/enabled", Users.updateUserQuickPinEnabled);
+router.patch("/:id/quick-pin/enabled", requireUsersRolesAdmin, Users.updateUserQuickPinEnabled);
 
 /* =========================
    AVATAR (ME)
@@ -123,39 +127,52 @@ router.delete("/me/avatar", Users.removeMyAvatar);
 /* =========================
    AVATAR (ADMIN)
 ========================= */
-router.put("/:id/avatar", uploadAvatar.single("avatar"), Users.updateUserAvatarForUser);
-router.delete("/:id/avatar", Users.removeUserAvatarForUser);
+router.put(
+  "/:id/avatar",
+  requireUsersRolesAdmin,
+  uploadAvatar.single("avatar"),
+  Users.updateUserAvatarForUser
+);
+router.delete("/:id/avatar", requireUsersRolesAdmin, Users.removeUserAvatarForUser);
 
 /* =========================
-   USER ATTACHMENTS (ADMIN)
+   ✅ USER ATTACHMENTS (ADMIN)
+   PUT    /users/:id/attachments
+   DELETE /users/:id/attachments/:attachmentId
 ========================= */
 router.put(
   "/:id/attachments",
-  uploadUserAttachments.array("attachments", 10),
+  requireUsersRolesAdmin,
+  uploadUserAttachments.array("attachments", 10), // field: attachments
   Users.uploadUserAttachments
 );
-router.delete("/:id/attachments/:attachmentId", Users.deleteUserAttachment);
+
+router.delete(
+  "/:id/attachments/:attachmentId",
+  requireUsersRolesAdmin,
+  Users.deleteUserAttachment
+);
 
 /* =========================
    USERS CRUD / ADMIN
 ========================= */
-router.post("/", Users.createUser);
-router.get("/", Users.listUsers);
-router.get("/:id", Users.getUser);
+router.post("/", requireUsersRolesAdmin, Users.createUser);
+router.get("/", requireUsersRolesAdmin, Users.listUsers);
+router.get("/:id", requireUsersRolesAdmin, Users.getUser);
 
 /** ✅ EDITAR PERFIL/DIRECCIÓN/NOTAS */
-router.patch("/:id", Users.updateUserProfile);
+router.patch("/:id", requireUsersRolesAdmin, Users.updateUserProfile);
 
 // Estado / roles
-router.patch("/:id/status", Users.updateUserStatus);
-router.put("/:id/roles", Users.assignRolesToUser);
+router.patch("/:id/status", requireUsersRolesAdmin, Users.updateUserStatus);
+router.put("/:id/roles", requireUsersRolesAdmin, Users.assignRolesToUser);
 
 // Overrides (permisos especiales)
-router.post("/:id/overrides", Users.setUserOverride);
-router.delete("/:id/overrides/:permissionId", Users.removeUserOverride);
+router.post("/:id/overrides", requireUsersRolesAdmin, Users.setUserOverride);
+router.delete("/:id/overrides/:permissionId", requireUsersRolesAdmin, Users.removeUserOverride);
 
 // ✅ SOFT DELETE
-router.delete("/:id", Users.softDeleteUser);
+router.delete("/:id", requireUsersRolesAdmin, Users.softDeleteUser);
 
 /* =========================
    Multer error handler
@@ -163,7 +180,6 @@ router.delete("/:id", Users.softDeleteUser);
 router.use((err: any, _req: any, res: any, next: any) => {
   if (!err) return next();
 
-  // Multer límites
   if (err?.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ message: "El archivo supera el máximo permitido." });
   }
@@ -171,12 +187,9 @@ router.use((err: any, _req: any, res: any, next: any) => {
     return res.status(400).json({ message: "Demasiados archivos." });
   }
   if (err?.code === "LIMIT_UNEXPECTED_FILE") {
-    return res
-      .status(400)
-      .json({ message: "Archivo inesperado. Revisá el field multipart." });
+    return res.status(400).json({ message: "Archivo inesperado. Revisá el field multipart." });
   }
 
-  // Errores propios (avatar filter, etc.)
   if (typeof err?.message === "string") {
     if (err.message.toLowerCase().includes("imagen")) {
       return res.status(400).json({ message: err.message });

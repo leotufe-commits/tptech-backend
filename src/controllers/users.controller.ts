@@ -1515,9 +1515,13 @@ export async function softDeleteUser(req: Request, res: Response) {
    PUT /users/:id/attachments   (multipart field: attachments)
    DELETE /users/:id/attachments/:attachmentId
 ========================= */
+
 function publicBaseUrl(req: Request) {
+  // 1) Preferimos PUBLIC_BASE_URL (Render) para que quede fijo y correcto
   const envBase = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
   if (envBase) return envBase;
+
+  // 2) Fallback local: arma con host actual
   return `${req.protocol}://${req.get("host")}`;
 }
 
@@ -1552,6 +1556,9 @@ export async function uploadUserAttachments(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
+
+  // ✅ ADMIN only
+  if (!requireAdminUsersRoles(req, res)) return;
 
   const targetUserId = String(req.params.id || "").trim();
   if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
@@ -1652,14 +1659,13 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     user: updated
       ? {
           ...updated,
-          hasQuickPin: Boolean((updated as any).quickPinHash),
-          pinEnabled:
-            Boolean((updated as any).quickPinHash) && Boolean((updated as any).quickPinEnabled),
-          roles: ((updated as any).roles ?? [])
+          hasQuickPin: Boolean(updated.quickPinHash),
+          pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
+          roles: (updated.roles ?? [])
             .map((ur: any) => ur.role)
             .filter((r: any) => r && r.jewelryId === tenantId && !r.deletedAt)
             .map((r: any) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
-          permissionOverrides: (updated as any).permissionOverrides ?? [],
+          permissionOverrides: updated.permissionOverrides ?? [],
         }
       : null,
   });
@@ -1669,6 +1675,9 @@ export async function deleteUserAttachment(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
+
+  // ✅ ADMIN only
+  if (!requireAdminUsersRoles(req, res)) return;
 
   const targetUserId = String(req.params.id || "").trim();
   const attachmentId = String(req.params.attachmentId || "").trim();
@@ -1682,14 +1691,10 @@ export async function deleteUserAttachment(req: Request, res: Response) {
   });
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
-const att = await prisma.userAttachment.findFirst({
-  where: {
-    id: attachmentId,
-    userId: targetUserId,
-    user: { jewelryId: tenantId, deletedAt: null },
-  },
-  select: { id: true, url: true },
-});
+  const att = await prisma.userAttachment.findFirst({
+    where: { id: attachmentId, userId: targetUserId },
+    select: { id: true, url: true },
+  });
   if (!att) return res.status(404).json({ message: "Adjunto no encontrado." });
 
   await prisma.userAttachment.delete({ where: { id: att.id } });

@@ -1,6 +1,6 @@
 // tptech-backend/src/lib/prisma.ts
 import "dotenv/config";
-import { PrismaClient } from "@prisma/client";
+import PrismaClientPkg from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 
@@ -21,14 +21,13 @@ export function getRequestContext() {
 
 /**
  * Middleware que inicializa el contexto por request.
- * En app.ts (o server.ts) va ANTES de tus rutas.
  */
 export function requestContextMiddleware(_req: any, _res: any, next: any) {
   als.run({ tenantId: undefined, userId: undefined }, () => next());
 }
 
 /**
- * Helpers para setear/limpiar contexto desde middlewares
+ * Helpers de contexto
  */
 export function setContextUserId(userId: string) {
   const store = als.getStore();
@@ -58,18 +57,19 @@ export function clearRequestContext() {
 }
 
 /**
- * Prisma base singleton
+ * Prisma singleton + adapter
  */
+const { PrismaClient } = PrismaClientPkg;
+
 type PrismaGlobal = {
-  prisma?: PrismaClient;
+  prisma?: InstanceType<typeof PrismaClient>;
   prismaAdapter?: PrismaPg;
 };
-
 const globalForPrisma = globalThis as unknown as PrismaGlobal;
 
 function getAdapter() {
   const url = process.env.DATABASE_URL;
-  if (!url) throw new Error("❌ DATABASE_URL no está seteada en el entorno");
+  if (!url) throw new Error("DATABASE_URL no está definida");
   return globalForPrisma.prismaAdapter ?? new PrismaPg({ connectionString: url });
 }
 
@@ -77,7 +77,6 @@ const basePrisma =
   globalForPrisma.prisma ??
   new PrismaClient({
     adapter: getAdapter(),
-    // log: ["error", "warn"],
   });
 
 if (process.env.NODE_ENV !== "production") {
@@ -86,9 +85,7 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 /**
- * ✅ Multi-tenant enforcement via $extends
- *
- * Nota: Permission es GLOBAL (catálogo) y NO tiene jewelryId -> no debe filtrarse por tenant.
+ * Multi-tenant enforcement
  */
 const TENANT_MODELS = new Set<string>([
   "User",
@@ -104,7 +101,7 @@ const TENANT_FIELD_BY_MODEL: Record<string, string> = {
   AuditLog: "jewelryId",
 };
 
-function isTenantModel(model?: string | undefined) {
+function isTenantModel(model?: string) {
   return !!model && TENANT_MODELS.has(model);
 }
 
@@ -112,58 +109,55 @@ function tenantFieldFor(model: string) {
   return TENANT_FIELD_BY_MODEL[model] ?? "jewelryId";
 }
 
-function mergeWhereWithTenant(where: any, tenantField: string, tenantId: string) {
-  if (!tenantField) return where ?? {};
-  return { ...(where ?? {}), [tenantField]: tenantId };
+function mergeWhereWithTenant(where: any, field: string, tenantId: string) {
+  return { ...(where ?? {}), [field]: tenantId };
 }
 
-function addTenantToCreateData(data: any, tenantField: string, tenantId: string) {
-  if (!tenantField) return data ?? {};
-  return { ...(data ?? {}), [tenantField]: tenantId };
+function addTenantToCreateData(data: any, field: string, tenantId: string) {
+  return { ...(data ?? {}), [field]: tenantId };
 }
 
+/**
+ * 👉 ESTE EXPORT ES EL QUE FALTABA
+ */
 export const prisma = basePrisma.$extends({
   query: {
     $allModels: {
       async $allOperations({ model, operation, args, query }) {
         const ctx = getRequestContext();
-
-        // si no hay tenant en contexto, no tocamos
         if (!ctx?.tenantId) return query(args);
-
-        // si no es modelo multi-tenant, no tocamos
         if (!isTenantModel(model)) return query(args);
 
         const tenantId = ctx.tenantId;
         const tenantField = tenantFieldFor(model!);
-
         const a: any = args ?? {};
 
-        // reads
-        if (operation === "findMany" || operation === "findFirst" || operation === "findFirstOrThrow") {
+        if (
+          operation === "findMany" ||
+          operation === "findFirst" ||
+          operation === "findFirstOrThrow"
+        ) {
           a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
           return query(a);
         }
 
-        // bulk writes
         if (operation === "updateMany" || operation === "deleteMany") {
           a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
           return query(a);
         }
 
-        // creates
         if (operation === "create") {
           a.data = addTenantToCreateData(a.data, tenantField, tenantId);
           return query(a);
         }
 
         if (operation === "createMany") {
-          const data = Array.isArray(a.data) ? a.data : [];
-          a.data = data.map((row: any) => addTenantToCreateData(row, tenantField, tenantId));
+          a.data = (Array.isArray(a.data) ? a.data : []).map((row: any) =>
+            addTenantToCreateData(row, tenantField, tenantId)
+          );
           return query(a);
         }
 
-        // upsert
         if (operation === "upsert") {
           a.create = addTenantToCreateData(a.create, tenantField, tenantId);
           a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);

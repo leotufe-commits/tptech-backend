@@ -1,8 +1,11 @@
 // tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { OverrideEffect, UserStatus } from "@prisma/client";
+import PrismaPkg from "@prisma/client";
+const { UserStatus, OverrideEffect } = PrismaPkg;
+
 import { prisma, setContextTenantId, setContextUserId } from "../lib/prisma.js";
+
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
