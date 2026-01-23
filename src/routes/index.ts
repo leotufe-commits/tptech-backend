@@ -9,7 +9,10 @@ import movimientosRoutes from "../modules/movimientos/movimientos.routes.js";
 // Users ya está en modules ✅
 import usersRoutes from "../modules/users/users.routes.js";
 
-// Roles/Permissions todavía están en /routes (ok por ahora)
+// Company (configuración joyería)
+import companyRoutes from "./company.routes.js";
+
+// Roles / Permissions
 import rolesRoutes from "./roles.routes.js";
 import permissionsRoutes from "./permissions.routes.js";
 
@@ -28,6 +31,9 @@ privateRouter.use(requireAuth);
 
 // 🔹 Usuarios
 privateRouter.use("/users", usersRoutes);
+
+// 🔹 Configuración joyería
+privateRouter.use("/company", companyRoutes);
 
 // 🔹 Otros módulos
 privateRouter.use("/movimientos", movimientosRoutes);

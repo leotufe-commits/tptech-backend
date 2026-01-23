@@ -34,7 +34,10 @@ model Jewelry {
   notes        String @default("")
 
   // ✅ Cambio rápido de usuario (PIN) dentro del sistema
-  quickSwitchEnabled Boolean @default(false)
+  quickSwitchEnabled         Boolean @default(false)
+  pinLockEnabled             Boolean @default(false)
+  pinLockTimeoutSec          Int     @default(120)
+  pinLockRequireOnUserSwitch Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -123,9 +126,9 @@ model User {
 
   // ✅ CLAVE RÁPIDA (PIN)
   quickPinHash        String?
-  quickPinEnabled     Boolean  @default(false)
+  quickPinEnabled     Boolean   @default(false)
   quickPinUpdatedAt   DateTime?
-  quickPinFailedCount Int      @default(0)
+  quickPinFailedCount Int       @default(0)
   quickPinLockedUntil DateTime?
 
   createdAt DateTime @default(now())
@@ -141,14 +144,11 @@ model User {
   auditLogs           AuditLog[]
 
   @@unique([jewelryId, email]) // ✅ multi-tenant friendly
-
   @@index([jewelryId])
   @@index([jewelryId, status])
   @@index([favoriteWarehouseId])
-
   // ✅ recomendado para listados: WHERE jewelryId=? AND deletedAt IS NULL
   @@index([jewelryId, deletedAt])
-
   // PIN
   @@index([quickPinUpdatedAt])
   @@index([quickPinEnabled])
@@ -177,11 +177,11 @@ model UserAttachment {
 // ROLES / PERMISOS
 //////////////////////////////
 model Role {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   jewelryId   String
   name        String
   displayName String?
-  isSystem    Boolean  @default(false)
+  isSystem    Boolean   @default(false)
   deletedAt   DateTime?
 
   createdAt DateTime @default(now())

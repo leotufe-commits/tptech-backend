@@ -10,7 +10,6 @@ const pin4 = z.string().regex(/^\d{4}$/, "El PIN debe tener 4 dígitos.");
 
 /* =========================
    REGISTER
-   (estricto, como decidimos)
 ========================= */
 export const registerSchema = z.object({
   email,
@@ -32,13 +31,22 @@ export const registerSchema = z.object({
 });
 
 /* =========================
-   LOGIN / PASSWORD
+   LOGIN
 ========================= */
 export const loginSchema = z.object({
+  tenantId: z.string().min(1, "Tenant requerido."),
   email,
   password: z.string().min(1),
 });
 
+/* ✅ Nuevo: opciones de login por email (joyerías asociadas) */
+export const loginOptionsSchema = z.object({
+  email,
+});
+
+/* =========================
+   PASSWORD
+========================= */
 export const forgotSchema = z.object({
   email,
 });
@@ -51,19 +59,9 @@ export const resetSchema = z.object({
 /* =========================
    UPDATE EMPRESA / JOYERÍA
 ========================= */
-/**
- * Reglas:
- * - name es el ÚNICO obligatorio
- * - el resto:
- *    - puede no venir
- *    - puede venir como string vacío ""
- * - compatible con JSON y multipart (parseJsonBodyField)
- */
 export const updateJewelrySchema = z.object({
-  // obligatorio
   name: z.string().min(1),
 
-  // opcionales (aceptan "")
   firstName: z.string().optional(),
   lastName: z.string().optional(),
 
@@ -77,7 +75,6 @@ export const updateJewelrySchema = z.object({
   postalCode: z.string().optional(),
   country: z.string().optional(),
 
-  // empresa
   logoUrl: z.string().optional(),
   legalName: z.string().optional(),
   cuit: z.string().optional(),
@@ -89,26 +86,31 @@ export const updateJewelrySchema = z.object({
 
 /* =========================
    ✅ PIN (SOLO DENTRO DEL SISTEMA)
-   - nunca login externo
 ========================= */
-
-// crear / cambiar PIN del usuario actual
 export const pinSetSchema = z.object({
   pin: pin4,
 });
 
-// desactivar PIN (requiere PIN actual)
 export const pinDisableSchema = z.object({
   pin: pin4,
 });
 
-// desbloquear pantalla (PIN del usuario actual)
 export const pinUnlockSchema = z.object({
   pin: pin4,
 });
 
-// cambio rápido de usuario (si la joyería lo permite)
+/* ✅ FIX: pin opcional para permitir "switch sin PIN" cuando la joyería lo habilita */
 export const pinSwitchSchema = z.object({
   targetUserId: z.string().min(1),
-  pin: pin4,
+  pin: pin4.optional(),
+});
+
+/* =========================
+   ✅ CONFIG PIN / LOCK (JOYERÍA)
+========================= */
+export const pinLockSettingsSchema = z.object({
+  pinLockEnabled: z.boolean(),
+  pinLockTimeoutSec: z.number().int().min(30).max(60 * 60 * 12),
+  pinLockRequireOnUserSwitch: z.boolean(),
+  quickSwitchEnabled: z.boolean(),
 });
