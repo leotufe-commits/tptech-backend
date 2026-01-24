@@ -7,9 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { prisma } from "../lib/prisma.js";
 import { sendResetEmail } from "../lib/mailer.js";
-import { UserStatus, OverrideEffect, PermModule, PermAction } from "@prisma/client";
+import { UserStatus, PermModule, PermAction } from "@prisma/client";
 import type { Prisma, Permission as PermissionRow } from "@prisma/client";
 import { auditLog } from "../lib/auditLogger.js";
+import { buildAuthResponse } from "../lib/authResponse.js";
 
 /* =========================
    ENV / CONST
@@ -71,54 +72,6 @@ function clearAuthCookie(_req: Request, res: Response) {
     sameSite: isProd ? "none" : "lax",
     path: "/",
   });
-}
-
-function uniq(arr: string[]) {
-  return Array.from(new Set(arr));
-}
-
-function formatPerm(module: string, action: string) {
-  return `${module}:${action}`;
-}
-
-type ComputeUserShape = {
-  roles: Array<{
-    role: {
-      permissions: Array<{ permission: { module: unknown; action: unknown } }>;
-    };
-  }>;
-  permissionOverrides: Array<{
-    effect: OverrideEffect;
-    permission: { module: unknown; action: unknown };
-  }>;
-};
-
-function computeEffectivePermissions(user: ComputeUserShape) {
-  // 1) permisos por roles
-  const fromRoles: string[] = [];
-  for (const ur of user.roles ?? []) {
-    const rps = ur.role?.permissions ?? [];
-    for (const rp of rps) {
-      fromRoles.push(formatPerm(String(rp.permission.module), String(rp.permission.action)));
-    }
-  }
-
-  // 2) overrides
-  const allow: string[] = [];
-  const deny: string[] = [];
-  for (const ov of user.permissionOverrides ?? []) {
-    const p = formatPerm(String(ov.permission.module), String(ov.permission.action));
-    if (ov.effect === "ALLOW") allow.push(p);
-    if (ov.effect === "DENY") deny.push(p);
-  }
-
-  // 3) aplicar deny sobre roles y allow
-  const base = new Set(uniq(fromRoles));
-  for (const d of deny) base.delete(d);
-  for (const a of allow) base.add(a);
-  for (const d of deny) base.delete(d);
-
-  return Array.from(base).sort();
 }
 
 // ✅ normalizador: SIEMPRE string (incluye "")
@@ -187,7 +140,11 @@ async function tryDeleteUploadFile(storageFilename: string) {
 }
 
 function isPrismaUniqueError(e: any) {
-  return e && typeof e === "object" && (e.code === "P2002" || e.name === "PrismaClientKnownRequestError");
+  return (
+    e &&
+    typeof e === "object" &&
+    (e.code === "P2002" || e.name === "PrismaClientKnownRequestError")
+  );
 }
 
 function prismaUniqueTargets(e: any): string[] {
@@ -197,43 +154,35 @@ function prismaUniqueTargets(e: any): string[] {
   return [];
 }
 
+/* =========================
+   PRISMA INCLUDES (centralizado)
+========================= */
+const AUTH_USER_INCLUDE = {
+  jewelry: true,
+  favoriteWarehouse: true,
+  roles: {
+    include: {
+      role: {
+        include: {
+          permissions: { include: { permission: true } },
+        },
+      },
+    },
+  },
+  permissionOverrides: { include: { permission: true } },
+} as const;
+
 async function fetchUserForAuthById(userId: string) {
   return prisma.user.findUnique({
     where: { id: userId },
-    include: {
-      jewelry: true,
-      favoriteWarehouse: true,
-      roles: {
-        include: {
-          role: {
-            include: {
-              permissions: { include: { permission: true } },
-            },
-          },
-        },
-      },
-      permissionOverrides: { include: { permission: true } },
-    },
+    include: AUTH_USER_INCLUDE,
   });
 }
 
 async function fetchUserForAuthByEmailAndTenant(email: string, tenantId: string) {
   return prisma.user.findFirst({
     where: { email, jewelryId: tenantId, deletedAt: null },
-    include: {
-      jewelry: true,
-      favoriteWarehouse: true,
-      roles: {
-        include: {
-          role: {
-            include: {
-              permissions: { include: { permission: true } },
-            },
-          },
-        },
-      },
-      permissionOverrides: { include: { permission: true } },
-    },
+    include: AUTH_USER_INCLUDE,
     orderBy: { createdAt: "asc" },
   });
 }
@@ -258,53 +207,37 @@ async function fetchUsersForLoginOptions(email: string) {
 }
 
 /* =========================
+   ME (con fallback attachments encapsulado)
+========================= */
+async function fetchMeUserWithOptionalAttachments(userId: string) {
+  // 1) Intento: include attachments si el schema lo soporta
+  try {
+    return await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        jewelry: { include: { attachments: true } } as any,
+        favoriteWarehouse: true,
+        roles: AUTH_USER_INCLUDE.roles,
+        permissionOverrides: AUTH_USER_INCLUDE.permissionOverrides,
+      },
+    });
+  } catch {
+    // 2) Fallback: schema sin attachments
+    return await prisma.user.findUnique({
+      where: { id: userId },
+      include: AUTH_USER_INCLUDE,
+    });
+  }
+}
+
+/* =========================
    ME
 ========================= */
 export async function me(req: Request, res: Response) {
   const userId = (req as any).userId as string | undefined;
   if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
-  let user: any = null;
-
-  // 1) Intento: incluir attachments si el schema lo soporta
-  try {
-    user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: {
-        jewelry: { include: { attachments: true } } as any,
-        favoriteWarehouse: true,
-        roles: {
-          include: {
-            role: {
-              include: {
-                permissions: { include: { permission: true } },
-              },
-            },
-          },
-        },
-        permissionOverrides: { include: { permission: true } },
-      },
-    });
-  } catch {
-    // 2) Fallback: schema sin attachments
-    user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: {
-        jewelry: true,
-        favoriteWarehouse: true,
-        roles: {
-          include: {
-            role: {
-              include: {
-                permissions: { include: { permission: true } },
-              },
-            },
-          },
-        },
-        permissionOverrides: { include: { permission: true } },
-      },
-    });
-  }
+  const user = await fetchMeUserWithOptionalAttachments(userId);
 
   if (!user) return res.status(404).json({ message: "User not found." });
 
@@ -319,39 +252,7 @@ export async function me(req: Request, res: Response) {
     return res.status(403).json({ message: "Usuario no habilitado." });
   }
 
-  const safeUser: any = { ...user };
-  delete safeUser.password;
-
-  const roles = (user.roles ?? []).map((ur: any) => ({
-    id: ur.roleId,
-    name: ur.role?.name,
-    isSystem: ur.role?.isSystem ?? false,
-  }));
-
-  const permissions = computeEffectivePermissions(user as ComputeUserShape);
-
-  delete safeUser.roles;
-  delete safeUser.permissionOverrides;
-
-  const j = user.jewelry ?? null;
-
-  return res.json({
-    user: safeUser,
-
-    jewelry: j
-      ? {
-          ...j,
-          pinLockEnabled: (j as any).pinLockEnabled ?? true,
-          pinLockTimeoutSec: (j as any).pinLockTimeoutSec ?? 300,
-          pinLockRequireOnUserSwitch: (j as any).pinLockRequireOnUserSwitch ?? true,
-          quickSwitchEnabled: (j as any).quickSwitchEnabled ?? false,
-        }
-      : null,
-
-    roles,
-    permissions,
-    favoriteWarehouse: user.favoriteWarehouse ?? null,
-  });
+  return res.json(buildAuthResponse({ user, includeToken: false }));
 }
 
 /* =========================
@@ -382,7 +283,10 @@ export async function updateMyJewelry(req: Request, res: Response) {
     | undefined;
 
   const logoFile = files?.logo?.[0] ?? null;
-  const attachments: MulterFile[] = [...(files?.attachments ?? []), ...(files?.["attachments[]"] ?? [])];
+  const attachments: MulterFile[] = [
+    ...(files?.attachments ?? []),
+    ...(files?.["attachments[]"] ?? []),
+  ];
 
   const newLogoUrl = logoFile ? fileUrl(req, logoFile.filename) : undefined;
 
@@ -683,20 +587,7 @@ export async function register(req: Request, res: Response) {
 
       const fullUser = await tx.user.findUniqueOrThrow({
         where: { id: user.id },
-        include: {
-          jewelry: true,
-          favoriteWarehouse: true,
-          roles: {
-            include: {
-              role: {
-                include: {
-                  permissions: { include: { permission: true } },
-                },
-              },
-            },
-          },
-          permissionOverrides: { include: { permission: true } },
-        },
+        include: AUTH_USER_INCLUDE,
       });
 
       return { user: fullUser, jewelry };
@@ -713,34 +604,17 @@ export async function register(req: Request, res: Response) {
       meta: { email },
     });
 
-    const safeUser: any = { ...result.user };
-    delete safeUser.password;
-
-    const roles = (result.user.roles ?? []).map((ur: any) => ({
-      id: ur.roleId,
-      name: ur.role?.name,
-      isSystem: ur.role?.isSystem ?? false,
-    }));
-
-    const permissions = computeEffectivePermissions(result.user as unknown as ComputeUserShape);
-
-    delete safeUser.roles;
-    delete safeUser.permissionOverrides;
-
-    return res.status(201).json({
-      user: safeUser,
-      jewelry: result.jewelry,
-      roles,
-      permissions,
-      favoriteWarehouse: result.user.favoriteWarehouse ?? null,
-      token,
-      accessToken: token,
-    });
+    return res.status(201).json(
+      buildAuthResponse({
+        user: { ...result.user, jewelry: result.jewelry },
+        token,
+        includeToken: true,
+      })
+    );
   } catch (e: any) {
     if (isPrismaUniqueError(e)) {
       const targets = prismaUniqueTargets(e);
 
-      // si por error todavía existiera email único global
       if (targets.includes("email") || targets.join(",").includes("email")) {
         auditLog(req, {
           action: "auth.register",
@@ -762,8 +636,6 @@ export async function register(req: Request, res: Response) {
 
 /* =========================
    LOGIN
-   - ✅ si email tiene 1 joyería: login directo
-   - ✅ si email tiene N joyerías: requiere tenantId
 ========================= */
 export async function login(req: Request, res: Response) {
   const data = req.body as any;
@@ -865,29 +737,7 @@ export async function login(req: Request, res: Response) {
     meta: { selectedTenantId: user.jewelryId },
   });
 
-  const safeUser: any = { ...user };
-  delete safeUser.password;
-
-  const roles = (user.roles ?? []).map((ur: any) => ({
-    id: ur.roleId,
-    name: ur.role?.name,
-    isSystem: ur.role?.isSystem ?? false,
-  }));
-
-  const permissions = computeEffectivePermissions(user as unknown as ComputeUserShape);
-
-  delete safeUser.roles;
-  delete safeUser.permissionOverrides;
-
-  return res.json({
-    user: safeUser,
-    jewelry: user.jewelry ?? null,
-    roles,
-    permissions,
-    favoriteWarehouse: user.favoriteWarehouse ?? null,
-    token,
-    accessToken: token,
-  });
+  return res.json(buildAuthResponse({ user, token, includeToken: true }));
 }
 
 /* =========================
@@ -1020,11 +870,32 @@ export async function resetPassword(req: Request, res: Response) {
 }
 
 /* =========================
-   PIN (solo dentro del sistema)
+   PIN / QUICK SWITCH
 ========================= */
 function isValidPin(pin: unknown) {
   const p = String(pin ?? "").trim();
   return /^\d{4}$/.test(p);
+}
+
+// ✅ lockout settings (simple, estable)
+const PIN_MAX_FAILED = 5;
+const PIN_LOCK_MINUTES = 5;
+
+function lockUntilDate() {
+  return new Date(Date.now() + PIN_LOCK_MINUTES * 60 * 1000);
+}
+
+function isLocked(lockedUntil: Date | null | undefined) {
+  if (!lockedUntil) return false;
+  return lockedUntil.getTime() > Date.now();
+}
+
+function lockPayload(lockedUntil: Date) {
+  return {
+    message: "PIN bloqueado. Intentá nuevamente más tarde.",
+    code: "PIN_LOCKED",
+    lockedUntil,
+  };
 }
 
 /** Requiere que el usuario actual exista y sea ACTIVE */
@@ -1062,6 +933,54 @@ async function isQuickSwitchEnabled(jewelryId: string) {
   } catch {
     return false;
   }
+}
+
+async function recordPinFailure(args: {
+  userId: string;
+  tenantId: string;
+  action: string;
+  meta?: any;
+}) {
+  const u = await prisma.user.update({
+    where: { id: args.userId },
+    data: { quickPinFailedCount: { increment: 1 } },
+    select: { quickPinFailedCount: true },
+  });
+
+  const failed = Number((u as any).quickPinFailedCount ?? 0);
+  if (failed >= PIN_MAX_FAILED) {
+    const lockedUntil = lockUntilDate();
+    await prisma.user.update({
+      where: { id: args.userId },
+      data: {
+        quickPinLockedUntil: lockedUntil,
+        quickPinUpdatedAt: new Date(),
+      },
+    });
+
+    auditLog({} as any, {
+      action: args.action,
+      success: false,
+      userId: args.userId,
+      tenantId: args.tenantId,
+      meta: { ...(args.meta ?? {}), reason: "pin_locked", lockedUntil, failed },
+    });
+
+    return { locked: true as const, lockedUntil };
+  }
+
+  return { locked: false as const, failed };
+}
+
+async function clearPinFailures(userId: string) {
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      quickPinFailedCount: 0,
+      quickPinLockedUntil: null,
+      quickPinUpdatedAt: new Date(),
+    },
+  });
 }
 
 /* ---------- SET PIN (crear / cambiar) ---------- */
@@ -1112,15 +1031,29 @@ export async function disableMyPin(req: Request, res: Response) {
     return res.status(400).json({ message: "El PIN no está habilitado." });
   }
 
+  if (isLocked(meUser.quickPinLockedUntil as any)) {
+    return res.status(429).json(lockPayload(meUser.quickPinLockedUntil as any));
+  }
+
   const ok = await bcrypt.compare(pin, String(meUser.quickPinHash));
   if (!ok) {
+    const r = await recordPinFailure({
+      userId: meUser.id,
+      tenantId: meUser.jewelryId,
+      action: "auth.pin_disable",
+      meta: { reason: "invalid_pin" },
+    });
+
+    if (r.locked) return res.status(429).json(lockPayload(r.lockedUntil));
+
     auditLog(req, {
       action: "auth.pin_disable",
       success: false,
       userId: meUser.id,
       tenantId: meUser.jewelryId,
-      meta: { reason: "invalid_pin" },
+      meta: { reason: "invalid_pin", failed: r.failed },
     });
+
     return res.status(401).json({ message: "PIN incorrecto." });
   }
 
@@ -1160,26 +1093,33 @@ export async function unlockWithPin(req: Request, res: Response) {
     return res.status(400).json({ message: "Este usuario no tiene PIN configurado." });
   }
 
+  if (isLocked(meUser.quickPinLockedUntil as any)) {
+    return res.status(429).json(lockPayload(meUser.quickPinLockedUntil as any));
+  }
+
   const ok = await bcrypt.compare(pin, String(meUser.quickPinHash));
   if (!ok) {
+    const r = await recordPinFailure({
+      userId: meUser.id,
+      tenantId: meUser.jewelryId,
+      action: "auth.pin_unlock",
+      meta: { reason: "invalid_pin" },
+    });
+
+    if (r.locked) return res.status(429).json(lockPayload(r.lockedUntil));
+
     auditLog(req, {
       action: "auth.pin_unlock",
       success: false,
       userId: meUser.id,
       tenantId: meUser.jewelryId,
-      meta: { reason: "invalid_pin" },
+      meta: { reason: "invalid_pin", failed: r.failed },
     });
+
     return res.status(401).json({ message: "PIN incorrecto." });
   }
 
-  await prisma.user.update({
-    where: { id: meUser.id },
-    data: {
-      quickPinFailedCount: 0,
-      quickPinLockedUntil: null,
-      quickPinUpdatedAt: new Date(),
-    },
-  });
+  await clearPinFailures(meUser.id);
 
   auditLog(req, {
     action: "auth.pin_unlock",
@@ -1205,10 +1145,17 @@ export async function quickUsers(req: Request, res: Response) {
       status: UserStatus.ACTIVE,
       deletedAt: null,
     },
-    include: {
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      avatarUrl: true,
+      quickPinEnabled: true,
+      quickPinHash: true,
       roles: {
-        include: {
-          role: true,
+        select: {
+          roleId: true,
+          role: { select: { name: true, isSystem: true } },
         },
       },
     },
@@ -1217,34 +1164,49 @@ export async function quickUsers(req: Request, res: Response) {
 
   return res.json({
     enabled: true,
-    users: users.map((u) => ({
-      id: u.id,
-      email: u.email,
-      name: u.name,
-      avatarUrl: u.avatarUrl,
+    users: users.map((u: any) => {
+      const roles = (u.roles ?? [])
+        .map((ur: any) => ({
+          id: ur.roleId,
+          name: ur.role?.name,
+          isSystem: ur.role?.isSystem ?? false,
+        }))
+        .filter((r: any) => typeof r?.name === "string" && r.name.trim());
 
-      // 🔐 PIN
-      hasQuickPin: Boolean(u.quickPinEnabled && u.quickPinHash),
-      pinEnabled: Boolean(u.quickPinEnabled),
-      hasPin: Boolean(u.quickPinEnabled && u.quickPinHash),
+      const roleNames = roles
+        .map((r: any) => String(r.name).trim())
+        .filter(Boolean);
 
-      // ✅ ROLES (clave para UX consistente)
-      roles: (u.roles ?? []).map((ur) => ({
-        id: ur.roleId,
-        name: ur.role?.name,
-        isSystem: ur.role?.isSystem ?? false,
-      })),
-    })),
+      const roleLabel = roleNames.length ? roleNames.join(" • ") : "";
+
+      const hasQuickPin = Boolean(u.quickPinEnabled && u.quickPinHash);
+      const pinEnabled = Boolean(u.quickPinEnabled);
+
+      return {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        avatarUrl: u.avatarUrl,
+
+        // 🔐 PIN
+        hasQuickPin,
+        pinEnabled,
+        hasPin: hasQuickPin,
+
+        // ✅ ROLES (todas las variantes para frontend)
+        roles,
+        roleNames,
+        roleLabel,
+      };
+    }),
   });
 }
-
 
 /* ---------- SWITCH USER ---------- */
 export async function switchUserWithPin(req: Request, res: Response) {
   const meUser = await requireActiveMe(req);
   if (!meUser) return res.status(401).json({ message: "Unauthorized" });
 
-  // ✅ leer config real de la joyería (quickSwitch + requirePinOnSwitch)
   const j = await prisma.jewelry.findUnique({
     where: { id: meUser.jewelryId },
     select: { quickSwitchEnabled: true, pinLockRequireOnUserSwitch: true } as any,
@@ -1258,7 +1220,7 @@ export async function switchUserWithPin(req: Request, res: Response) {
   const requireOnUserSwitch =
     typeof (j as any)?.pinLockRequireOnUserSwitch === "boolean"
       ? Boolean((j as any)?.pinLockRequireOnUserSwitch)
-      : true; // default seguro
+      : true;
 
   const targetUserId = String((req.body as any)?.targetUserId ?? "").trim();
   const pin = String((req.body as any)?.pin ?? "").trim(); // puede venir vacío si no se requiere
@@ -1267,7 +1229,6 @@ export async function switchUserWithPin(req: Request, res: Response) {
     return res.status(400).json({ message: "targetUserId requerido." });
   }
 
-  // ✅ solo exigimos PIN si la config lo pide
   if (requireOnUserSwitch && !isValidPin(pin)) {
     return res.status(400).json({ message: "PIN inválido." });
   }
@@ -1289,23 +1250,39 @@ export async function switchUserWithPin(req: Request, res: Response) {
     return res.status(403).json({ message: "Usuario no habilitado." });
   }
 
-  // ✅ si se requiere PIN, validamos hash; si NO, saltamos todo esto
   if (requireOnUserSwitch) {
     if (!(target as any).quickPinEnabled || !(target as any).quickPinHash) {
       return res.status(400).json({ message: "El usuario seleccionado no tiene PIN configurado." });
     }
 
+    const lockedUntil = (target as any).quickPinLockedUntil as Date | null | undefined;
+    if (isLocked(lockedUntil)) {
+      return res.status(429).json(lockPayload(lockedUntil as Date));
+    }
+
     const ok = await bcrypt.compare(pin, String((target as any).quickPinHash));
     if (!ok) {
+      const r = await recordPinFailure({
+        userId: target.id,
+        tenantId: target.jewelryId,
+        action: "auth.pin_switch",
+        meta: { reason: "invalid_pin", targetUserId, fromUserId: meUser.id },
+      });
+
+      if (r.locked) return res.status(429).json(lockPayload(r.lockedUntil));
+
       auditLog(req, {
         action: "auth.pin_switch",
         success: false,
         userId: meUser.id,
         tenantId: meUser.jewelryId,
-        meta: { reason: "invalid_pin", targetUserId },
+        meta: { reason: "invalid_pin", targetUserId, failed: r.failed },
       });
+
       return res.status(401).json({ message: "PIN incorrecto." });
     }
+
+    await clearPinFailures(target.id);
   }
 
   const token = signToken(target.id, target.jewelryId, target.tokenVersion);
@@ -1322,31 +1299,9 @@ export async function switchUserWithPin(req: Request, res: Response) {
     },
   });
 
-  const safeUser: any = { ...target };
-  delete safeUser.password;
-  delete safeUser.quickPinHash;
-
-  const roles = (target.roles ?? []).map((ur: any) => ({
-    id: ur.roleId,
-    name: ur.role?.name,
-    isSystem: ur.role?.isSystem ?? false,
-  }));
-
-  const permissions = computeEffectivePermissions(target as unknown as ComputeUserShape);
-
-  delete safeUser.roles;
-  delete safeUser.permissionOverrides;
-
-  return res.json({
-    user: safeUser,
-    jewelry: target.jewelry ?? null,
-    roles,
-    permissions,
-    favoriteWarehouse: target.favoriteWarehouse ?? null,
-    token,
-    accessToken: token,
-  });
+  return res.json(buildAuthResponse({ user: target, token, includeToken: true }));
 }
+
 
 /* =========================
    QUICK SWITCH (toggle por joyería)
@@ -1358,7 +1313,6 @@ export async function setQuickSwitchForJewelry(req: Request, res: Response) {
   if (!userId) return res.status(401).json({ message: "Unauthorized" });
   if (!tenantId) return res.status(400).json({ message: "Tenant no definido." });
 
-  // acepta { enabled } o { quickSwitchEnabled }
   const enabledRaw = (req.body as any)?.enabled ?? (req.body as any)?.quickSwitchEnabled;
   const enabled =
     enabledRaw === true || enabledRaw === "true" || enabledRaw === 1 || enabledRaw === "1";
@@ -1381,8 +1335,6 @@ export async function setQuickSwitchForJewelry(req: Request, res: Response) {
 
 /* =========================
    PIN LOCK SETTINGS (joyería)
-   PATCH /auth/company/security/pin-lock
-   body: { pinLockEnabled?, pinLockTimeoutSec?, pinLockRequireOnUserSwitch?, quickSwitchEnabled? }
 ========================= */
 export async function setPinLockSettingsForJewelry(req: Request, res: Response) {
   const userId = (req as any).userId as string | undefined;
@@ -1393,7 +1345,6 @@ export async function setPinLockSettingsForJewelry(req: Request, res: Response) 
 
   const b = (req.body ?? {}) as any;
 
-  // aceptamos boolean o strings "true"/"false"
   const toBool = (v: any): boolean | undefined => {
     if (v === undefined || v === null) return undefined;
     if (typeof v === "boolean") return v;
@@ -1405,30 +1356,21 @@ export async function setPinLockSettingsForJewelry(req: Request, res: Response) 
 
   const pinLockEnabled = toBool(b.pinLockEnabled);
   const pinLockRequireOnUserSwitch = toBool(b.pinLockRequireOnUserSwitch);
-
-  // ✅ ESTE ERA EL BUG: no se guardaba quickSwitchEnabled
   const quickSwitchEnabled = toBool(b.quickSwitchEnabled);
 
   let pinLockTimeoutSec: number | undefined = undefined;
-  if (
-    b.pinLockTimeoutSec !== undefined &&
-    b.pinLockTimeoutSec !== null &&
-    b.pinLockTimeoutSec !== ""
-  ) {
+  if (b.pinLockTimeoutSec !== undefined && b.pinLockTimeoutSec !== null && b.pinLockTimeoutSec !== "") {
     const n = Number(b.pinLockTimeoutSec);
     if (!Number.isFinite(n)) {
       return res.status(400).json({ message: "pinLockTimeoutSec inválido." });
     }
-    // clamp: 10s a 12h (alineado con frontend)
     pinLockTimeoutSec = Math.max(10, Math.min(60 * 60 * 12, Math.trunc(n)));
   }
 
   const data: any = {};
   if (pinLockEnabled !== undefined) data.pinLockEnabled = pinLockEnabled;
   if (pinLockTimeoutSec !== undefined) data.pinLockTimeoutSec = pinLockTimeoutSec;
-  if (pinLockRequireOnUserSwitch !== undefined) {
-    data.pinLockRequireOnUserSwitch = pinLockRequireOnUserSwitch;
-  }
+  if (pinLockRequireOnUserSwitch !== undefined) data.pinLockRequireOnUserSwitch = pinLockRequireOnUserSwitch;
   if (quickSwitchEnabled !== undefined) data.quickSwitchEnabled = quickSwitchEnabled;
 
   if (!Object.keys(data).length) {
@@ -1465,7 +1407,6 @@ export async function setPinLockSettingsForJewelry(req: Request, res: Response) 
 
 /* =========================
    LOGIN OPTIONS (email -> joyerías)
-   POST /auth/login/options
 ========================= */
 export async function loginOptions(req: Request, res: Response) {
   const rawEmail = String((req.body as any)?.email ?? "").toLowerCase().trim();
