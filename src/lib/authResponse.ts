@@ -11,7 +11,12 @@ function formatPerm(module: string, action: string) {
 
 export type ComputeUserShape = {
   roles: Array<{
+    roleId?: string;
     role: {
+      id?: unknown;
+      name?: unknown;
+      displayName?: unknown;
+      isSystem?: unknown;
       permissions: Array<{ permission: { module: unknown; action: unknown } }>;
     };
   }>;
@@ -49,12 +54,32 @@ export function computeEffectivePermissions(user: ComputeUserShape) {
   return Array.from(base).sort();
 }
 
+function safeRoleLabel(r: any) {
+  const dn = String(r?.displayName ?? "").trim();
+  const n = String(r?.name ?? "").trim();
+  return dn || n;
+}
+
 export function mapRoles(user: any) {
-  return (user?.roles ?? []).map((ur: any) => ({
-    id: ur.roleId,
-    name: ur.role?.name,
-    isSystem: ur.role?.isSystem ?? false,
-  }));
+  const list = (user?.roles ?? []).map((ur: any) => {
+    const role = ur?.role ?? {};
+    const id = String(ur?.roleId ?? role?.id ?? "").trim();
+    const name = String(role?.name ?? "").trim();
+    const displayName = safeRoleLabel(role);
+    const isSystem = Boolean(role?.isSystem ?? false);
+
+    return { id, name, displayName, isSystem };
+  });
+
+  // ✅ limpia vacíos/duplicados por seguridad
+  const seen = new Set<string>();
+  return list.filter((r: any) => {
+    const key = r.id || `${r.name}::${r.displayName}`;
+    if (!key) return false;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(String(r.displayName || r.name || "").trim());
+  });
 }
 
 export function normalizeJewelrySecurity(j: any) {
@@ -87,10 +112,24 @@ export function buildAuthResponse(args: {
   const roles = mapRoles(user);
   const permissions = computeEffectivePermissions(user as ComputeUserShape);
 
+  // ✅ helpers listos para UI (Sidebar / LockScreen / Topbar)
+  const roleNames = roles
+    .map((r: any) => String(r?.displayName ?? r?.name ?? "").trim())
+    .filter(Boolean);
+
+  const roleLabel = roleNames.join(" • ");
+
   return {
     user: sanitizeUser(user),
     jewelry: normalizeJewelrySecurity(user?.jewelry ?? null),
+
+    // ✅ roles con displayName
     roles,
+
+    // ✅ extra para evitar hardcode en frontend
+    roleNames,
+    roleLabel,
+
     permissions,
     favoriteWarehouse: user?.favoriteWarehouse ?? null,
     ...(includeToken

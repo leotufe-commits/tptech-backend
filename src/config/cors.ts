@@ -1,3 +1,4 @@
+// tptech-backend/src/config/cors.ts
 import cors, { type CorsOptions } from "cors";
 
 function parseEnvOrigins(raw: string | undefined) {
@@ -21,15 +22,22 @@ export function buildCorsMiddleware() {
 
   const options: CorsOptions = {
     origin: (origin, callback) => {
+      // same-origin / server-to-server / curl
       if (!origin) return callback(null, true);
+
       if (allowedOrigins.has(origin)) return callback(null, true);
-      return callback(null, false);
+
+      // ✅ devolver error explícito (facilita debug en prod)
+      return callback(new Error(`CORS bloqueado para origin: ${origin}`));
     },
 
+    // ✅ clave para cookies httpOnly en cross-site
     credentials: true,
 
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+
+    // ✅ más tolerante (evita preflights inesperados que pueden fallar en algunos proxies)
+    allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
 
     optionsSuccessStatus: 204,
   };

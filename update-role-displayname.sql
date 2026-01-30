@@ -1,0 +1,1 @@
+UPDATE "Role" SET "displayName" = CASE "name" WHEN 'OWNER' THEN 'Propietario' WHEN 'ADMIN' THEN 'Administrador' WHEN 'STAFF' THEN 'Empleado' WHEN 'READONLY' THEN 'Solo lectura' ELSE "displayName" END WHERE "displayName" IS NULL;

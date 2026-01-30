@@ -4,6 +4,31 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { auditLog } from "../lib/auditLogger.js";
 
+/* =========================
+   Helpers
+========================= */
+function requireTenantId(req: Request, res: Response) {
+  const tenantId = (req as any).tenantId as string | undefined;
+  if (!tenantId) {
+    res.status(401).json({ message: "Tenant no encontrado" });
+    return null;
+  }
+  return String(tenantId);
+}
+
+function norm(s: any) {
+  return String(s || "").trim();
+}
+
+function isOwnerRole(roleName: string) {
+  // ✅ tolerante a DB: "OWNER" / "owner" / "Owner"
+  return String(roleName || "").trim().toLowerCase() === "owner";
+}
+
+function uniqStrings(arr: string[]) {
+  return Array.from(new Set((arr || []).map((x) => String(x)).filter(Boolean)));
+}
+
 /**
  * GET /roles
  * Lista roles del tenant (LIVIANO para performance).
@@ -17,8 +42,8 @@ import { auditLog } from "../lib/auditLogger.js";
  */
 export async function listRoles(req: Request, res: Response) {
   try {
-    const tenantId = (req as any).tenantId as string | undefined;
-    if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
+    const tenantId = requireTenantId(req, res);
+    if (!tenantId) return;
 
     const roles = await prisma.role.findMany({
       where: { jewelryId: tenantId, deletedAt: null },
@@ -55,10 +80,10 @@ export async function listRoles(req: Request, res: Response) {
  */
 export async function getRole(req: Request, res: Response) {
   try {
-    const tenantId = (req as any).tenantId as string | undefined;
-    if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
+    const tenantId = requireTenantId(req, res);
+    if (!tenantId) return;
 
-    const roleId = String(req.params.id || "");
+    const roleId = norm(req.params.id);
     if (!roleId) return res.status(400).json({ message: "roleId requerido" });
 
     const role = await prisma.role.findFirst({
@@ -104,27 +129,34 @@ export async function getRole(req: Request, res: Response) {
 
 /**
  * POST /roles
+ * (permissionIds opcional en schema; si lo mandás, lo aplicamos)
  */
 export async function createRole(req: Request, res: Response) {
   try {
-    const tenantId = (req as any).tenantId as string | undefined;
-    const userId = (req as any).userId as string | undefined;
-    if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
+    const tenantId = requireTenantId(req, res);
+    if (!tenantId) return;
 
-    const name = String((req as any).body?.name || "").trim();
+    const userId = (req as any).userId as string | undefined;
+
+    const name = norm((req as any).body?.name);
     if (!name) return res.status(400).json({ message: "name requerido" });
 
+    const permissionIdsRaw = Array.isArray((req as any).body?.permissionIds)
+      ? ((req as any).body.permissionIds as unknown[])
+      : [];
+
+    const permissionIds = uniqStrings(permissionIdsRaw as any);
+
     const existing = await prisma.role.findFirst({
-      where: {
-        jewelryId: tenantId,
-        name: { equals: name, mode: "insensitive" },
-      },
+      where: { jewelryId: tenantId, name: { equals: name, mode: "insensitive" } },
     });
 
+    // ya existe activo
     if (existing && existing.deletedAt === null) {
       return res.status(409).json({ message: "Ya existe un rol con ese nombre" });
     }
 
+    // restaurar soft deleted
     if (existing && existing.deletedAt !== null) {
       const restored = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const role = await tx.role.update({
@@ -138,6 +170,24 @@ export async function createRole(req: Request, res: Response) {
         });
 
         await tx.rolePermission.deleteMany({ where: { roleId: role.id } });
+
+        if (permissionIds.length) {
+          // ✅ validar existencia de permisos
+          const valid = await tx.permission.findMany({
+            where: { id: { in: permissionIds } },
+            select: { id: true },
+          });
+          const validIds = new Set(valid.map((p) => p.id));
+          const safeIds = permissionIds.filter((id) => validIds.has(id));
+
+          if (safeIds.length) {
+            await tx.rolePermission.createMany({
+              data: safeIds.map((pid) => ({ roleId: role.id, permissionId: pid })),
+              skipDuplicates: true,
+            });
+          }
+        }
+
         return role;
       });
 
@@ -146,19 +196,39 @@ export async function createRole(req: Request, res: Response) {
         success: true,
         userId,
         tenantId,
-        meta: { roleId: restored.id, name },
+        meta: { roleId: restored.id, name, permissionIdsCount: permissionIds.length },
       });
 
       return res.status(201).json(restored);
     }
 
-    const role = await prisma.role.create({
-      data: {
-        name,
-        displayName: name,
-        jewelryId: tenantId,
-        isSystem: false,
-      },
+    const created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const role = await tx.role.create({
+        data: {
+          name,
+          displayName: name,
+          jewelryId: tenantId,
+          isSystem: false,
+        },
+      });
+
+      if (permissionIds.length) {
+        const valid = await tx.permission.findMany({
+          where: { id: { in: permissionIds } },
+          select: { id: true },
+        });
+        const validIds = new Set(valid.map((p) => p.id));
+        const safeIds = permissionIds.filter((id) => validIds.has(id));
+
+        if (safeIds.length) {
+          await tx.rolePermission.createMany({
+            data: safeIds.map((pid) => ({ roleId: role.id, permissionId: pid })),
+            skipDuplicates: true,
+          });
+        }
+      }
+
+      return role;
     });
 
     auditLog(req, {
@@ -166,10 +236,10 @@ export async function createRole(req: Request, res: Response) {
       success: true,
       userId,
       tenantId,
-      meta: { roleId: role.id, name },
+      meta: { roleId: created.id, name, permissionIdsCount: permissionIds.length },
     });
 
-    return res.status(201).json(role);
+    return res.status(201).json(created);
   } catch (e: any) {
     return res.status(500).json({ message: e?.message || "Error creando rol" });
   }
@@ -177,17 +247,20 @@ export async function createRole(req: Request, res: Response) {
 
 /**
  * PATCH /roles/:id
+ * - si isSystem: solo displayName
+ * - si no isSystem: name + displayName
  */
 export async function updateRole(req: Request, res: Response) {
   try {
-    const tenantId = (req as any).tenantId as string | undefined;
-    const userId = (req as any).userId as string | undefined;
-    if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
+    const tenantId = requireTenantId(req, res);
+    if (!tenantId) return;
 
-    const roleId = String(req.params.id || "");
+    const userId = (req as any).userId as string | undefined;
+
+    const roleId = norm(req.params.id);
     if (!roleId) return res.status(400).json({ message: "roleId requerido" });
 
-    const name = String((req as any).body?.name || "").trim();
+    const name = norm((req as any).body?.name);
     if (!name) return res.status(400).json({ message: "name requerido" });
 
     const role = await prisma.role.findFirst({
@@ -197,7 +270,7 @@ export async function updateRole(req: Request, res: Response) {
 
     if (!role) return res.status(404).json({ message: "Rol no encontrado" });
 
-    if (role.isSystem && role.name === "OWNER") {
+    if (role.isSystem && isOwnerRole(role.name)) {
       return res.status(403).json({ message: "No se puede renombrar el rol Propietario" });
     }
 
@@ -253,19 +326,23 @@ export async function updateRole(req: Request, res: Response) {
 
 /**
  * PATCH /roles/:id/permissions
+ * Reemplaza toda la lista de permisos del rol.
  */
 export async function updateRolePermissions(req: Request, res: Response) {
   try {
-    const tenantId = (req as any).tenantId as string | undefined;
-    const userId = (req as any).userId as string | undefined;
-    if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
+    const tenantId = requireTenantId(req, res);
+    if (!tenantId) return;
 
-    const roleId = String(req.params.id || "");
+    const userId = (req as any).userId as string | undefined;
+
+    const roleId = norm(req.params.id);
     if (!roleId) return res.status(400).json({ message: "roleId requerido" });
 
-    const permissionIds = Array.isArray((req as any).body?.permissionIds)
-      ? (((req as any).body.permissionIds as unknown[]) as string[])
+    const permissionIdsRaw = Array.isArray((req as any).body?.permissionIds)
+      ? ((req as any).body.permissionIds as unknown[])
       : [];
+
+    const permissionIds = uniqStrings(permissionIdsRaw as any);
 
     const role = await prisma.role.findFirst({
       where: { id: roleId, jewelryId: tenantId, deletedAt: null },
@@ -274,28 +351,42 @@ export async function updateRolePermissions(req: Request, res: Response) {
 
     if (!role) return res.status(404).json({ message: "Rol no encontrado" });
 
-    if (role.isSystem && role.name === "OWNER") {
+    if (role.isSystem && isOwnerRole(role.name)) {
       return res.status(403).json({ message: "No se pueden editar permisos del Propietario" });
     }
 
-    await prisma.rolePermission.deleteMany({ where: { roleId } });
-
+    // ✅ validar existencia de permisos (catálogo global)
+    let safeIds: string[] = [];
     if (permissionIds.length) {
-      await prisma.rolePermission.createMany({
-        data: permissionIds.map((pid: string) => ({ roleId, permissionId: pid })),
-        skipDuplicates: true,
+      const valid = await prisma.permission.findMany({
+        where: { id: { in: permissionIds } },
+        select: { id: true },
       });
+      const validIds = new Set(valid.map((p) => p.id));
+      safeIds = permissionIds.filter((id) => validIds.has(id));
     }
+
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.rolePermission.deleteMany({ where: { roleId } });
+
+      if (safeIds.length) {
+        await tx.rolePermission.createMany({
+          data: safeIds.map((pid) => ({ roleId, permissionId: pid })),
+          skipDuplicates: true,
+        });
+      }
+    });
 
     auditLog(req, {
       action: "roles.update_permissions",
       success: true,
       userId,
       tenantId,
-      meta: { roleId, permissionIds },
+      meta: { roleId, permissionIds: safeIds, dropped: permissionIds.length - safeIds.length },
     });
 
-    return res.json({ ok: true });
+    // ✅ devolver algo útil para UI
+    return res.json({ ok: true, roleId, permissionIds: safeIds });
   } catch (e: any) {
     return res.status(500).json({ message: e?.message || "Error guardando permisos" });
   }
@@ -303,19 +394,21 @@ export async function updateRolePermissions(req: Request, res: Response) {
 
 /**
  * DELETE /roles/:id
+ * Soft delete + limpia rolePermission.
  */
 export async function deleteRole(req: Request, res: Response) {
   try {
-    const tenantId = (req as any).tenantId as string | undefined;
-    const userId = (req as any).userId as string | undefined;
-    if (!tenantId) return res.status(401).json({ message: "Tenant no encontrado" });
+    const tenantId = requireTenantId(req, res);
+    if (!tenantId) return;
 
-    const roleId = String(req.params.id || "");
+    const userId = (req as any).userId as string | undefined;
+
+    const roleId = norm(req.params.id);
     if (!roleId) return res.status(400).json({ message: "roleId requerido" });
 
     const role = await prisma.role.findFirst({
       where: { id: roleId, jewelryId: tenantId, deletedAt: null },
-      select: { id: true, isSystem: true, users: { select: { userId: true } } },
+      select: { id: true, name: true, isSystem: true, users: { select: { userId: true } } },
     });
 
     if (!role) return res.status(404).json({ message: "Rol no encontrado" });

@@ -132,11 +132,19 @@ function requireAdminUsersRoles(req: Request, res: Response): boolean {
   }
   return true;
 }
+async function countUserOverrides(userId: string) {
+  return prisma.userPermissionOverride.count({ where: { userId } });
+}
+
 
 /* =========================
    ✅ QUICK PIN (ME)
    PUT /users/me/quick-pin
    body: { pin: "1234", currentPin?: "0000" }
+
+   ⚠️ IMPORTANTE:
+   Antes incrementabas tokenVersion acá => eso invalida el JWT/cookie y te “expira sesión”.
+   El PIN no debería cerrar sesión, así que NO tocamos tokenVersion.
 ========================= */
 export async function updateMyQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -180,11 +188,10 @@ export async function updateMyQuickPin(req: Request, res: Response) {
     where: { id: actorId },
     data: {
       quickPinHash: hash,
-      quickPinEnabled: true, // ✅ si setea PIN, queda habilitado
+      quickPinEnabled: true,
       quickPinUpdatedAt: new Date(),
       quickPinFailedCount: 0,
       quickPinLockedUntil: null,
-      tokenVersion: { increment: 1 },
     },
     select: { id: true, quickPinHash: true, quickPinEnabled: true, quickPinUpdatedAt: true },
   });
@@ -209,6 +216,8 @@ export async function updateMyQuickPin(req: Request, res: Response) {
    ✅ QUICK PIN (ME)
    DELETE /users/me/quick-pin
    body: { currentPin: "1234" }
+
+   ⚠️ NO tocamos tokenVersion (evita “sesión expirada”)
 ========================= */
 export async function removeMyQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -252,7 +261,6 @@ export async function removeMyQuickPin(req: Request, res: Response) {
       quickPinUpdatedAt: new Date(),
       quickPinFailedCount: 0,
       quickPinLockedUntil: null,
-      tokenVersion: { increment: 1 },
     },
     select: { id: true, quickPinHash: true, quickPinEnabled: true, quickPinUpdatedAt: true },
   });
@@ -272,10 +280,13 @@ export async function removeMyQuickPin(req: Request, res: Response) {
     quickPinUpdatedAt: updated.quickPinUpdatedAt,
   });
 }
+
 /* =========================
    ✅ QUICK PIN (ADMIN)
    PUT /users/:id/quick-pin
    body: { pin: "1234" }
+
+   ⚠️ NO tocamos tokenVersion (evita cerrar sesión del usuario por setear PIN)
 ========================= */
 export async function updateUserQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -310,7 +321,6 @@ export async function updateUserQuickPin(req: Request, res: Response) {
       quickPinUpdatedAt: new Date(),
       quickPinFailedCount: 0,
       quickPinLockedUntil: null,
-      tokenVersion: { increment: 1 },
     },
     select: { id: true, quickPinHash: true, quickPinEnabled: true, quickPinUpdatedAt: true },
   });
@@ -334,6 +344,9 @@ export async function updateUserQuickPin(req: Request, res: Response) {
 /* =========================
    ✅ QUICK PIN (ADMIN)
    DELETE /users/:id/quick-pin
+
+   ⚠️ NO tocamos tokenVersion
+   ✅ Si tiene permisos especiales, exige confirmación y los borra
 ========================= */
 export async function removeUserQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -345,6 +358,8 @@ export async function removeUserQuickPin(req: Request, res: Response) {
   const targetUserId = String(req.params.id || "").trim();
   if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
 
+  const { confirmRemoveOverrides } = (req.body ?? {}) as { confirmRemoveOverrides?: boolean };
+
   const target = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
     select: { id: true, quickPinHash: true, quickPinEnabled: true },
@@ -352,17 +367,34 @@ export async function removeUserQuickPin(req: Request, res: Response) {
 
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
-  const updated = await prisma.user.update({
-    where: { id: targetUserId },
-    data: {
-      quickPinHash: null,
-      quickPinEnabled: false,
-      quickPinUpdatedAt: new Date(),
-      quickPinFailedCount: 0,
-      quickPinLockedUntil: null,
-      tokenVersion: { increment: 1 },
-    },
-    select: { id: true, quickPinHash: true, quickPinEnabled: true, quickPinUpdatedAt: true },
+  const overridesCount = await countUserOverrides(targetUserId);
+
+  if (overridesCount > 0 && confirmRemoveOverrides !== true) {
+    return res.status(409).json({
+      code: "HAS_SPECIAL_PERMISSIONS",
+      message:
+        "Este usuario tiene permisos especiales asignados. Si continuás, se borrarán esos permisos.",
+      overridesCount,
+      requireConfirmRemoveOverrides: true,
+    });
+  }
+
+  const updated = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    if (overridesCount > 0) {
+      await tx.userPermissionOverride.deleteMany({ where: { userId: targetUserId } });
+    }
+
+    return tx.user.update({
+      where: { id: targetUserId },
+      data: {
+        quickPinHash: null,
+        quickPinEnabled: false,
+        quickPinUpdatedAt: new Date(),
+        quickPinFailedCount: 0,
+        quickPinLockedUntil: null,
+      },
+      select: { id: true, quickPinHash: true, quickPinEnabled: true, quickPinUpdatedAt: true },
+    });
   });
 
   auditLog(req, {
@@ -370,7 +402,12 @@ export async function removeUserQuickPin(req: Request, res: Response) {
     success: true,
     userId: actorId,
     tenantId,
-    meta: { targetUserId, hasPin: false },
+    meta: {
+      targetUserId,
+      hasPin: false,
+      overridesCleared: overridesCount > 0,
+      overridesCount,
+    },
   });
 
   return res.json({
@@ -378,13 +415,18 @@ export async function removeUserQuickPin(req: Request, res: Response) {
     hasQuickPin: Boolean(updated.quickPinHash),
     pinEnabled: Boolean(updated.quickPinEnabled),
     quickPinUpdatedAt: updated.quickPinUpdatedAt,
+    overridesCleared: overridesCount > 0,
+    overridesCount,
   });
 }
+
 
 /* =========================
    ✅ QUICK PIN ENABLED (ADMIN)
    PATCH /users/:id/quick-pin/enabled
    body: { enabled: boolean }
+
+   ⚠️ NO tocamos tokenVersion (evita “sesión expirada” por habilitar/deshabilitar)
 ========================= */
 export async function updateUserQuickPinEnabled(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -397,6 +439,8 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
   if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
 
   const enabledRaw = (req.body as any)?.enabled;
+  const confirmRemoveOverrides = Boolean((req.body as any)?.confirmRemoveOverrides);
+
   if (typeof enabledRaw !== "boolean") {
     return res.status(400).json({ message: "enabled debe ser boolean." });
   }
@@ -412,13 +456,32 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
     return res.status(400).json({ message: "El usuario no tiene PIN definido. Definilo primero." });
   }
 
-  const updated = await prisma.user.update({
-    where: { id: targetUserId },
-    data: {
-      quickPinEnabled: enabledRaw,
-      tokenVersion: { increment: 1 },
-    },
-    select: { id: true, quickPinHash: true, quickPinEnabled: true },
+  // ✅ Si se está DESHABILITANDO el PIN y hay permisos especiales -> exigir confirmación
+  let overridesCount = 0;
+  if (enabledRaw === false) {
+    overridesCount = await countUserOverrides(targetUserId);
+
+    if (overridesCount > 0 && confirmRemoveOverrides !== true) {
+      return res.status(409).json({
+        code: "HAS_SPECIAL_PERMISSIONS",
+        message:
+          "Este usuario tiene permisos especiales asignados. Si continuás, se borrarán esos permisos.",
+        overridesCount,
+        requireConfirmRemoveOverrides: true,
+      });
+    }
+  }
+
+  const updated = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    if (enabledRaw === false && overridesCount > 0) {
+      await tx.userPermissionOverride.deleteMany({ where: { userId: targetUserId } });
+    }
+
+    return tx.user.update({
+      where: { id: targetUserId },
+      data: { quickPinEnabled: enabledRaw },
+      select: { id: true, quickPinHash: true, quickPinEnabled: true },
+    });
   });
 
   auditLog(req, {
@@ -426,13 +489,20 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
     success: true,
     userId: actorId,
     tenantId,
-    meta: { targetUserId, enabled: enabledRaw },
+    meta: {
+      targetUserId,
+      enabled: enabledRaw,
+      overridesCleared: enabledRaw === false && overridesCount > 0,
+      overridesCount: enabledRaw === false ? overridesCount : undefined,
+    },
   });
 
   return res.json({
     ok: true,
     hasQuickPin: Boolean(updated.quickPinHash),
     pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
+    overridesCleared: enabledRaw === false && overridesCount > 0,
+    overridesCount: enabledRaw === false ? overridesCount : undefined,
   });
 }
 
@@ -580,6 +650,7 @@ export async function createUser(req: Request, res: Response) {
 /* =========================
    GET /users
    ✅ LIVIANO + PAGINADO + SEARCH
+   ✅ incluye attachmentsCount + overridesCount (para UI instantánea)
 ========================= */
 export async function listUsers(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -628,6 +699,14 @@ export async function listUsers(req: Request, res: Response) {
             },
           },
         },
+
+        // ✅ contadores livianos para la tabla
+        _count: {
+          select: {
+            attachments: true,
+            permissionOverrides: true,
+          },
+        },
       },
       orderBy: { createdAt: "asc" },
       skip,
@@ -660,6 +739,11 @@ export async function listUsers(req: Request, res: Response) {
         .map((ur: UR) => ur.role as R)
         .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
         .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
+
+      // ✅ lo que necesita la tabla
+      attachmentsCount: u._count?.attachments ?? 0,
+      overridesCount: u._count?.permissionOverrides ?? 0,
+      hasSpecialPermissions: (u._count?.permissionOverrides ?? 0) > 0,
     })),
   });
 }
@@ -777,8 +861,10 @@ export async function getUser(req: Request, res: Response) {
     },
   });
 }
+
 /* =========================
    PATCH /users/:id
+   ⚠️ FIX: NO invalidar sesión del propio usuario por editar datos de perfil.
 ========================= */
 export async function updateUserProfile(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -841,7 +927,11 @@ export async function updateUserProfile(req: Request, res: Response) {
     return res.status(400).json({ message: "No hay campos para actualizar." });
   }
 
-  data.tokenVersion = { increment: 1 };
+  // ✅ Solo invalidar sesiones si estoy editando a OTRA persona (opcional).
+  // Para "mi usuario", NO tocamos tokenVersion (evita “sesión expirada”).
+  if (targetUserId !== actorId) {
+    data.tokenVersion = { increment: 1 };
+  }
 
   const updated = await prisma.user.update({
     where: { id: targetUserId },
@@ -884,7 +974,6 @@ export async function updateUserProfile(req: Request, res: Response) {
 
   return res.json({ user: updated });
 }
-
 /* =========================
    PATCH /users/:id/status
 ========================= */
@@ -1228,7 +1317,7 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
 
   const updated = await prisma.user.update({
     where: { id: targetUserId },
-    data: { favoriteWarehouseId: cleanId ?? null },
+    data: { favoriteWarehouseId: cleanId ?? null, tokenVersion: { increment: 1 } },
     select: {
       id: true,
       email: true,
@@ -1447,6 +1536,7 @@ export async function removeUserAvatarForUser(req: Request, res: Response) {
 
   return res.json({ ok: true, avatarUrl: null, user: updated });
 }
+
 /* =========================
    ✅ SOFT DELETE USER (ADMIN)
 ========================= */
