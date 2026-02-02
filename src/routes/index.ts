@@ -20,6 +20,7 @@ const router = Router();
 
 /* =====================
    Público
+   ✅ authRoutes ya maneja públic/privado internamente
 ===================== */
 router.use("/auth", authRoutes);
 

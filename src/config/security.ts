@@ -13,13 +13,14 @@ export function buildHelmetMiddleware(): RequestHandler {
     hsts: isProd
       ? { maxAge: 15552000, includeSubDomains: true, preload: true } // ~180 días
       : false,
+
+    // ✅ permite servir imágenes/recursos en cross-origin (frontend separado)
     crossOriginResourcePolicy: { policy: "cross-origin" },
   });
 }
 
 function getClientIp(req: Request) {
   // con app.set("trust proxy", 1) esto suele venir correcto
-  // garantizamos string para ipKeyGenerator
   return String(req.ip || "");
 }
 
@@ -31,8 +32,19 @@ export function buildRateLimitMiddleware(): RequestHandler {
     standardHeaders: true,
     legacyHeaders: false,
 
-    // ✅ FIX TS: keyGenerator debe recibir Request (y opcional Response)
-    // y devolver string. Adaptamos ipKeyGenerator.
+    // ✅ NO rate-limit a preflights
+    skip: (req) => {
+      if (req.method === "OPTIONS") return true;
+
+      // ✅ opcional: no limitar healthcheck ni archivos estáticos
+      const p = String(req.path || "");
+      if (p === "/health") return true;
+      if (p.startsWith("/uploads/")) return true;
+
+      return false;
+    },
+
+    // ✅ keyGenerator estable (IP) — evita problemas con proxies
     keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
 
     message: { message: "Demasiadas solicitudes. Intentá de nuevo más tarde." },

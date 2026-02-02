@@ -26,6 +26,18 @@ export function createApp() {
   app.use(buildHelmetMiddleware());
 
   /* =====================
+     CORS (con credentials)
+     ✅ bien arriba para que preflights respondan siempre con headers
+     ✅ REUTILIZAR la misma instancia (no llamar 2 veces buildCorsMiddleware)
+  ===================== */
+  const corsMw = buildCorsMiddleware();
+  app.use(corsMw);
+
+  // ✅ FIX: "*" rompe en path-to-regexp nuevo
+  // Usá regex para matchear todo
+  app.options(/.*/, corsMw);
+
+  /* =====================
      Parsers
   ===================== */
   app.use(express.json({ limit: "1mb" }));
@@ -34,26 +46,17 @@ export function createApp() {
 
   /* =====================
      Request Context (ALS)
-     ⚠️ ANTES de rutas
+     ⚠️ antes de rutas
   ===================== */
   app.use(requestContextMiddleware);
 
   /* =====================
      PERF logger (auditoría)
-     - loguea lentos (>= slowMs) en prod
-     - loguea todo en dev
   ===================== */
   app.use(perfLogger({ slowMs: 700 }));
 
   /* =====================
-     CORS (con credentials)
-  ===================== */
-  app.use(buildCorsMiddleware());
-
-  /* =====================
      Static: uploads
-     - Permite abrir avatares / logos / adjuntos por URL pública
-     - Ej: /uploads/avatars/<file>  |  /uploads/jewelry/<file>
   ===================== */
   const UPLOADS_DIR = path.join(process.cwd(), "uploads");
 
@@ -61,10 +64,8 @@ export function createApp() {
     "/uploads",
     express.static(UPLOADS_DIR, {
       index: false,
-      // si no existe el archivo, devolvemos 404 acá
       fallthrough: false,
       setHeaders(res) {
-        // cache leve (ajustable)
         res.setHeader("Cache-Control", "public, max-age=3600");
       },
     })
@@ -79,6 +80,7 @@ export function createApp() {
 
   /* =====================
      Rate limit global
+     (si querés bypass OPTIONS, lo hacemos desde el rate limiter, no con un app.use vacío)
   ===================== */
   app.use(buildRateLimitMiddleware());
 

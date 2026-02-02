@@ -1,11 +1,9 @@
 // tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import PrismaPkg from "@prisma/client";
-const { UserStatus, OverrideEffect } = PrismaPkg;
+import { UserStatus, OverrideEffect } from "@prisma/client";
 
 import { prisma, setContextTenantId, setContextUserId } from "../lib/prisma.js";
-
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
@@ -114,12 +112,16 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }
 
     // set req (tipado viene por express.d.ts)
-    req.userId = user.id;
-    req.tenantId = user.jewelryId;
+    (req as any).userId = user.id;
+    (req as any).tenantId = user.jewelryId;
 
-    // ALS (multi-tenant)
-    setContextUserId(user.id);
-    setContextTenantId(user.jewelryId);
+    // ALS (multi-tenant) — no dejes que un fallo acá tumbe el auth
+    try {
+      setContextUserId(user.id);
+      setContextTenantId(user.jewelryId);
+    } catch {
+      // no-op (si ALS no está disponible por algún motivo, no cortamos el request)
+    }
 
     // ✅ calcular permisos efectivos
     const base = new Set<string>();
@@ -137,8 +139,8 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }
 
     // overrides: DENY pisa todo, ALLOW suma si no fue denegado
-    const allow = new Set<string>();
     const deny = new Set<string>();
+    const allow = new Set<string>();
 
     for (const ov of user.permissionOverrides ?? []) {
       const key = toPermKey(ov.permission.module, ov.permission.action);
@@ -153,7 +155,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     // y deny vuelve a pisar por seguridad
     for (const d of deny) base.delete(d);
 
-    req.permissions = Array.from(base);
+    (req as any).permissions = Array.from(base);
 
     return next();
   } catch {
