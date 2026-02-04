@@ -1,2 +1,2 @@
-// src/index.ts
-import "./server.js";
+import "dotenv/config";
+import "./server.ts";

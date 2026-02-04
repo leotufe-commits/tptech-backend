@@ -5,14 +5,14 @@ import path from "node:path";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
+import { requirePermission } from "../../middlewares/requirePermission.js";
 import * as Users from "../../controllers/users.controller.js";
 
 const router = Router();
 
 /**
  * NOTA:
- * requireAuth ya se aplica en src/routes/index.ts (privateRouter.use(requireAuth)).
- * Así evitamos duplicaciones de auth y problemas de routing.
+ * requireAuth ya se aplica en src/routes/index.ts (router.use("/users", requireAuth, usersRoutes)).
  */
 
 /* =========================
@@ -22,18 +22,11 @@ function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function requireUsersRolesAdmin(req: any, res: any, next: any) {
-  const perms = req?.permissions ?? [];
-  if (!Array.isArray(perms) || !perms.includes("USERS_ROLES:ADMIN")) {
-    return res.status(403).json({ message: "No tenés permisos para realizar esta acción." });
-  }
-  next();
-}
+// ✅ Gate único para este módulo (OWNER bypass desde requirePermission)
+const requireUsersAdmin = requirePermission("USERS_ROLES", "ADMIN");
 
 /* =========================
    Multer storage (avatars)
-   - Guarda en: uploads/avatars
-   - Field esperado: avatar
 ========================= */
 const AVATARS_DIR = path.join(process.cwd(), "uploads", "avatars");
 ensureDir(AVATARS_DIR);
@@ -47,9 +40,7 @@ const avatarStorage = multer.diskStorage({
     const userId = String((req as any).userId || "user");
     const ext = path.extname(file.originalname || "").slice(0, 10).toLowerCase();
     const safeExt = ext && ext.length <= 10 ? ext : "";
-    const name = `avatar_${userId}_${Date.now()}_${crypto
-      .randomBytes(4)
-      .toString("hex")}${safeExt}`;
+    const name = `avatar_${userId}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}${safeExt}`;
     cb(null, name);
   },
 });
@@ -69,8 +60,6 @@ const uploadAvatar = multer({
 
 /* =========================
    Multer storage (user attachments)
-   - Guarda en: uploads/user-attachments
-   - Field esperado: attachments (multiple)
 ========================= */
 const USER_ATT_DIR = path.join(process.cwd(), "uploads", "user-attachments");
 ensureDir(USER_ATT_DIR);
@@ -84,9 +73,7 @@ const userAttStorage = multer.diskStorage({
     const userId = String(req.params?.id || (req as any).userId || "user");
     const ext = path.extname(file.originalname || "").slice(0, 12).toLowerCase();
     const safeExt = ext && ext.length <= 12 ? ext : "";
-    const name = `uatt_${userId}_${Date.now()}_${crypto
-      .randomBytes(6)
-      .toString("hex")}${safeExt}`;
+    const name = `uatt_${userId}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}${safeExt}`;
     cb(null, name);
   },
 });
@@ -103,76 +90,56 @@ const uploadUserAttachments = multer({
 /* =========================
    FAVORITE WAREHOUSE
 ========================= */
-router.patch("/me/favorite-warehouse", Users.updateMyFavoriteWarehouse);
-router.patch("/:id/favorite-warehouse", requireUsersRolesAdmin, Users.updateUserFavoriteWarehouse);
+router.patch("/me/favorite-warehouse", requireUsersAdmin, Users.updateMyFavoriteWarehouse);
+router.patch("/:id/favorite-warehouse", requireUsersAdmin, Users.updateUserFavoriteWarehouse);
 
 /* =========================
    ✅ CLAVE RÁPIDA (PIN)
 ========================= */
-router.put("/me/quick-pin", Users.updateMyQuickPin);
-router.delete("/me/quick-pin", Users.removeMyQuickPin);
+router.put("/me/quick-pin", requireUsersAdmin, Users.updateMyQuickPin);
+router.delete("/me/quick-pin", requireUsersAdmin, Users.removeMyQuickPin);
 
-router.put("/:id/quick-pin", requireUsersRolesAdmin, Users.updateUserQuickPin);
-router.delete("/:id/quick-pin", requireUsersRolesAdmin, Users.removeUserQuickPin);
+router.put("/:id/quick-pin", requireUsersAdmin, Users.updateUserQuickPin);
+router.delete("/:id/quick-pin", requireUsersAdmin, Users.removeUserQuickPin);
 
-/** ✅ habilitar/deshabilitar acceso por PIN (sin mostrar ni cambiar el PIN) */
-router.patch("/:id/quick-pin/enabled", requireUsersRolesAdmin, Users.updateUserQuickPinEnabled);
-
-/* =========================
-   AVATAR (ME)
-========================= */
-router.put("/me/avatar", uploadAvatar.single("avatar"), Users.updateMyAvatar);
-router.delete("/me/avatar", Users.removeMyAvatar);
+router.patch("/:id/quick-pin/enabled", requireUsersAdmin, Users.updateUserQuickPinEnabled);
 
 /* =========================
-   AVATAR (ADMIN)
+   AVATAR
 ========================= */
-router.put(
-  "/:id/avatar",
-  requireUsersRolesAdmin,
-  uploadAvatar.single("avatar"),
-  Users.updateUserAvatarForUser
-);
-router.delete("/:id/avatar", requireUsersRolesAdmin, Users.removeUserAvatarForUser);
+router.put("/me/avatar", requireUsersAdmin, uploadAvatar.single("avatar"), Users.updateMyAvatar);
+router.delete("/me/avatar", requireUsersAdmin, Users.removeMyAvatar);
+
+router.put("/:id/avatar", requireUsersAdmin, uploadAvatar.single("avatar"), Users.updateUserAvatarForUser);
+router.delete("/:id/avatar", requireUsersAdmin, Users.removeUserAvatarForUser);
 
 /* =========================
    ✅ USER ATTACHMENTS (ADMIN)
-   PUT    /users/:id/attachments
-   DELETE /users/:id/attachments/:attachmentId
 ========================= */
 router.put(
   "/:id/attachments",
-  requireUsersRolesAdmin,
-  uploadUserAttachments.array("attachments", 10), // field: attachments
+  requireUsersAdmin,
+  uploadUserAttachments.array("attachments", 10),
   Users.uploadUserAttachments
 );
 
-router.delete(
-  "/:id/attachments/:attachmentId",
-  requireUsersRolesAdmin,
-  Users.deleteUserAttachment
-);
+router.delete("/:id/attachments/:attachmentId", requireUsersAdmin, Users.deleteUserAttachment);
 
 /* =========================
    USERS CRUD / ADMIN
 ========================= */
-router.post("/", requireUsersRolesAdmin, Users.createUser);
-router.get("/", requireUsersRolesAdmin, Users.listUsers);
-router.get("/:id", requireUsersRolesAdmin, Users.getUser);
+router.post("/", requireUsersAdmin, Users.createUser);
+router.get("/", requireUsersAdmin, Users.listUsers);
+router.get("/:id", requireUsersAdmin, Users.getUser);
 
-/** ✅ EDITAR PERFIL/DIRECCIÓN/NOTAS */
-router.patch("/:id", requireUsersRolesAdmin, Users.updateUserProfile);
+router.patch("/:id", requireUsersAdmin, Users.updateUserProfile);
+router.patch("/:id/status", requireUsersAdmin, Users.updateUserStatus);
+router.put("/:id/roles", requireUsersAdmin, Users.assignRolesToUser);
 
-// Estado / roles
-router.patch("/:id/status", requireUsersRolesAdmin, Users.updateUserStatus);
-router.put("/:id/roles", requireUsersRolesAdmin, Users.assignRolesToUser);
+router.post("/:id/overrides", requireUsersAdmin, Users.setUserOverride);
+router.delete("/:id/overrides/:permissionId", requireUsersAdmin, Users.removeUserOverride);
 
-// Overrides (permisos especiales)
-router.post("/:id/overrides", requireUsersRolesAdmin, Users.setUserOverride);
-router.delete("/:id/overrides/:permissionId", requireUsersRolesAdmin, Users.removeUserOverride);
-
-// ✅ SOFT DELETE
-router.delete("/:id", requireUsersRolesAdmin, Users.softDeleteUser);
+router.delete("/:id", requireUsersAdmin, Users.softDeleteUser);
 
 /* =========================
    Multer error handler

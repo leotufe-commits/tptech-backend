@@ -1,6 +1,7 @@
 // tptech-backend/src/routes/roles.routes.ts
 import { Router } from "express";
 import { validateBody } from "../middlewares/validate.js";
+import { requirePermission } from "../middlewares/requirePermission.js";
 
 import {
   listRoles,
@@ -20,40 +21,27 @@ import {
 const router = Router();
 
 /**
- * ✅ NOTA IMPORTANTE
- * En src/routes/index.ts ya estás aplicando:
- *   privateRouter.use(requireAuth)
- * Por eso acá NO se vuelve a aplicar requireAuth.
+ * ✅ requireAuth ya se aplica en src/routes/index.ts
+ * ✅ Acá protegemos por permisos:
+ * - OWNER bypass automático en requirePermission
  */
 
-/**
- * GET /roles
- */
-router.get("/", listRoles);
+// Lista / detalle: normalmente solo ADMIN en sistemas con RBAC
+// Si querés que sea visible para más gente, lo ajustamos luego.
+router.get("/", requirePermission("USERS_ROLES", "ADMIN"), listRoles);
+router.get("/:id", requirePermission("USERS_ROLES", "ADMIN"), getRole);
 
-/**
- * GET /roles/:id
- */
-router.get("/:id", getRole);
+// CRUD: SIEMPRE ADMIN
+router.post("/", requirePermission("USERS_ROLES", "ADMIN"), validateBody(createRoleSchema), createRole);
+router.patch("/:id", requirePermission("USERS_ROLES", "ADMIN"), validateBody(updateRoleSchema), updateRole);
 
-/**
- * POST /roles
- */
-router.post("/", validateBody(createRoleSchema), createRole);
+router.patch(
+  "/:id/permissions",
+  requirePermission("USERS_ROLES", "ADMIN"),
+  validateBody(updateRolePermissionsSchema),
+  updateRolePermissions
+);
 
-/**
- * PATCH /roles/:id
- */
-router.patch("/:id", validateBody(updateRoleSchema), updateRole);
-
-/**
- * PATCH /roles/:id/permissions
- */
-router.patch("/:id/permissions", validateBody(updateRolePermissionsSchema), updateRolePermissions);
-
-/**
- * DELETE /roles/:id
- */
-router.delete("/:id", deleteRole);
+router.delete("/:id", requirePermission("USERS_ROLES", "ADMIN"), deleteRole);
 
 export default router;

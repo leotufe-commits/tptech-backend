@@ -26,7 +26,16 @@ function isOwnerRole(roleName: string) {
 }
 
 function uniqStrings(arr: string[]) {
-  return Array.from(new Set((arr || []).map((x) => String(x)).filter(Boolean)));
+  return Array.from(new Set((arr || []).map((x) => String(x)).map((x) => x.trim()).filter(Boolean)));
+}
+
+function toRoleRow(r: { id: string; name: string; displayName: string | null; isSystem: boolean }) {
+  return {
+    id: r.id,
+    name: r.displayName ?? r.name, // visible
+    code: r.name, // técnico
+    isSystem: r.isSystem,
+  };
 }
 
 /**
@@ -60,12 +69,17 @@ export async function listRoles(req: Request, res: Response) {
 
     type Row = (typeof roles)[number];
 
+    auditLog(req, {
+      action: "roles.list",
+      success: true,
+      userId: (req as any).userId as string | undefined,
+      tenantId,
+      meta: { count: roles.length },
+    });
+
     return res.json(
       roles.map((r: Row) => ({
-        id: r.id,
-        name: r.displayName ?? r.name, // visible
-        code: r.name, // técnico
-        isSystem: r.isSystem,
+        ...toRoleRow(r),
         usersCount: r._count.users,
       }))
     );
@@ -107,12 +121,17 @@ export async function getRole(req: Request, res: Response) {
 
     type RP = (typeof role.permissions)[number];
 
+    auditLog(req, {
+      action: "roles.get",
+      success: true,
+      userId: (req as any).userId as string | undefined,
+      tenantId,
+      meta: { roleId },
+    });
+
     return res.json({
       role: {
-        id: role.id,
-        name: role.displayName ?? role.name,
-        code: role.name,
-        isSystem: role.isSystem,
+        ...toRoleRow(role),
         usersCount: role._count.users,
         permissionIds: role.permissions.map((rp: RP) => rp.permissionId),
         permissions: role.permissions.map((rp: RP) => ({
@@ -147,12 +166,21 @@ export async function createRole(req: Request, res: Response) {
 
     const permissionIds = uniqStrings(permissionIdsRaw as any);
 
+    // ✅ FIX: necesitamos deletedAt para la lógica restore/active
     const existing = await prisma.role.findFirst({
       where: { jewelryId: tenantId, name: { equals: name, mode: "insensitive" } },
+      select: { id: true, deletedAt: true },
     });
 
     // ya existe activo
     if (existing && existing.deletedAt === null) {
+      auditLog(req, {
+        action: "roles.create",
+        success: false,
+        userId,
+        tenantId,
+        meta: { name, reason: "already_exists" },
+      });
       return res.status(409).json({ message: "Ya existe un rol con ese nombre" });
     }
 
@@ -167,12 +195,12 @@ export async function createRole(req: Request, res: Response) {
             name,
             displayName: name,
           },
+          select: { id: true, name: true, displayName: true, isSystem: true },
         });
 
         await tx.rolePermission.deleteMany({ where: { roleId: role.id } });
 
         if (permissionIds.length) {
-          // ✅ validar existencia de permisos
           const valid = await tx.permission.findMany({
             where: { id: { in: permissionIds } },
             select: { id: true },
@@ -186,9 +214,11 @@ export async function createRole(req: Request, res: Response) {
               skipDuplicates: true,
             });
           }
+
+          return { role, safeIds };
         }
 
-        return role;
+        return { role, safeIds: [] as string[] };
       });
 
       auditLog(req, {
@@ -196,10 +226,14 @@ export async function createRole(req: Request, res: Response) {
         success: true,
         userId,
         tenantId,
-        meta: { roleId: restored.id, name, permissionIdsCount: permissionIds.length },
+        meta: { roleId: restored.role.id, name, permissionIdsCount: restored.safeIds.length },
       });
 
-      return res.status(201).json(restored);
+      return res.status(201).json({
+        role: toRoleRow(restored.role),
+        permissionIds: restored.safeIds,
+        restored: true,
+      });
     }
 
     const created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -210,7 +244,10 @@ export async function createRole(req: Request, res: Response) {
           jewelryId: tenantId,
           isSystem: false,
         },
+        select: { id: true, name: true, displayName: true, isSystem: true },
       });
+
+      let safeIds: string[] = [];
 
       if (permissionIds.length) {
         const valid = await tx.permission.findMany({
@@ -218,7 +255,7 @@ export async function createRole(req: Request, res: Response) {
           select: { id: true },
         });
         const validIds = new Set(valid.map((p) => p.id));
-        const safeIds = permissionIds.filter((id) => validIds.has(id));
+        safeIds = permissionIds.filter((id) => validIds.has(id));
 
         if (safeIds.length) {
           await tx.rolePermission.createMany({
@@ -228,7 +265,7 @@ export async function createRole(req: Request, res: Response) {
         }
       }
 
-      return role;
+      return { role, safeIds };
     });
 
     auditLog(req, {
@@ -236,10 +273,14 @@ export async function createRole(req: Request, res: Response) {
       success: true,
       userId,
       tenantId,
-      meta: { roleId: created.id, name, permissionIdsCount: permissionIds.length },
+      meta: { roleId: created.role.id, name, permissionIdsCount: created.safeIds.length },
     });
 
-    return res.status(201).json(created);
+    return res.status(201).json({
+      role: toRoleRow(created.role),
+      permissionIds: created.safeIds,
+      restored: false,
+    });
   } catch (e: any) {
     return res.status(500).json({ message: e?.message || "Error creando rol" });
   }
@@ -274,51 +315,37 @@ export async function updateRole(req: Request, res: Response) {
       return res.status(403).json({ message: "No se puede renombrar el rol Propietario" });
     }
 
-    if (role.isSystem) {
-      const updated = await prisma.role.update({
-        where: { id: roleId },
-        data: { displayName: name },
+    if (!role.isSystem) {
+      const exists = await prisma.role.findFirst({
+        where: {
+          jewelryId: tenantId,
+          deletedAt: null,
+          name: { equals: name, mode: "insensitive" },
+          NOT: { id: roleId },
+        },
+        select: { id: true },
       });
 
-      auditLog(req, {
-        action: "roles.rename_display",
-        success: true,
-        userId,
-        tenantId,
-        meta: { roleId, displayName: name },
-      });
-
-      return res.json(updated);
-    }
-
-    const exists = await prisma.role.findFirst({
-      where: {
-        jewelryId: tenantId,
-        deletedAt: null,
-        name: { equals: name, mode: "insensitive" },
-        NOT: { id: roleId },
-      },
-      select: { id: true },
-    });
-
-    if (exists) {
-      return res.status(409).json({ message: "Ya existe un rol con ese nombre" });
+      if (exists) {
+        return res.status(409).json({ message: "Ya existe un rol con ese nombre" });
+      }
     }
 
     const updated = await prisma.role.update({
       where: { id: roleId },
-      data: { name, displayName: name },
+      data: role.isSystem ? { displayName: name } : { name, displayName: name },
+      select: { id: true, name: true, displayName: true, isSystem: true },
     });
 
     auditLog(req, {
-      action: "roles.rename",
+      action: role.isSystem ? "roles.rename_display" : "roles.rename",
       success: true,
       userId,
       tenantId,
       meta: { roleId, name },
     });
 
-    return res.json(updated);
+    return res.json({ role: toRoleRow(updated) });
   } catch (e: any) {
     return res.status(500).json({ message: e?.message || "Error renombrando rol" });
   }
@@ -385,7 +412,6 @@ export async function updateRolePermissions(req: Request, res: Response) {
       meta: { roleId, permissionIds: safeIds, dropped: permissionIds.length - safeIds.length },
     });
 
-    // ✅ devolver algo útil para UI
     return res.json({ ok: true, roleId, permissionIds: safeIds });
   } catch (e: any) {
     return res.status(500).json({ message: e?.message || "Error guardando permisos" });

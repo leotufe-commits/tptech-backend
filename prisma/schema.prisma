@@ -48,6 +48,9 @@ model Jewelry {
   warehouses  Warehouse[]
   attachments JewelryAttachment[]
 
+  // ✅ Catálogos administrables (relación inversa)
+  catalogItems CatalogItem[]
+
   @@index([createdAt])
 }
 
@@ -143,13 +146,11 @@ model User {
   attachments         UserAttachment[]
   auditLogs           AuditLog[]
 
-  @@unique([jewelryId, email]) // ✅ multi-tenant friendly
+  @@unique([jewelryId, email])
   @@index([jewelryId])
   @@index([jewelryId, status])
   @@index([favoriteWarehouseId])
-  // ✅ recomendado para listados: WHERE jewelryId=? AND deletedAt IS NULL
   @@index([jewelryId, deletedAt])
-  // PIN
   @@index([quickPinUpdatedAt])
   @@index([quickPinEnabled])
 }
@@ -308,4 +309,34 @@ enum PermAction {
 enum OverrideEffect {
   ALLOW
   DENY
+}
+
+//////////////////////////////
+// CATÁLOGOS (COMBOS ADMINISTRABLES)
+//////////////////////////////
+enum CatalogType {
+  IVA_CONDITION
+  PHONE_PREFIX
+  DOCUMENT_TYPE
+  CITY
+  PROVINCE
+  COUNTRY
+}
+
+model CatalogItem {
+  id        String      @id @default(cuid())
+  jewelryId String
+  type      CatalogType
+  label     String
+  isActive  Boolean     @default(true)
+  sortOrder Int         @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  jewelry Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+
+  @@index([jewelryId])
+  @@index([jewelryId, type, isActive])
+  @@unique([jewelryId, type, label])
 }

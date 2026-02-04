@@ -7,7 +7,7 @@ const router = Router();
 
 /**
  * NOTA:
- * requireAuth ya se aplica en src/routes/index.ts (privateRouter.use(requireAuth)).
+ * requireAuth ya se aplica en src/routes/index.ts
  */
 
 router.get("/", requirePermission("USERS_ROLES", "ADMIN"), listPermissions);

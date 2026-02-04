@@ -1,15 +1,13 @@
 // tptech-backend/src/lib/prisma.ts
 import "dotenv/config";
 import type { Request, Response, NextFunction } from "express";
-
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 
-/**
- * Contexto por request (multi-tenant).
- * Guardamos tenantId (jewelryId) y userId.
- */
+/* =========================
+   REQUEST CONTEXT (ALS)
+========================= */
 type RequestContext = {
   tenantId?: string;
   userId?: string;
@@ -21,16 +19,14 @@ export function getRequestContext() {
   return als.getStore();
 }
 
-/**
- * Middleware que inicializa el contexto por request.
- */
-export function requestContextMiddleware(_req: Request, _res: Response, next: NextFunction) {
+export function requestContextMiddleware(
+  _req: Request,
+  _res: Response,
+  next: NextFunction
+) {
   als.run({ tenantId: undefined, userId: undefined }, () => next());
 }
 
-/**
- * Helpers de contexto
- */
 export function setContextUserId(userId: string) {
   const store = als.getStore();
   if (store) store.userId = userId;
@@ -41,16 +37,6 @@ export function setContextTenantId(tenantId: string) {
   if (store) store.tenantId = tenantId;
 }
 
-export function clearContextUserId() {
-  const store = als.getStore();
-  if (store) store.userId = undefined;
-}
-
-export function clearContextTenantId() {
-  const store = als.getStore();
-  if (store) store.tenantId = undefined;
-}
-
 export function clearRequestContext() {
   const store = als.getStore();
   if (!store) return;
@@ -58,12 +44,12 @@ export function clearRequestContext() {
   store.tenantId = undefined;
 }
 
-/**
- * Prisma singleton + adapter
- */
+/* =========================
+   PRISMA CLIENT (PG)
+========================= */
 type PrismaGlobal = {
   prisma?: PrismaClient;
-  prismaAdapter?: PrismaPg;
+  adapter?: PrismaPg;
 };
 
 const globalForPrisma = globalThis as unknown as PrismaGlobal;
@@ -72,16 +58,14 @@ function getAdapter(): PrismaPg {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL no está definida");
 
-  // 🔒 Reusar adapter en dev para evitar múltiples conexiones
-  if (globalForPrisma.prismaAdapter) return globalForPrisma.prismaAdapter;
+  if (globalForPrisma.adapter) return globalForPrisma.adapter;
 
-  // PrismaPg acepta connectionString pero los tipos a veces no calzan perfecto según versión
   const adapter = new PrismaPg({ connectionString: url } as any);
-  globalForPrisma.prismaAdapter = adapter;
+  globalForPrisma.adapter = adapter;
   return adapter;
 }
 
-const basePrisma: PrismaClient =
+const basePrisma =
   globalForPrisma.prisma ??
   new PrismaClient({
     adapter: getAdapter(),
@@ -91,10 +75,10 @@ if (process.env.NODE_ENV !== "production") {
   globalForPrisma.prisma = basePrisma;
 }
 
-/**
- * Multi-tenant enforcement
- */
-const TENANT_MODELS = new Set<string>(["User", "Role", "Warehouse", "AuditLog"]);
+/* =========================
+   MULTI-TENANT ENFORCEMENT
+========================= */
+const TENANT_MODELS = new Set(["User", "Role", "Warehouse", "AuditLog"]);
 
 const TENANT_FIELD_BY_MODEL: Record<string, string> = {
   User: "jewelryId",
@@ -120,12 +104,9 @@ function addTenantToCreateData(data: any, field: string, tenantId: string) {
 }
 
 /**
- * Prisma con enforcement multi-tenant
- *
- * ⚠️ Importante:
- * - Tipamos explícitamente el parámetro de $allOperations como `any`
- *   para evitar TS7006 (implicit any) en build estricto de Render.
- * - Exportamos `prisma` como PrismaClient para evitar casts problemáticos.
+ * Prisma extendido:
+ * - agrega tenantId automáticamente
+ * - filtra por tenantId en queries
  */
 export const prisma: PrismaClient = basePrisma.$extends({
   query: {
@@ -143,34 +124,38 @@ export const prisma: PrismaClient = basePrisma.$extends({
         if (!isTenantModel(model)) return query(args);
 
         const tenantId = ctx.tenantId;
-        const tenantField = tenantFieldFor(model!);
+        const field = tenantFieldFor(model!);
         const a: any = args ?? {};
 
-        if (operation === "findMany" || operation === "findFirst" || operation === "findFirstOrThrow") {
-          a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
+        if (
+          operation === "findMany" ||
+          operation === "findFirst" ||
+          operation === "findFirstOrThrow"
+        ) {
+          a.where = mergeWhereWithTenant(a.where, field, tenantId);
           return query(a);
         }
 
         if (operation === "updateMany" || operation === "deleteMany") {
-          a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
+          a.where = mergeWhereWithTenant(a.where, field, tenantId);
           return query(a);
         }
 
         if (operation === "create") {
-          a.data = addTenantToCreateData(a.data, tenantField, tenantId);
+          a.data = addTenantToCreateData(a.data, field, tenantId);
           return query(a);
         }
 
         if (operation === "createMany") {
           a.data = (Array.isArray(a.data) ? a.data : []).map((row: any) =>
-            addTenantToCreateData(row, tenantField, tenantId)
+            addTenantToCreateData(row, field, tenantId)
           );
           return query(a);
         }
 
         if (operation === "upsert") {
-          a.create = addTenantToCreateData(a.create, tenantField, tenantId);
-          a.where = mergeWhereWithTenant(a.where, tenantField, tenantId);
+          a.create = addTenantToCreateData(a.create, field, tenantId);
+          a.where = mergeWhereWithTenant(a.where, field, tenantId);
           return query(a);
         }
 

@@ -34,6 +34,24 @@ function toPermKey(module: any, action: any) {
   return `${String(module)}:${String(action)}`;
 }
 
+/**
+ * Lee tokenVersion de forma tolerante para evitar "sesión expirada"
+ * si el login emitió el claim con otro nombre.
+ */
+function readTokenVersion(payload: any): number | null {
+  const raw =
+    payload?.tokenVersion ??
+    payload?.tv ??
+    payload?.ver ?? // ✅ tolerancia
+    payload?.token_ver; // ✅ tolerancia
+
+  if (raw === undefined || raw === null || raw === "") return null;
+
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
+
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   const token = getTokenFromReq(req);
 
@@ -48,13 +66,18 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }) as any;
 
     // soporta payloads: tenantId o jewelryId
-    const userId = String(payload?.sub || payload?.userId || "");
-    const tenantId = String(payload?.tenantId || payload?.jewelryId || payload?.tenant || "");
+    const userId = String(payload?.sub || payload?.userId || "").trim();
+    const tenantId = String(payload?.tenantId || payload?.jewelryId || payload?.tenant || "").trim();
 
-    // soporta tokenVersion o tv
-    const tokenVersion = Number(payload?.tokenVersion ?? payload?.tv ?? 0);
+    const tokenVersion = readTokenVersion(payload);
 
     if (!userId || !tenantId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    // ✅ Si el token no trae versión, no podemos validar sesión correctamente
+    // (mejor devolver Unauthorized que "Sesión expirada" que confunde).
+    if (tokenVersion === null) {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
@@ -63,6 +86,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
      * - valida que el user exista en ese tenant
      * - valida deletedAt null
      * - trae roles/overrides para req.permissions
+     * - trae role.name para isOwner/roles
      */
     const user = await prisma.user.findFirst({
       where: {
@@ -79,6 +103,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
           select: {
             role: {
               select: {
+                name: true, // ✅ necesario para OWNER
                 jewelryId: true,
                 deletedAt: true,
                 permissions: {
@@ -115,12 +140,24 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     (req as any).userId = user.id;
     (req as any).tenantId = user.jewelryId;
 
+    // roles e isOwner (para bypass limpio en requirePermission)
+    const roleNames: string[] = [];
+    for (const ur of user.roles ?? []) {
+      const r = ur.role;
+      if (!r) continue;
+      if (r.jewelryId !== user.jewelryId) continue;
+      if (r.deletedAt) continue;
+      roleNames.push(String(r.name || "").trim().toUpperCase());
+    }
+    (req as any).roles = Array.from(new Set(roleNames));
+    (req as any).isOwner = (req as any).roles.includes("OWNER");
+
     // ALS (multi-tenant) — no dejes que un fallo acá tumbe el auth
     try {
       setContextUserId(user.id);
       setContextTenantId(user.jewelryId);
     } catch {
-      // no-op (si ALS no está disponible por algún motivo, no cortamos el request)
+      // no-op
     }
 
     // ✅ calcular permisos efectivos

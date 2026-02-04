@@ -4,8 +4,8 @@ import { z } from "zod";
 /* =========================
    HELPERS
 ========================= */
-const email = z.string().email();
-const password = z.string().min(6);
+const email = z.string().email("Email inválido.");
+const password = z.string().min(6, "La contraseña debe tener al menos 6 caracteres.");
 const pin4 = z.string().regex(/^\d{4}$/, "El PIN debe tener 4 dígitos.");
 
 /* =========================
@@ -36,10 +36,10 @@ export const registerSchema = z.object({
 export const loginSchema = z.object({
   tenantId: z.string().min(1, "Tenant requerido."),
   email,
-  password: z.string().min(1),
+  password: z.string().min(1, "Contraseña requerida."),
 });
 
-/* ✅ Nuevo: opciones de login por email (joyerías asociadas) */
+/* ✅ Opciones de login por email (joyerías asociadas) */
 export const loginOptionsSchema = z.object({
   email,
 });
@@ -85,7 +85,7 @@ export const updateJewelrySchema = z.object({
 });
 
 /* =========================
-   ✅ PIN (SOLO DENTRO DEL SISTEMA)
+   🔐 PIN (SOLO DENTRO DEL SISTEMA)
 ========================= */
 export const pinSetSchema = z.object({
   pin: pin4,
@@ -99,14 +99,15 @@ export const pinUnlockSchema = z.object({
   pin: pin4,
 });
 
-/* ✅ FIX: pin opcional para permitir "switch sin PIN" cuando la joyería lo habilita */
+/* ✅ PIN opcional para permitir switch sin PIN
+   cuando la joyería lo habilita */
 export const pinSwitchSchema = z.object({
   targetUserId: z.string().min(1),
   pin: pin4.optional(),
 });
 
 /* =========================
-   ✅ CONFIG PIN / LOCK (JOYERÍA)
+   🔐 CONFIG PIN / LOCK (JOYERÍA)
 ========================= */
 export const pinLockSettingsSchema = z.object({
   pinLockEnabled: z.boolean(),

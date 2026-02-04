@@ -3,44 +3,31 @@ import { Router } from "express";
 
 import { requireAuth } from "../middlewares/requireAuth.js";
 
+// ✅ módulos
 import authRoutes from "../modules/auth/auth.routes.js";
 import movimientosRoutes from "../modules/movimientos/movimientos.routes.js";
-
-// Users ya está en modules ✅
 import usersRoutes from "../modules/users/users.routes.js";
 
-// Company (configuración joyería)
+// ✅ rutas “legacy/flat” que siguen en /routes
 import companyRoutes from "./company.routes.js";
-
-// Roles / Permissions
 import rolesRoutes from "./roles.routes.js";
 import permissionsRoutes from "./permissions.routes.js";
 
 const router = Router();
 
 /* =====================
-   Público
-   ✅ authRoutes ya maneja públic/privado internamente
+   PÚBLICO
+   - auth.routes.ts maneja público/privado internamente
 ===================== */
 router.use("/auth", authRoutes);
 
 /* =====================
-   Privado (requiere login)
+   PRIVADO (requiere sesión)
 ===================== */
-const privateRouter = Router();
-privateRouter.use(requireAuth);
-
-// 🔹 Usuarios
-privateRouter.use("/users", usersRoutes);
-
-// 🔹 Configuración joyería
-privateRouter.use("/company", companyRoutes);
-
-// 🔹 Otros módulos
-privateRouter.use("/movimientos", movimientosRoutes);
-privateRouter.use("/roles", rolesRoutes);
-privateRouter.use("/permissions", permissionsRoutes);
-
-router.use(privateRouter);
+router.use("/movimientos", requireAuth, movimientosRoutes);
+router.use("/users", requireAuth, usersRoutes);
+router.use("/company", requireAuth, companyRoutes);
+router.use("/roles", requireAuth, rolesRoutes);
+router.use("/permissions", requireAuth, permissionsRoutes);
 
 export default router;

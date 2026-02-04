@@ -1,13 +1,8 @@
 // src/server.ts
-import dotenv from "dotenv";
-
-dotenv.config();
-
 import { createApp } from "./app.js";
 import { getEnv } from "./config/env.js";
 
 const env = getEnv();
-
 const app = createApp();
 
 app.listen(env.PORT, "0.0.0.0", () => {
