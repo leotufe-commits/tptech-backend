@@ -1,5 +1,7 @@
 // tptech-frontend/src/services/catalogs.ts
-import { apiFetch } from "../lib/api";
+// ✅
+import { prisma } from "../lib/prisma.js";
+
 
 export type CatalogType =
   | "IVA_CONDITION"

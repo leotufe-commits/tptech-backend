@@ -173,7 +173,8 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }
 
     (req as any).roles = Array.from(new Set(roleNames));
-    (req as any).isOwner = (req as any).roles.includes("OWNER");
+    (req as any).isOwner = Boolean((req as any).roles?.includes?.("OWNER"));
+
 
     try {
       setContextUserId(user.id);
@@ -209,6 +210,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
     return next();
   } catch {
-    return unauthorized(res);
+    return unauthorized(r
   }
 }

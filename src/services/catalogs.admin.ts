@@ -1,5 +1,6 @@
 // tptech-frontend/src/services/catalogs.admin.ts
-import { apiFetch } from "../lib/api";
+import { apiFetch } from "../lib/api.js";
+
 
 export type CatalogType =
   | "IVA_CONDITION"
