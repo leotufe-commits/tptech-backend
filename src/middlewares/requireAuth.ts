@@ -63,9 +63,10 @@ function verifyAnyToken(req: Request): any | null {
   const cookie = readCookieToken(req);
   const bearer = readBearer(req);
 
-  const candidates = [cookie, bearer].filter(
-  (t): t is string => typeof t === "string" && t.trim().length > 0
+  const candidates = [cookie, bearer].filter((t): t is string =>
+  Boolean(typeof t === "string" && t.trim())
 );
+
 
   for (const token of candidates) {
     try {
