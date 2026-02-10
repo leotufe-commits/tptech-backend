@@ -1,2 +1,2 @@
 import "dotenv/config";
-import "./server.ts";
+import "./server.js";
