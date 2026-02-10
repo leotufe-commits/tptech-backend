@@ -90,7 +90,7 @@ router.delete("/me/avatar", Users.removeMyAvatar);
 ========================= */
 const uploadMyAttachmentsHandler =
   (Users as any).uploadMyAttachments ??
-  ((req, res) => {
+  ((req: import("express").Request, res: import("express").Response) => {
     return res.status(501).json({
       message:
         "uploadMyAttachments no está implementado/exportado en users.controller.ts. Implementalo o cambiá la ruta.",
