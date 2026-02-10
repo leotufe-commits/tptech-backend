@@ -48,7 +48,7 @@ function readBearer(req: Request): string | null {
 /** Devuelve cookie si existe (sin validar) */
 function readCookieToken(req: Request): string | null {
   const c = (req as any).cookies?.[AUTH_COOKIE];
-  if (typeof c === "string" && c.trim()) return c.trim();
+  if (typeof c === "string" && c.trim().length > 0) return c.trim();
   return null;
 }
 
