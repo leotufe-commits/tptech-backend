@@ -1,3 +1,4 @@
+// tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { UserStatus, OverrideEffect } from "@prisma/client";
@@ -62,9 +63,7 @@ function verifyAnyToken(req: Request): any | null {
   const cookie = readCookieToken(req);
   const bearer = readBearer(req);
 
-  const candidates = [cookie, bearer].filter(
-    (t): t is string => typeof t === "string" && t.trim()
-  );
+  const candidates = [cookie, bearer].filter((t): t is string => typeof t === "string" && t.trim());
 
   for (const token of candidates) {
     try {
@@ -86,11 +85,7 @@ function toPermKey(module: any, action: any) {
 }
 
 function readTokenVersion(payload: any): number | null {
-  const raw =
-    payload?.tokenVersion ??
-    payload?.tv ??
-    payload?.ver ??
-    payload?.token_ver;
+  const raw = payload?.tokenVersion ?? payload?.tv ?? payload?.ver ?? payload?.token_ver;
 
   if (raw === undefined || raw === null || raw === "") return null;
 
@@ -105,9 +100,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     if (!payload) return unauthorized(res);
 
     const userId = String(payload?.sub || payload?.userId || "").trim();
-    const tenantId = String(
-      payload?.tenantId || payload?.jewelryId || payload?.tenant || ""
-    ).trim();
+    const tenantId = String(payload?.tenantId || payload?.jewelryId || payload?.tenant || "").trim();
     if (!userId || !tenantId) return unauthorized(res);
 
     const tokenVersion = readTokenVersion(payload);
@@ -175,7 +168,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     (req as any).roles = Array.from(new Set(roleNames));
     (req as any).isOwner = Boolean((req as any).roles?.includes?.("OWNER"));
 
-
     try {
       setContextUserId(user.id);
       setContextTenantId(user.jewelryId);
@@ -210,6 +202,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
     return next();
   } catch {
-    return unauthorized(r
+    return unauthorized(res);
   }
 }
