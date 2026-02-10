@@ -24,7 +24,7 @@ function clearAuthCookie(res: Response) {
     res.clearCookie(AUTH_COOKIE, {
       httpOnly: true,
       secure: isProd(),
-      sameSite: isProd() ? "none" : "lax",
+      sameSite: (isProd() ? "none" : "lax") as "none" | "lax",
       path: "/",
     });
   } catch {}
@@ -63,7 +63,7 @@ function verifyAnyToken(req: Request): any | null {
   const cookie = readCookieToken(req);
   const bearer = readBearer(req);
 
-  const candidates = [cookie, bearer].filter((t): t is string => typeof t === "string" && t.trim());
+  sameSite: (isProd() ? "none" : "lax") as "none" | "lax",
 
   for (const token of candidates) {
     try {
