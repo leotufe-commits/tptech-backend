@@ -175,6 +175,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     (req as any).roles = Array.from(new Set(roleNames));
     (req as any).isOwner = Boolean((req as any).roles?.includes?.("OWNER"));
 
+
     try {
       setContextUserId(user.id);
       setContextTenantId(user.jewelryId);
