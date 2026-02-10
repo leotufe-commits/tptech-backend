@@ -1,4 +1,3 @@
-// tptech-backend/src/middlewares/requireAuth.ts
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { UserStatus, OverrideEffect } from "@prisma/client";
@@ -15,17 +14,69 @@ const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "tptech-web";
 // mismo nombre que en auth.controller.ts
 const AUTH_COOKIE = "tptech_session";
 
-function getTokenFromReq(req: Request): string | null {
-  // 1) Authorization: Bearer <token>
+function isProd() {
+  return process.env.NODE_ENV === "production";
+}
+
+function clearAuthCookie(res: Response) {
+  try {
+    res.clearCookie(AUTH_COOKIE, {
+      httpOnly: true,
+      secure: isProd(),
+      sameSite: isProd() ? "none" : "lax",
+      path: "/",
+    });
+  } catch {}
+}
+
+function unauthorized(res: Response, message = "Unauthorized") {
+  clearAuthCookie(res);
+  return res.status(401).json({ message });
+}
+
+/** Devuelve Bearer si existe (sin validar) */
+function readBearer(req: Request): string | null {
   const h = req.headers.authorization;
   if (h && typeof h === "string") {
     const m = h.match(/^Bearer\s+(.+)$/i);
     if (m?.[1]) return m[1].trim();
   }
+  return null;
+}
 
-  // 2) Cookie
+/** Devuelve cookie si existe (sin validar) */
+function readCookieToken(req: Request): string | null {
   const c = (req as any).cookies?.[AUTH_COOKIE];
   if (typeof c === "string" && c.trim()) return c.trim();
+  return null;
+}
+
+/**
+ * ✅ FIX:
+ * - Si existe cookie, la priorizamos SIEMPRE.
+ *   Motivo: en el frontend web puede quedar un Bearer legacy válido de firma,
+ *   pero con tokenVersion viejo → disparaba "Sesión expirada" aunque la cookie sea válida.
+ * - Si no hay cookie, usamos Bearer (útil para clientes/API).
+ */
+function verifyAnyToken(req: Request): any | null {
+  const cookie = readCookieToken(req);
+  const bearer = readBearer(req);
+
+  const candidates = [cookie, bearer].filter(
+    (t): t is string => typeof t === "string" && t.trim()
+  );
+
+  for (const token of candidates) {
+    try {
+      const payload = jwt.verify(token, JWT_SECRET_SAFE, {
+        issuer: JWT_ISSUER,
+        audience: JWT_AUDIENCE,
+      }) as any;
+      return payload;
+    } catch {
+      // probar siguiente candidato
+    }
+  }
 
   return null;
 }
@@ -34,16 +85,12 @@ function toPermKey(module: any, action: any) {
   return `${String(module)}:${String(action)}`;
 }
 
-/**
- * Lee tokenVersion de forma tolerante para evitar "sesión expirada"
- * si el login emitió el claim con otro nombre.
- */
 function readTokenVersion(payload: any): number | null {
   const raw =
     payload?.tokenVersion ??
     payload?.tv ??
-    payload?.ver ?? // ✅ tolerancia
-    payload?.token_ver; // ✅ tolerancia
+    payload?.ver ??
+    payload?.token_ver;
 
   if (raw === undefined || raw === null || raw === "") return null;
 
@@ -53,41 +100,18 @@ function readTokenVersion(payload: any): number | null {
 }
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const token = getTokenFromReq(req);
-
-  if (!token) {
-    return res.status(401).json({ message: "Unauthorized" });
-  }
-
   try {
-    const payload = jwt.verify(token, JWT_SECRET_SAFE, {
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-    }) as any;
+    const payload = verifyAnyToken(req);
+    if (!payload) return unauthorized(res);
 
-    // soporta payloads: tenantId o jewelryId
     const userId = String(payload?.sub || payload?.userId || "").trim();
-    const tenantId = String(payload?.tenantId || payload?.jewelryId || payload?.tenant || "").trim();
+    const tenantId = String(
+      payload?.tenantId || payload?.jewelryId || payload?.tenant || ""
+    ).trim();
+    if (!userId || !tenantId) return unauthorized(res);
 
     const tokenVersion = readTokenVersion(payload);
 
-    if (!userId || !tenantId) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    // ✅ Si el token no trae versión, no podemos validar sesión correctamente
-    // (mejor devolver Unauthorized que "Sesión expirada" que confunde).
-    if (tokenVersion === null) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    /**
-     * ✅ 1 sola query:
-     * - valida que el user exista en ese tenant
-     * - valida deletedAt null
-     * - trae roles/overrides para req.permissions
-     * - trae role.name para isOwner/roles
-     */
     const user = await prisma.user.findFirst({
       where: {
         id: userId,
@@ -103,7 +127,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
           select: {
             role: {
               select: {
-                name: true, // ✅ necesario para OWNER
+                name: true,
                 jewelryId: true,
                 deletedAt: true,
                 permissions: {
@@ -124,23 +148,21 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       },
     });
 
-    if (!user) return res.status(401).json({ message: "Unauthorized" });
+    if (!user) return unauthorized(res);
 
-    // si está bloqueado / no activo, cortamos acá
     if (user.status !== UserStatus.ACTIVE) {
       return res.status(403).json({ message: "Usuario no habilitado." });
     }
 
-    // tokenVersion mismatch => sesión inválida
-    if (user.tokenVersion !== tokenVersion) {
-      return res.status(401).json({ message: "Sesión expirada" });
+    // ✅ SOLO validar tokenVersion si el JWT lo trae
+    if (tokenVersion !== null && user.tokenVersion !== tokenVersion) {
+      return unauthorized(res, "Sesión expirada");
     }
 
-    // set req (tipado viene por express.d.ts)
+    // req context
     (req as any).userId = user.id;
     (req as any).tenantId = user.jewelryId;
 
-    // roles e isOwner (para bypass limpio en requirePermission)
     const roleNames: string[] = [];
     for (const ur of user.roles ?? []) {
       const r = ur.role;
@@ -149,21 +171,17 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       if (r.deletedAt) continue;
       roleNames.push(String(r.name || "").trim().toUpperCase());
     }
+
     (req as any).roles = Array.from(new Set(roleNames));
     (req as any).isOwner = (req as any).roles.includes("OWNER");
 
-    // ALS (multi-tenant) — no dejes que un fallo acá tumbe el auth
     try {
       setContextUserId(user.id);
       setContextTenantId(user.jewelryId);
-    } catch {
-      // no-op
-    }
+    } catch {}
 
-    // ✅ calcular permisos efectivos
     const base = new Set<string>();
 
-    // roles -> base (solo roles del tenant + no borrados)
     for (const ur of user.roles ?? []) {
       const role = ur.role;
       if (!role) continue;
@@ -175,7 +193,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       }
     }
 
-    // overrides: DENY pisa todo, ALLOW suma si no fue denegado
     const deny = new Set<string>();
     const allow = new Set<string>();
 
@@ -185,17 +202,13 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       if (ov.effect === OverrideEffect.ALLOW) allow.add(key);
     }
 
-    // aplicar deny primero
     for (const d of deny) base.delete(d);
-    // luego allow
     for (const a of allow) base.add(a);
-    // y deny vuelve a pisar por seguridad
-    for (const d of deny) base.delete(d);
 
     (req as any).permissions = Array.from(base);
 
     return next();
   } catch {
-    return res.status(401).json({ message: "Unauthorized" });
+    return unauthorized(res);
   }
 }

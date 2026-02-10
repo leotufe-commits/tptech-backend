@@ -311,9 +311,11 @@ export async function updateRole(req: Request, res: Response) {
 
     if (!role) return res.status(404).json({ message: "Rol no encontrado" });
 
-    if (role.isSystem && isOwnerRole(role.name)) {
-      return res.status(403).json({ message: "No se puede renombrar el rol Propietario" });
-    }
+    // ✅ CAMBIO: permitimos renombrar el OWNER (solo displayName).
+    // Mantiene el bloqueo de permisos en updateRolePermissions.
+    // if (role.isSystem && isOwnerRole(role.name)) {
+    //   return res.status(403).json({ message: "No se puede renombrar el rol Propietario" });
+    // }
 
     if (!role.isSystem) {
       const exists = await prisma.role.findFirst({

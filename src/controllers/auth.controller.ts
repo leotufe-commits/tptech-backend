@@ -1,4 +1,7 @@
 // tptech-backend/src/controllers/auth.controller.ts
+// =========================
+// PARTE 1 / 2
+// =========================
 import type { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -140,11 +143,7 @@ async function tryDeleteUploadFile(storageFilename: string) {
 }
 
 function isPrismaUniqueError(e: any) {
-  return (
-    e &&
-    typeof e === "object" &&
-    (e.code === "P2002" || e.name === "PrismaClientKnownRequestError")
-  );
+  return e && typeof e === "object" && (e.code === "P2002" || e.name === "PrismaClientKnownRequestError");
 }
 
 function prismaUniqueTargets(e: any): string[] {
@@ -283,10 +282,7 @@ export async function updateMyJewelry(req: Request, res: Response) {
     | undefined;
 
   const logoFile = files?.logo?.[0] ?? null;
-  const attachments: MulterFile[] = [
-    ...(files?.attachments ?? []),
-    ...(files?.["attachments[]"] ?? []),
-  ];
+  const attachments: MulterFile[] = [...(files?.attachments ?? []), ...(files?.["attachments[]"] ?? [])];
 
   const newLogoUrl = logoFile ? fileUrl(req, logoFile.filename) : undefined;
 
@@ -375,6 +371,92 @@ export async function updateMyJewelry(req: Request, res: Response) {
     });
   } catch {
     return res.json({ jewelry: updated });
+  }
+}
+
+/* =========================
+   ✅ UPLOAD JEWELRY LOGO (solo logo)
+   PUT /auth/me/jewelry/logo
+   - multipart field: logo
+   - devuelve { jewelry }
+========================= */
+export async function uploadMyJewelryLogo(req: Request, res: Response) {
+  const userId = (req as any).userId as string;
+
+  const meUser = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { jewelryId: true },
+  });
+
+  if (!meUser) return res.status(404).json({ message: "User not found." });
+  if (!meUser.jewelryId) {
+    return res.status(400).json({ message: "Jewelry not set for user." });
+  }
+
+  type MulterFile = { filename: string; originalname: string; mimetype: string; size: number };
+
+  const files = (req as any).files as { logo?: MulterFile[] } | undefined;
+  const logoFile = files?.logo?.[0] ?? null;
+
+  if (!logoFile) {
+    return res.status(400).json({ message: "Falta archivo logo (field: logo)." });
+  }
+
+  if (!String(logoFile.mimetype || "").startsWith("image/")) {
+    return res.status(400).json({ message: "El logo debe ser una imagen." });
+  }
+
+  // logo anterior
+  const prev = await prisma.jewelry.findUnique({
+    where: { id: meUser.jewelryId },
+    select: { logoUrl: true } as any,
+  });
+
+  const prevUrl = String((prev as any)?.logoUrl || "");
+  const prevFilename = prevUrl ? filenameFromPublicUrl(prevUrl) : "";
+
+  const newLogoUrl = fileUrl(req, logoFile.filename);
+
+  await prisma.jewelry.update({
+    where: { id: meUser.jewelryId },
+    data: { logoUrl: newLogoUrl } as any,
+  });
+
+  // borrar logo anterior (best-effort)
+  if (prevFilename) await tryDeleteUploadFile(prevFilename);
+
+  auditLog(req, {
+    action: "jewelry.upload_logo",
+    success: true,
+    userId,
+    tenantId: meUser.jewelryId,
+    meta: { filename: logoFile.originalname, size: logoFile.size },
+  });
+
+  // devolver jewelry actualizado (con attachments si existen)
+  try {
+    const jewelry = await prisma.jewelry.findUnique({
+      where: { id: meUser.jewelryId },
+    });
+
+    let atts: any[] = [];
+    try {
+      atts = await (prisma as any).jewelryAttachment.findMany({
+        where: { jewelryId: meUser.jewelryId },
+        orderBy: { createdAt: "desc" },
+      });
+    } catch {
+      atts = [];
+    }
+
+    return res.json({
+      jewelry: {
+        ...(jewelry as any),
+        attachments: atts,
+      },
+    });
+  } catch {
+    return res.json({ ok: true, logoUrl: newLogoUrl });
   }
 }
 
@@ -540,11 +622,7 @@ export async function register(req: Request, res: Response) {
 
       const OWNER_PERMS = allPermissions.map((p) => p.id);
       const ADMIN_PERMS = pick(ALL_MODULES as PermModule[], ALL_ACTIONS as PermAction[]);
-      const STAFF_PERMS = pick(ALL_MODULES as PermModule[], [
-        PermAction.VIEW,
-        PermAction.CREATE,
-        PermAction.EDIT,
-      ]);
+      const STAFF_PERMS = pick(ALL_MODULES as PermModule[], [PermAction.VIEW, PermAction.CREATE, PermAction.EDIT]);
       const READONLY_PERMS = pick(ALL_MODULES as PermModule[], [PermAction.VIEW]);
 
       const rolesToCreate = [
@@ -868,6 +946,9 @@ export async function resetPassword(req: Request, res: Response) {
     return res.status(401).json({ message: "Token inválido." });
   }
 }
+// =========================
+// PARTE 2 / 2
+// =========================
 
 /* =========================
    PIN / QUICK SWITCH
@@ -935,12 +1016,7 @@ async function isQuickSwitchEnabled(jewelryId: string) {
   }
 }
 
-async function recordPinFailure(args: {
-  userId: string;
-  tenantId: string;
-  action: string;
-  meta?: any;
-}) {
+async function recordPinFailure(args: { userId: string; tenantId: string; action: string; meta?: any }) {
   const u = await prisma.user.update({
     where: { id: args.userId },
     data: { quickPinFailedCount: { increment: 1 } },
@@ -983,7 +1059,6 @@ async function clearPinFailures(userId: string) {
   });
 }
 
-/* ---------- SET PIN (crear / cambiar) ---------- */
 export async function setMyPin(req: Request, res: Response) {
   const meUser = await requireActiveMe(req);
   if (!meUser) return res.status(401).json({ message: "Unauthorized" });
@@ -995,7 +1070,8 @@ export async function setMyPin(req: Request, res: Response) {
 
   const quickPinHash = await bcrypt.hash(pin, 10);
 
-  await prisma.user.update({
+  // ✅ Actualizar y TRAER tokenVersion nuevo
+  const updated = await prisma.user.update({
     where: { id: meUser.id },
     data: {
       quickPinHash,
@@ -1003,21 +1079,26 @@ export async function setMyPin(req: Request, res: Response) {
       quickPinUpdatedAt: new Date(),
       quickPinFailedCount: 0,
       quickPinLockedUntil: null,
-      tokenVersion: { increment: 1 },
+      tokenVersion: { increment: 1 }, // mantenemos seguridad
     },
+    select: { id: true, jewelryId: true, tokenVersion: true },
   });
+
+  // ✅ Rotar token + cookie (CRÍTICO)
+  const token = signToken(updated.id, updated.jewelryId, updated.tokenVersion);
+  setAuthCookie(req, res, token);
 
   auditLog(req, {
     action: "auth.pin_set",
     success: true,
-    userId: meUser.id,
-    tenantId: meUser.jewelryId,
+    userId: updated.id,
+    tenantId: updated.jewelryId,
   });
 
   return res.json({ ok: true });
 }
 
-/* ---------- DISABLE PIN ---------- */
+
 export async function disableMyPin(req: Request, res: Response) {
   const meUser = await requireActiveMe(req);
   if (!meUser) return res.status(401).json({ message: "Unauthorized" });
@@ -1057,7 +1138,8 @@ export async function disableMyPin(req: Request, res: Response) {
     return res.status(401).json({ message: "PIN incorrecto." });
   }
 
-  await prisma.user.update({
+  // ✅ Actualizar y TRAER tokenVersion nuevo
+  const updated = await prisma.user.update({
     where: { id: meUser.id },
     data: {
       quickPinHash: null,
@@ -1065,19 +1147,25 @@ export async function disableMyPin(req: Request, res: Response) {
       quickPinUpdatedAt: new Date(),
       quickPinFailedCount: 0,
       quickPinLockedUntil: null,
-      tokenVersion: { increment: 1 },
+      tokenVersion: { increment: 1 }, // mantenemos seguridad
     },
+    select: { id: true, jewelryId: true, tokenVersion: true },
   });
+
+  // ✅ Rotar token + cookie (CRÍTICO)
+  const token = signToken(updated.id, updated.jewelryId, updated.tokenVersion);
+  setAuthCookie(req, res, token);
 
   auditLog(req, {
     action: "auth.pin_disable",
     success: true,
-    userId: meUser.id,
-    tenantId: meUser.jewelryId,
+    userId: updated.id,
+    tenantId: updated.jewelryId,
   });
 
   return res.json({ ok: true });
 }
+
 
 /* ---------- UNLOCK ---------- */
 export async function unlockWithPin(req: Request, res: Response) {
@@ -1173,9 +1261,7 @@ export async function quickUsers(req: Request, res: Response) {
         }))
         .filter((r: any) => typeof r?.name === "string" && r.name.trim());
 
-      const roleNames = roles
-        .map((r: any) => String(r.name).trim())
-        .filter(Boolean);
+      const roleNames = roles.map((r: any) => String(r.name).trim()).filter(Boolean);
 
       const roleLabel = roleNames.length ? roleNames.join(" • ") : "";
 
@@ -1302,7 +1388,6 @@ export async function switchUserWithPin(req: Request, res: Response) {
   return res.json(buildAuthResponse({ user: target, token, includeToken: true }));
 }
 
-
 /* =========================
    QUICK SWITCH (toggle por joyería)
 ========================= */
@@ -1314,8 +1399,7 @@ export async function setQuickSwitchForJewelry(req: Request, res: Response) {
   if (!tenantId) return res.status(400).json({ message: "Tenant no definido." });
 
   const enabledRaw = (req.body as any)?.enabled ?? (req.body as any)?.quickSwitchEnabled;
-  const enabled =
-    enabledRaw === true || enabledRaw === "true" || enabledRaw === 1 || enabledRaw === "1";
+  const enabled = enabledRaw === true || enabledRaw === "true" || enabledRaw === 1 || enabledRaw === "1";
 
   await prisma.jewelry.update({
     where: { id: tenantId },

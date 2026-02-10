@@ -64,6 +64,31 @@ function isPrismaUniqueViolation(e: any) {
   return e?.code === "P2002";
 }
 
+function parseBool(v: any): boolean | null {
+  if (typeof v === "boolean") return v;
+  const s = String(v ?? "").trim().toLowerCase();
+  if (!s) return null;
+  if (s === "1" || s === "true" || s === "yes" || s === "y" || s === "on") return true;
+  if (s === "0" || s === "false" || s === "no" || s === "n" || s === "off") return false;
+  return null;
+}
+
+/* =========================
+   INTERNAL: 1 favorito por type
+========================= */
+async function clearOtherFavorites(catalog: any, tenantId: string, type: CatalogType, keepId: string) {
+  // Desmarca otros favoritos del mismo tipo (misma joyería)
+  await catalog.updateMany({
+    where: {
+      jewelryId: tenantId,
+      type,
+      isFavorite: true,
+      NOT: { id: keepId },
+    },
+    data: { isFavorite: false },
+  });
+}
+
 /* =========================
    GET /company/catalogs/:type
    Query:
@@ -92,13 +117,15 @@ export async function listCatalog(req: Request, res: Response) {
         type,
         ...(includeInactive ? {} : { isActive: true }),
       },
-      orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
+      // ✅ Favoritos primero (si existe el campo en DB)
+      orderBy: [{ isFavorite: "desc" }, { sortOrder: "asc" }, { label: "asc" }],
       select: {
         id: true,
         type: true,
         label: true,
         isActive: true,
         sortOrder: true,
+        isFavorite: true, // ✅ NUEVO
         createdAt: true,
         updatedAt: true,
       },
@@ -156,9 +183,7 @@ export async function createCatalogItem(req: Request, res: Response) {
     return res.status(400).json({ message: "label es demasiado largo (máx 80)." });
   }
 
-  const sortOrder = Number.isFinite(Number(body.sortOrder))
-    ? Math.trunc(Number(body.sortOrder))
-    : 0;
+  const sortOrder = Number.isFinite(Number(body.sortOrder)) ? Math.trunc(Number(body.sortOrder)) : 0;
 
   try {
     const created = await catalog.create({
@@ -168,6 +193,7 @@ export async function createCatalogItem(req: Request, res: Response) {
         label,
         sortOrder,
         isActive: true,
+        // isFavorite queda false por default en DB
       },
       select: {
         id: true,
@@ -175,6 +201,7 @@ export async function createCatalogItem(req: Request, res: Response) {
         label: true,
         isActive: true,
         sortOrder: true,
+        isFavorite: true, // ✅ NUEVO
         createdAt: true,
         updatedAt: true,
       },
@@ -201,6 +228,7 @@ export async function createCatalogItem(req: Request, res: Response) {
             label: true,
             isActive: true,
             sortOrder: true,
+            isFavorite: true, // ✅ NUEVO
             createdAt: true,
             updatedAt: true,
           },
@@ -266,9 +294,7 @@ export async function bulkCreateCatalogItems(req: Request, res: Response) {
     return res.status(400).json({ message: "Demasiados items (máx 500 por carga)." });
   }
 
-  const sortOrderStart = Number.isFinite(Number(body.sortOrderStart))
-    ? Math.trunc(Number(body.sortOrderStart))
-    : 0;
+  const sortOrderStart = Number.isFinite(Number(body.sortOrderStart)) ? Math.trunc(Number(body.sortOrderStart)) : 0;
 
   try {
     const data = labels.map((label, idx) => ({
@@ -277,6 +303,7 @@ export async function bulkCreateCatalogItems(req: Request, res: Response) {
       label,
       isActive: true,
       sortOrder: sortOrderStart + idx,
+      // isFavorite false default
     }));
 
     const result = await catalog.createMany({
@@ -311,8 +338,80 @@ export async function bulkCreateCatalogItems(req: Request, res: Response) {
 }
 
 /* =========================
+   PATCH /company/catalogs/item/:id/favorite
+   Body: { isFavorite: boolean }
+   ✅ 1 favorito por (jewelryId + type)
+========================= */
+export async function setCatalogItemFavorite(req: Request, res: Response) {
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const catalog = requireCatalogDelegate(res);
+  if (!catalog) return;
+
+  const actorId = (req as any).userId as string | undefined;
+
+  const id = String((req.params as any).id ?? "").trim();
+  if (!id) return res.status(400).json({ message: "id inválido." });
+
+  const want = parseBool((req.body ?? {})?.isFavorite);
+  if (want === null) {
+    return res.status(400).json({ message: "isFavorite debe ser boolean." });
+  }
+
+  const existing = await catalog.findFirst({
+    where: { id, jewelryId: tenantId },
+    select: { id: true, type: true, label: true, isFavorite: true },
+  });
+
+  if (!existing) return res.status(404).json({ message: "Item no encontrado." });
+
+  try {
+    // Si queremos marcar favorito, primero desmarcamos los otros del mismo tipo
+    if (want) {
+      await clearOtherFavorites(catalog, tenantId, existing.type, id);
+    }
+
+    const updated = await catalog.update({
+      where: { id },
+      data: { isFavorite: want },
+      select: {
+        id: true,
+        type: true,
+        label: true,
+        isActive: true,
+        sortOrder: true,
+        isFavorite: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    auditLog(req, {
+      action: "company.catalogs.favorite",
+      success: true,
+      userId: actorId,
+      tenantId,
+      meta: { id, type: existing.type, isFavorite: want },
+    });
+
+    return res.json({ item: updated });
+  } catch (e: any) {
+    auditLog(req, {
+      action: "company.catalogs.favorite",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { id, type: existing.type, error: String(e?.message ?? e) },
+    });
+
+    return res.status(500).json({ message: "Error actualizando favorito." });
+  }
+}
+
+/* =========================
    PATCH /company/catalogs/item/:id
-   Body: { label?: string, isActive?: boolean, sortOrder?: number }
+   Body: { label?: string, isActive?: boolean, sortOrder?: number, isFavorite?: boolean }
 ========================= */
 export async function updateCatalogItem(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -330,6 +429,7 @@ export async function updateCatalogItem(req: Request, res: Response) {
     label: string;
     isActive: boolean;
     sortOrder: number;
+    isFavorite: boolean;
   }>;
 
   const data: any = {};
@@ -355,6 +455,13 @@ export async function updateCatalogItem(req: Request, res: Response) {
     data.sortOrder = Math.trunc(Number(body.sortOrder));
   }
 
+  if ("isFavorite" in body) {
+    if (typeof body.isFavorite !== "boolean") {
+      return res.status(400).json({ message: "isFavorite debe ser boolean." });
+    }
+    data.isFavorite = body.isFavorite;
+  }
+
   if (!Object.keys(data).length) {
     return res.status(400).json({ message: "No hay campos para actualizar." });
   }
@@ -369,6 +476,11 @@ export async function updateCatalogItem(req: Request, res: Response) {
   }
 
   try {
+    // ✅ si se marca favorito, desmarcar otros del mismo type
+    if (data.isFavorite === true) {
+      await clearOtherFavorites(catalog, tenantId, existing.type, id);
+    }
+
     const updated = await catalog.update({
       where: { id },
       data,
@@ -378,6 +490,7 @@ export async function updateCatalogItem(req: Request, res: Response) {
         label: true,
         isActive: true,
         sortOrder: true,
+        isFavorite: true,
         createdAt: true,
         updatedAt: true,
       },

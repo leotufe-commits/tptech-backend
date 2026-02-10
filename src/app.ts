@@ -12,14 +12,13 @@ import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/securi
 export function createApp() {
   const app = express();
 
-  // ✅ Render / proxies (antes de cookies secure / req.protocol)
+  // ✅ Importante para cookies + proxy
   app.set("trust proxy", 1);
 
-  // Seguridad básica
   app.disable("x-powered-by");
   app.use(buildHelmetMiddleware());
 
-  // CORS (credentials)
+  // CORS con credentials
   const corsMw = buildCorsMiddleware();
   app.use(corsMw);
   app.options(/.*/, corsMw);
@@ -29,35 +28,36 @@ export function createApp() {
   app.use(express.urlencoded({ extended: true, limit: "1mb" }));
   app.use(cookieParser());
 
-  // ALS / Prisma context
+  // Prisma ALS
   app.use(requestContextMiddleware);
 
-  // Perf logger
+  // Perf
   app.use(perfLogger({ slowMs: 700 }));
 
   // Static uploads
   const UPLOADS_DIR = path.join(process.cwd(), "uploads");
-  app.use(
-    "/uploads",
-    express.static(UPLOADS_DIR, {
-      index: false,
-      fallthrough: false,
-      setHeaders(res) {
-        res.setHeader("Cache-Control", "public, max-age=3600");
-      },
-    })
-  );
+  const uploadsStatic = express.static(UPLOADS_DIR, {
+    index: false,
+    fallthrough: false,
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "public, max-age=3600");
+    },
+  });
 
-  // Health
-  app.get("/health", (_req, res) => {
+  // ✅ Servir uploads en /uploads (directo backend) y /api/uploads (para proxy Vite)
+  app.use("/uploads", uploadsStatic);
+  app.use("/api/uploads", uploadsStatic);
+
+  // Health (también bajo /api)
+  app.get("/api/health", (_req, res) => {
     res.status(200).json({ ok: true, service: "tptech-backend" });
   });
 
   // Rate limit global
   app.use(buildRateLimitMiddleware());
 
-  // Routes
-  app.use(routes);
+  // 🔑🔑🔑 RUTAS BAJO /api 🔑🔑🔑
+  app.use("/api", routes);
 
   // Root
   app.get("/", (_req, res) => {

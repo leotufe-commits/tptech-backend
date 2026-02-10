@@ -8,6 +8,7 @@ import { UserStatus } from "@prisma/client";
 import crypto from "node:crypto";
 import path from "node:path";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 
 /* =========================
    HELPERS
@@ -124,27 +125,152 @@ function isValidPin4(v: any): v is string {
   return /^[0-9]{4}$/.test(s);
 }
 
+/**
+ * ✅ FIX 403:
+ * Soporta permisos en múltiples formatos:
+ * - "USERS_ROLES:ADMIN"
+ * - { module: "USERS_ROLES", action: "ADMIN" }
+ * - { key: "USERS_ROLES:ADMIN" }
+ * - { perm: "USERS_ROLES:ADMIN" }
+ */
+function isOwnerReq(req: Request): boolean {
+  const anyReq = req as any;
+
+  if (anyReq?.isOwner === true) return true;
+
+  const role = String(anyReq?.role ?? anyReq?.userRole ?? "")
+    .trim()
+    .toUpperCase();
+  if (role === "OWNER") return true;
+
+  const roles = (anyReq?.roles ?? anyReq?.userRoles) as unknown;
+  if (Array.isArray(roles)) {
+    return roles.map((x) => String(x).trim().toUpperCase()).includes("OWNER");
+  }
+
+  return false;
+}
+
+function hasUsersRolesAdmin(perms: unknown[]): boolean {
+  if (!Array.isArray(perms)) return false;
+
+  for (const p of perms) {
+    if (typeof p === "string") {
+      if (p.trim() === "USERS_ROLES:ADMIN") return true;
+      continue;
+    }
+    if (p && typeof p === "object") {
+      const obj = p as any;
+
+      const key =
+        obj.key ??
+        obj.code ??
+        obj.slug ??
+        obj.name ??
+        (obj.module && obj.action ? `${obj.module}:${obj.action}` : undefined) ??
+        (obj.permModule && obj.permAction ? `${obj.permModule}:${obj.permAction}` : undefined);
+
+      if (typeof key === "string" && key.trim() === "USERS_ROLES:ADMIN") return true;
+
+      const mod = String(obj.module ?? obj.permModule ?? "").trim();
+      const act = String(obj.action ?? obj.permAction ?? "").trim();
+      if (mod === "USERS_ROLES" && act === "ADMIN") return true;
+    }
+  }
+  return false;
+}
+
 function requireAdminUsersRoles(req: Request, res: Response): boolean {
+  // ✅ BYPASS OWNER (igual que requirePermission)
+  if (isOwnerReq(req)) return true;
+
   const perms = ((req as any).permissions ?? []) as unknown[];
-  if (!Array.isArray(perms) || !perms.includes("USERS_ROLES:ADMIN")) {
+  if (!hasUsersRolesAdmin(perms)) {
     res.status(403).json({ message: "No tenés permisos para realizar esta acción." });
     return false;
   }
   return true;
 }
+
 async function countUserOverrides(userId: string) {
   return prisma.userPermissionOverride.count({ where: { userId } });
 }
 
+/* =========================
+   ✅ OWNER PIN FIX
+   - Si el target es OWNER, permitir quitar/deshabilitar PIN
+     SIN tocar permisos especiales (overrides).
+========================= */
+async function isTargetOwnerUser(tenantId: string, userId: string): Promise<boolean> {
+  try {
+    const ur = await prisma.userRole.findFirst({
+      where: {
+        userId,
+        role: {
+          jewelryId: tenantId,
+          deletedAt: null,
+          name: "OWNER",
+        },
+      },
+      select: { userId: true },
+    });
+    return Boolean(ur);
+  } catch {
+    return false;
+  }
+}
+
+/* =========================
+   ✅ PIN LOCK RULE (tenant-level)
+   - Si pinLockEnabled está activo, NO permitir dejar la joyería sin ningún PIN habilitado
+========================= */
+async function assertCanRemoveOrDisableQuickPinForTenant(tenantId: string, targetUserId: string): Promise<
+  | { ok: true }
+  | {
+      ok: false;
+      code: "LAST_PIN_LOCK_ACTIVE";
+      message: string;
+    }
+> {
+  const jewelry = await prisma.jewelry.findFirst({
+    where: { id: tenantId },
+    select: { pinLockEnabled: true },
+  });
+
+  if (!jewelry?.pinLockEnabled) return { ok: true };
+
+  // Cantidad de usuarios con PIN "usable": hash + enabled + no deleted
+  const countEnabled = await prisma.user.count({
+    where: {
+      jewelryId: tenantId,
+      deletedAt: null,
+      quickPinHash: { not: null },
+      quickPinEnabled: true,
+    },
+  });
+
+  if (countEnabled > 1) return { ok: true };
+
+  // Si target es el último con PIN habilitado -> bloquear
+  const target = await prisma.user.findFirst({
+    where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
+    select: { quickPinHash: true, quickPinEnabled: true },
+  });
+
+  const targetHasEnabledPin = Boolean(target?.quickPinHash) && Boolean(target?.quickPinEnabled);
+  if (!targetHasEnabledPin) return { ok: true };
+
+  return {
+    ok: false,
+    code: "LAST_PIN_LOCK_ACTIVE",
+    message:
+      "No podés eliminar o deshabilitar el último PIN mientras el bloqueo por PIN esté activo. Primero desactivá el bloqueo o asigná un PIN a otro usuario.",
+  };
+}
 
 /* =========================
    ✅ QUICK PIN (ME)
    PUT /users/me/quick-pin
-   body: { pin: "1234", currentPin?: "0000" }
-
-   ⚠️ IMPORTANTE:
-   Antes incrementabas tokenVersion acá => eso invalida el JWT/cookie y te “expira sesión”.
-   El PIN no debería cerrar sesión, así que NO tocamos tokenVersion.
 ========================= */
 export async function updateMyQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -164,7 +290,6 @@ export async function updateMyQuickPin(req: Request, res: Response) {
 
   if (!me) return res.status(404).json({ message: "Usuario no encontrado." });
 
-  // Si ya tenía PIN, validar currentPin antes de cambiarlo
   if (me.quickPinHash) {
     if (!isValidPin4(currentPin)) {
       return res.status(400).json({ message: "Ingresá tu PIN actual (4 dígitos)." });
@@ -215,16 +340,14 @@ export async function updateMyQuickPin(req: Request, res: Response) {
 /* =========================
    ✅ QUICK PIN (ME)
    DELETE /users/me/quick-pin
-   body: { currentPin: "1234" }
-
-   ⚠️ NO tocamos tokenVersion (evita “sesión expirada”)
+   ✅ FIX: currentPin opcional + regla último PIN si pinLockEnabled=true
 ========================= */
 export async function removeMyQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
   const tenantId = requireTenantId(req, res);
   if (!tenantId) return;
 
-  const { currentPin } = req.body as { currentPin?: string };
+  const { currentPin } = (req.body ?? {}) as { currentPin?: string };
 
   const me = await prisma.user.findFirst({
     where: { id: actorId, jewelryId: tenantId, deletedAt: null },
@@ -237,20 +360,29 @@ export async function removeMyQuickPin(req: Request, res: Response) {
     return res.json({ ok: true, hasQuickPin: false, pinEnabled: false });
   }
 
-  if (!isValidPin4(currentPin)) {
-    return res.status(400).json({ message: "Ingresá tu PIN actual (4 dígitos)." });
+  // ✅ regla “último PIN + pinLockEnabled”
+  const gate = await assertCanRemoveOrDisableQuickPinForTenant(tenantId, actorId);
+  if (!gate.ok) {
+    return res.status(409).json({ code: gate.code, message: gate.message });
   }
 
-  const ok = await bcrypt.compare(String(currentPin), me.quickPinHash);
-  if (!ok) {
-    auditLog(req, {
-      action: "users.quick_pin.remove_me",
-      success: false,
-      userId: actorId,
-      tenantId,
-      meta: { reason: "invalid_current_pin" },
-    });
-    return res.status(400).json({ message: "PIN actual incorrecto." });
+  // ✅ Para MI CUENTA: currentPin es opcional. Si lo envía, lo validamos.
+  if (currentPin !== undefined && String(currentPin).trim() !== "") {
+    if (!isValidPin4(currentPin)) {
+      return res.status(400).json({ message: "Ingresá tu PIN actual (4 dígitos)." });
+    }
+
+    const ok = await bcrypt.compare(String(currentPin), me.quickPinHash);
+    if (!ok) {
+      auditLog(req, {
+        action: "users.quick_pin.remove_me",
+        success: false,
+        userId: actorId,
+        tenantId,
+        meta: { reason: "invalid_current_pin" },
+      });
+      return res.status(400).json({ message: "PIN actual incorrecto." });
+    }
   }
 
   const updated = await prisma.user.update({
@@ -282,11 +414,7 @@ export async function removeMyQuickPin(req: Request, res: Response) {
 }
 
 /* =========================
-   ✅ QUICK PIN (ADMIN)
-   PUT /users/:id/quick-pin
-   body: { pin: "1234" }
-
-   ⚠️ NO tocamos tokenVersion (evita cerrar sesión del usuario por setear PIN)
+   ✅ QUICK PIN (ADMIN) /users/:id/quick-pin
 ========================= */
 export async function updateUserQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -342,11 +470,7 @@ export async function updateUserQuickPin(req: Request, res: Response) {
 }
 
 /* =========================
-   ✅ QUICK PIN (ADMIN)
-   DELETE /users/:id/quick-pin
-
-   ⚠️ NO tocamos tokenVersion
-   ✅ Si tiene permisos especiales, exige confirmación y los borra
+   ✅ QUICK PIN (ADMIN) DELETE /users/:id/quick-pin
 ========================= */
 export async function removeUserQuickPin(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -367,20 +491,31 @@ export async function removeUserQuickPin(req: Request, res: Response) {
 
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
+  // ✅ regla “último PIN + pinLockEnabled”
+  const gate = await assertCanRemoveOrDisableQuickPinForTenant(tenantId, targetUserId);
+  if (!gate.ok) {
+    return res.status(409).json({ code: gate.code, message: gate.message, targetUserId });
+  }
+
+  // ✅ OWNER: permitir quitar PIN sin forzar borrado de overrides
+  const targetIsOwner = await isTargetOwnerUser(tenantId, targetUserId);
+
   const overridesCount = await countUserOverrides(targetUserId);
 
-  if (overridesCount > 0 && confirmRemoveOverrides !== true) {
-    return res.status(409).json({
-      code: "HAS_SPECIAL_PERMISSIONS",
-      message:
-        "Este usuario tiene permisos especiales asignados. Si continuás, se borrarán esos permisos.",
-      overridesCount,
-      requireConfirmRemoveOverrides: true,
-    });
+  if (!targetIsOwner) {
+    if (overridesCount > 0 && confirmRemoveOverrides !== true) {
+      return res.status(409).json({
+        code: "HAS_SPECIAL_PERMISSIONS",
+        message: "Este usuario tiene permisos especiales asignados. Si continuás, se borrarán esos permisos.",
+        overridesCount,
+        requireConfirmRemoveOverrides: true,
+      });
+    }
   }
 
   const updated = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    if (overridesCount > 0) {
+    // Solo borrar overrides si NO es owner y el usuario confirmó
+    if (!targetIsOwner && overridesCount > 0) {
       await tx.userPermissionOverride.deleteMany({ where: { userId: targetUserId } });
     }
 
@@ -405,7 +540,8 @@ export async function removeUserQuickPin(req: Request, res: Response) {
     meta: {
       targetUserId,
       hasPin: false,
-      overridesCleared: overridesCount > 0,
+      targetIsOwner,
+      overridesCleared: !targetIsOwner && overridesCount > 0,
       overridesCount,
     },
   });
@@ -415,18 +551,14 @@ export async function removeUserQuickPin(req: Request, res: Response) {
     hasQuickPin: Boolean(updated.quickPinHash),
     pinEnabled: Boolean(updated.quickPinEnabled),
     quickPinUpdatedAt: updated.quickPinUpdatedAt,
-    overridesCleared: overridesCount > 0,
+    overridesCleared: !targetIsOwner && overridesCount > 0,
     overridesCount,
+    targetIsOwner,
   });
 }
 
-
 /* =========================
    ✅ QUICK PIN ENABLED (ADMIN)
-   PATCH /users/:id/quick-pin/enabled
-   body: { enabled: boolean }
-
-   ⚠️ NO tocamos tokenVersion (evita “sesión expirada” por habilitar/deshabilitar)
 ========================= */
 export async function updateUserQuickPinEnabled(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -456,24 +588,36 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
     return res.status(400).json({ message: "El usuario no tiene PIN definido. Definilo primero." });
   }
 
-  // ✅ Si se está DESHABILITANDO el PIN y hay permisos especiales -> exigir confirmación
+  // ✅ regla “último PIN + pinLockEnabled” también al DESHABILITAR
+  if (enabledRaw === false) {
+    const gate = await assertCanRemoveOrDisableQuickPinForTenant(tenantId, targetUserId);
+    if (!gate.ok) {
+      return res.status(409).json({ code: gate.code, message: gate.message, targetUserId });
+    }
+  }
+
+  // ✅ OWNER: permitir deshabilitar sin forzar borrado de overrides
+  const targetIsOwner = await isTargetOwnerUser(tenantId, targetUserId);
+
   let overridesCount = 0;
   if (enabledRaw === false) {
     overridesCount = await countUserOverrides(targetUserId);
 
-    if (overridesCount > 0 && confirmRemoveOverrides !== true) {
-      return res.status(409).json({
-        code: "HAS_SPECIAL_PERMISSIONS",
-        message:
-          "Este usuario tiene permisos especiales asignados. Si continuás, se borrarán esos permisos.",
-        overridesCount,
-        requireConfirmRemoveOverrides: true,
-      });
+    if (!targetIsOwner) {
+      if (overridesCount > 0 && confirmRemoveOverrides !== true) {
+        return res.status(409).json({
+          code: "HAS_SPECIAL_PERMISSIONS",
+          message: "Este usuario tiene permisos especiales asignados. Si continuás, se borrarán esos permisos.",
+          overridesCount,
+          requireConfirmRemoveOverrides: true,
+        });
+      }
     }
   }
 
   const updated = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    if (enabledRaw === false && overridesCount > 0) {
+    // Solo borrar overrides si NO es owner y confirmó
+    if (enabledRaw === false && !targetIsOwner && overridesCount > 0) {
       await tx.userPermissionOverride.deleteMany({ where: { userId: targetUserId } });
     }
 
@@ -492,7 +636,8 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
     meta: {
       targetUserId,
       enabled: enabledRaw,
-      overridesCleared: enabledRaw === false && overridesCount > 0,
+      targetIsOwner,
+      overridesCleared: enabledRaw === false && !targetIsOwner && overridesCount > 0,
       overridesCount: enabledRaw === false ? overridesCount : undefined,
     },
   });
@@ -501,14 +646,14 @@ export async function updateUserQuickPinEnabled(req: Request, res: Response) {
     ok: true,
     hasQuickPin: Boolean(updated.quickPinHash),
     pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
-    overridesCleared: enabledRaw === false && overridesCount > 0,
+    overridesCleared: enabledRaw === false && !targetIsOwner && overridesCount > 0,
     overridesCount: enabledRaw === false ? overridesCount : undefined,
+    targetIsOwner,
   });
 }
 
 /* =========================
-   POST /users
-   Crear usuario (ADMIN)
+   POST /users (ADMIN)
 ========================= */
 export async function createUser(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -538,16 +683,13 @@ export async function createUser(req: Request, res: Response) {
     desiredStatus === "BLOCKED"
       ? UserStatus.BLOCKED
       : desiredStatus === "PENDING"
-      ? UserStatus.PENDING
-      : hasPassword
-      ? UserStatus.ACTIVE
-      : UserStatus.PENDING;
+        ? UserStatus.PENDING
+        : hasPassword
+          ? UserStatus.ACTIVE
+          : UserStatus.PENDING;
 
   const existing = await prisma.user.findFirst({
-    where: {
-      jewelryId: tenantId,
-      email,
-    },
+    where: { jewelryId: tenantId, email },
     select: { id: true, deletedAt: true },
   });
 
@@ -569,15 +711,11 @@ export async function createUser(req: Request, res: Response) {
     });
 
     if (roles.length !== roleIds.length) {
-      return res.status(400).json({
-        message: "Uno o más roles no son válidos para esta joyería.",
-      });
+      return res.status(400).json({ message: "Uno o más roles no son válidos para esta joyería." });
     }
   }
 
-  const passwordHash = hasPassword
-    ? await bcrypt.hash(String(body.password), 10)
-    : await randomPasswordHash();
+  const passwordHash = hasPassword ? await bcrypt.hash(String(body.password), 10) : await randomPasswordHash();
 
   const created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const user = await tx.user.create({
@@ -618,9 +756,7 @@ export async function createUser(req: Request, res: Response) {
     const roles = await tx.userRole.findMany({
       where: { userId: user.id },
       select: {
-        role: {
-          select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true },
-        },
+        role: { select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true } },
       },
     });
 
@@ -700,7 +836,6 @@ export async function listUsers(req: Request, res: Response) {
           },
         },
 
-        // ✅ contadores livianos para la tabla
         _count: {
           select: {
             attachments: true,
@@ -740,7 +875,6 @@ export async function listUsers(req: Request, res: Response) {
         .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
         .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
 
-      // ✅ lo que necesita la tabla
       attachmentsCount: u._count?.attachments ?? 0,
       overridesCount: u._count?.permissionOverrides ?? 0,
       hasSpecialPermissions: (u._count?.permissionOverrides ?? 0) > 0,
@@ -864,7 +998,6 @@ export async function getUser(req: Request, res: Response) {
 
 /* =========================
    PATCH /users/:id
-   ⚠️ FIX: NO invalidar sesión del propio usuario por editar datos de perfil.
 ========================= */
 export async function updateUserProfile(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -927,8 +1060,6 @@ export async function updateUserProfile(req: Request, res: Response) {
     return res.status(400).json({ message: "No hay campos para actualizar." });
   }
 
-  // ✅ Solo invalidar sesiones si estoy editando a OTRA persona (opcional).
-  // Para "mi usuario", NO tocamos tokenVersion (evita “sesión expirada”).
   if (targetUserId !== actorId) {
     data.tokenVersion = { increment: 1 };
   }
@@ -974,6 +1105,7 @@ export async function updateUserProfile(req: Request, res: Response) {
 
   return res.json({ user: updated });
 }
+
 /* =========================
    PATCH /users/:id/status
 ========================= */
@@ -1006,7 +1138,6 @@ export async function updateUserStatus(req: Request, res: Response) {
     where: { id: targetUserId },
     data: {
       status: raw,
-      tokenVersion: { increment: 1 },
     },
     select: {
       id: true,
@@ -1225,8 +1356,7 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
     return res.status(400).json({ message: "warehouseId inválido." });
   }
 
-  const cleanId =
-    typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
+  const cleanId = typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
 
   if (cleanId === "") {
     return res.status(400).json({ message: "warehouseId inválido." });
@@ -1239,9 +1369,7 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
     });
 
     if (!wh) {
-      return res
-        .status(404)
-        .json({ message: "Almacén no encontrado (o no pertenece a esta joyería)." });
+      return res.status(404).json({ message: "Almacén no encontrado (o no pertenece a esta joyería)." });
     }
   }
 
@@ -1288,8 +1416,7 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
     return res.status(400).json({ message: "warehouseId inválido." });
   }
 
-  const cleanId =
-    typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
+  const cleanId = typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
 
   if (cleanId === "") {
     return res.status(400).json({ message: "warehouseId inválido." });
@@ -1309,9 +1436,7 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
     });
 
     if (!wh) {
-      return res
-        .status(404)
-        .json({ message: "Almacén no encontrado (o no pertenece a esta joyería)." });
+      return res.status(404).json({ message: "Almacén no encontrado (o no pertenece a esta joyería)." });
     }
   }
 
@@ -1466,9 +1591,13 @@ export async function updateUserAvatarForUser(req: Request, res: Response) {
   const avatarRelative = `/uploads/avatars/${file.filename}`;
   const avatarUrl = toPublicUrl(avatarRelative);
 
+  const data: any = { avatarUrl };
+  // ✅ NO invalidar tu propia sesión si te editás a vos mismo desde ADMIN
+  if (targetUserId !== actorId) data.tokenVersion = { increment: 1 };
+
   const updated = await prisma.user.update({
     where: { id: targetUserId },
-    data: { avatarUrl, tokenVersion: { increment: 1 } },
+    data,
     select: {
       id: true,
       email: true,
@@ -1494,6 +1623,7 @@ export async function updateUserAvatarForUser(req: Request, res: Response) {
   return res.json({ ok: true, avatarUrl: updated.avatarUrl, user: updated });
 }
 
+
 export async function removeUserAvatarForUser(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
   const tenantId = requireTenantId(req, res);
@@ -1509,9 +1639,13 @@ export async function removeUserAvatarForUser(req: Request, res: Response) {
 
   if (!prev) return res.status(404).json({ message: "Usuario no encontrado." });
 
+  const data: any = { avatarUrl: null };
+  // ✅ NO invalidar tu propia sesión si te editás a vos mismo desde ADMIN
+  if (targetUserId !== actorId) data.tokenVersion = { increment: 1 };
+
   const updated = await prisma.user.update({
     where: { id: targetUserId },
-    data: { avatarUrl: null, tokenVersion: { increment: 1 } },
+    data,
     select: {
       id: true,
       email: true,
@@ -1536,6 +1670,7 @@ export async function removeUserAvatarForUser(req: Request, res: Response) {
 
   return res.json({ ok: true, avatarUrl: null, user: updated });
 }
+
 
 /* =========================
    ✅ SOFT DELETE USER (ADMIN)
@@ -1599,7 +1734,6 @@ export async function softDeleteUser(req: Request, res: Response) {
 
   return res.json({ ok: true });
 }
-
 /* =========================
    ✅ USER ATTACHMENTS (ADMIN)
 ========================= */
@@ -1637,6 +1771,170 @@ async function safeDeleteByUrlIfLocalUserAttachment(url: string | null) {
   }
 }
 
+/**
+ * Convierte una url pública local (…/uploads/user-attachments/FILE) en path absoluto.
+ * Devuelve null si no parece un archivo local del backend.
+ */
+function absLocalUserAttachmentFromUrl(url: string) {
+  const s = String(url || "");
+  if (!s.includes("/uploads/user-attachments/")) return null;
+
+  const filename = filenameFromAnyUrl(s);
+  if (!filename) return null;
+
+  const safeName = path.basename(filename);
+  if (!safeName) return null;
+
+  return path.join(process.cwd(), "uploads", "user-attachments", safeName);
+}
+
+/**
+ * ✅ Normaliza req.files para soportar:
+ * - multer.array("attachments") -> req.files = File[]
+ * - multer.fields(...) -> req.files = { attachments?: File[], "attachments[]"? : File[] }
+ */
+function normalizeUploadedFiles(req: Request): Express.Multer.File[] {
+  const anyReq = req as any;
+  const rf = anyReq.files;
+
+  if (!rf) return [];
+
+  if (Array.isArray(rf)) return rf as Express.Multer.File[];
+
+  if (rf && typeof rf === "object") {
+    const out: Express.Multer.File[] = [];
+    const obj = rf as Record<string, unknown>;
+
+    const a = obj["attachments"];
+    const b = obj["attachments[]"];
+
+    if (Array.isArray(a)) out.push(...(a as Express.Multer.File[]));
+    if (Array.isArray(b)) out.push(...(b as Express.Multer.File[]));
+
+    return out;
+  }
+
+  return [];
+}
+
+/* =========================
+   ✅ USER ATTACHMENTS (ME)
+   PUT /users/me/attachments
+========================= */
+export async function uploadMyAttachments(req: Request, res: Response) {
+  const actorId = (req as any).userId as string;
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const me = await prisma.user.findFirst({
+    where: { id: actorId, jewelryId: tenantId, deletedAt: null },
+    select: { id: true },
+  });
+
+  if (!me) {
+    return res.status(404).json({ message: "Usuario no encontrado." });
+  }
+
+  const files = normalizeUploadedFiles(req);
+
+  if (!files.length) {
+    return res.status(400).json({
+      message: "No se recibieron archivos (field: attachments o attachments[]).",
+    });
+  }
+
+  const created = await prisma.userAttachment.createMany({
+    data: files.map((f) => {
+      const rel = `/uploads/user-attachments/${f.filename}`;
+      return {
+        userId: actorId,
+        url: toPublicUrlFromReq(req, rel),
+        filename: f.originalname || f.filename,
+        mimeType: f.mimetype || "application/octet-stream",
+        size: f.size ?? 0,
+      };
+    }),
+    skipDuplicates: true,
+  });
+
+  auditLog(req, {
+    action: "users.attachments.upload_me",
+    success: true,
+    userId: actorId,
+    tenantId,
+    meta: { count: files.length },
+  });
+
+  const updated = await prisma.user.findFirst({
+    where: { id: actorId, jewelryId: tenantId, deletedAt: null },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      status: true,
+      tokenVersion: true,
+      avatarUrl: true,
+      favoriteWarehouseId: true,
+
+      phoneCountry: true,
+      phoneNumber: true,
+      documentType: true,
+      documentNumber: true,
+      street: true,
+      number: true,
+      city: true,
+      province: true,
+      postalCode: true,
+      country: true,
+      notes: true,
+
+      createdAt: true,
+      updatedAt: true,
+
+      quickPinHash: true,
+      quickPinEnabled: true,
+      quickPinUpdatedAt: true,
+
+      attachments: {
+        select: { id: true, url: true, filename: true, mimeType: true, size: true, createdAt: true },
+        orderBy: { createdAt: "desc" },
+      },
+      roles: {
+        select: {
+          role: {
+            select: { id: true, name: true, isSystem: true, jewelryId: true, deletedAt: true },
+          },
+        },
+      },
+      permissionOverrides: { select: { permissionId: true, effect: true } },
+    },
+  });
+
+  if (!updated) {
+    return res.json({ ok: true, createdCount: created.count, user: null });
+  }
+
+  type U = typeof updated;
+  type UR = U["roles"][number];
+  type R = UR["role"];
+
+  return res.json({
+    ok: true,
+    createdCount: created.count,
+    user: {
+      ...updated,
+      hasQuickPin: Boolean(updated.quickPinHash),
+      pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
+      roles: (updated.roles ?? [])
+        .map((ur: UR) => ur.role as R)
+        .filter((r: R) => r && r.jewelryId === tenantId && !r.deletedAt)
+        .map((r: R) => ({ id: r.id, name: r.name, isSystem: r.isSystem })),
+      permissionOverrides: updated.permissionOverrides ?? [],
+    },
+  });
+}
+
+
 export async function uploadUserAttachments(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
   const tenantId = requireTenantId(req, res);
@@ -1653,21 +1951,16 @@ export async function uploadUserAttachments(req: Request, res: Response) {
   });
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
-  const files = ((req as any).files ?? []) as Array<{
-    filename: string;
-    originalname?: string;
-    mimetype?: string;
-    size?: number;
-  }>;
+  const files = normalizeUploadedFiles(req);
 
-  if (!Array.isArray(files) || files.length === 0) {
-    return res.status(400).json({ message: "No se recibieron archivos (field: attachments)." });
+  if (!files.length) {
+    return res.status(400).json({
+      message: "No se recibieron archivos (field: attachments o attachments[]).",
+    });
   }
 
-  type F = (typeof files)[number];
-
   const created = await prisma.userAttachment.createMany({
-    data: files.map((f: F) => {
+    data: files.map((f) => {
       const rel = `/uploads/user-attachments/${f.filename}`;
       return {
         userId: targetUserId,
@@ -1680,11 +1973,14 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     skipDuplicates: true,
   });
 
+  if (targetUserId !== actorId) {
   await prisma.user.update({
     where: { id: targetUserId },
     data: { tokenVersion: { increment: 1 } },
     select: { id: true },
   });
+}
+
 
   auditLog(req, {
     action: "users.attachments.upload",
@@ -1762,6 +2058,110 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     },
   });
 }
+/* =========================
+   ✅ GET /users/:id/attachments/:attachmentId/download
+   - fuerza descarga (Content-Disposition)
+   - valida tenant + ownership
+   - ✅ permisos: que los controle la RUTA (VIEW o ADMIN), no acá
+========================= */
+function safeAsciiFilename(name: string) {
+  // fallback simple para filename=""
+  return (
+    String(name || "archivo")
+      .replace(/[\r\n"]/g, "") // evita header injection / comillas
+      .replace(/[\/\\]/g, "_") // evita paths
+      .trim() || "archivo"
+  );
+}
+
+function contentDisposition(filename: string) {
+  const fallback = safeAsciiFilename(filename);
+  const utf8 = encodeURIComponent(String(filename || fallback));
+  // filename* (RFC5987) + fallback ascii
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${utf8}`;
+}
+
+export async function downloadUserAttachment(req: Request, res: Response) {
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const actorId = (req as any).userId as string | undefined;
+
+  const targetUserId = String(req.params.id || "").trim();
+  const attachmentId = String(req.params.attachmentId || "").trim();
+
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
+  if (!attachmentId) return res.status(400).json({ message: "attachmentId inválido." });
+
+  const target = await prisma.user.findFirst({
+    where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
+    select: { id: true },
+  });
+  if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
+
+  const att = await prisma.userAttachment.findFirst({
+    where: { id: attachmentId, userId: targetUserId },
+    select: { id: true, url: true, filename: true, mimeType: true, size: true },
+  });
+  if (!att) return res.status(404).json({ message: "Adjunto no encontrado." });
+
+  // Si es URL externa real y NO es un archivo local del backend -> redirect
+  if (att.url.startsWith("http://") || att.url.startsWith("https://")) {
+    const abs = absLocalUserAttachmentFromUrl(att.url);
+
+    if (!abs) {
+      auditLog(req, {
+        action: "users.attachments.download",
+        success: true,
+        userId: actorId,
+        tenantId,
+        meta: { targetUserId, attachmentId, mode: "redirect" },
+      });
+      return res.redirect(att.url);
+    }
+
+    if (!fsSync.existsSync(abs)) {
+      return res.status(404).json({ message: "Archivo no encontrado en disco." });
+    }
+
+    const stat = fsSync.statSync(abs);
+
+    res.setHeader("Content-Type", att.mimeType || "application/octet-stream");
+    res.setHeader("Content-Length", String(att.size || stat.size));
+    res.setHeader("Content-Disposition", contentDisposition(att.filename || "archivo"));
+
+    auditLog(req, {
+      action: "users.attachments.download",
+      success: true,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId, attachmentId, mode: "local" },
+    });
+
+    return fsSync.createReadStream(abs).pipe(res);
+  }
+
+  // robustez por si algún día guardás path relativo
+  const abs = absLocalUserAttachmentFromUrl(att.url);
+  if (!abs) return res.status(400).json({ message: "URL de adjunto inválida." });
+  if (!fsSync.existsSync(abs)) return res.status(404).json({ message: "Archivo no encontrado en disco." });
+
+  const stat = fsSync.statSync(abs);
+
+  res.setHeader("Content-Type", att.mimeType || "application/octet-stream");
+  res.setHeader("Content-Length", String(att.size || stat.size));
+  res.setHeader("Content-Disposition", contentDisposition(att.filename || "archivo"));
+
+  auditLog(req, {
+    action: "users.attachments.download",
+    success: true,
+    userId: actorId,
+    tenantId,
+    meta: { targetUserId, attachmentId, mode: "local" },
+  });
+
+  return fsSync.createReadStream(abs).pipe(res);
+}
 
 export async function deleteUserAttachment(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -1790,11 +2190,12 @@ export async function deleteUserAttachment(req: Request, res: Response) {
 
   await prisma.userAttachment.delete({ where: { id: att.id } });
 
-  await prisma.user.update({
-    where: { id: targetUserId },
-    data: { tokenVersion: { increment: 1 } },
-    select: { id: true },
-  });
+  if (targetUserId !== actorId) {
+    await prisma.user.update({
+      where: { id: targetUserId },
+      data: { tokenVersion: { increment: 1 } },
+    });
+  }
 
   await safeDeleteByUrlIfLocalUserAttachment(att.url);
 

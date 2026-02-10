@@ -44,7 +44,8 @@ function withMulter(mw: (req: Request, res: Response, cb: (err?: any) => void) =
 ========================= */
 
 // sesión
-router.post("/logout", requireAuth, Auth.logout);
+router.post("/logout", Auth.logout); // ✅ público: siempre puede limpiar cookie
+
 router.get("/me", requireAuth, Auth.me);
 
 // joyería (perfil empresa)
@@ -55,6 +56,18 @@ router.put(
   parseJsonBodyField("data"),
   validateBody(updateJewelrySchema),
   Auth.updateMyJewelry
+);
+
+/**
+ * ✅ NUEVO: subir / cambiar SOLO el logo (sin validar todo el payload)
+ * - multipart field: logo
+ * - devuelve { jewelry }
+ */
+router.put(
+  "/me/jewelry/logo",
+  requireAuth,
+  withMulter(uploadJewelryFiles as any),
+  Auth.uploadMyJewelryLogo
 );
 
 router.delete("/me/jewelry/logo", requireAuth, Auth.deleteMyJewelryLogo);

@@ -15,6 +15,10 @@ export type CatalogItem = {
   label: string;
   isActive: boolean;
   sortOrder: number;
+
+  // ✅ NUEVO: favorito (puede no existir si DB vieja)
+  isFavorite?: boolean;
+
   createdAt?: string;
   updatedAt?: string;
 };
@@ -61,10 +65,22 @@ export async function bulkCreateCatalogItems(type: CatalogType, labels: string[]
 
 export async function updateCatalogItem(
   id: string,
-  patch: Partial<{ label: string; isActive: boolean; sortOrder: number }>
+  patch: Partial<{ label: string; isActive: boolean; sortOrder: number; isFavorite: boolean }>
 ) {
   return apiFetch<{ item: CatalogItem }>(`/company/catalogs/item/${id}`, {
     method: "PATCH",
     body: patch, // ✅ apiFetch serializa
+  });
+}
+
+/**
+ * ✅ Endpoint dedicado a favorito (recomendado)
+ * PATCH /company/catalogs/item/:id/favorite
+ * Body: { isFavorite: boolean }
+ */
+export async function setCatalogItemFavorite(id: string, isFavorite: boolean) {
+  return apiFetch<{ item: CatalogItem }>(`/company/catalogs/item/${id}/favorite`, {
+    method: "PATCH",
+    body: { isFavorite },
   });
 }

@@ -1,32 +1,31 @@
-// tptech-backend/src/routes/index.ts
 import { Router } from "express";
-
 import { requireAuth } from "../middlewares/requireAuth.js";
 
-// ✅ módulos
+// módulos
 import authRoutes from "../modules/auth/auth.routes.js";
 import movimientosRoutes from "../modules/movimientos/movimientos.routes.js";
 import usersRoutes from "../modules/users/users.routes.js";
 
-// ✅ rutas “legacy/flat” que siguen en /routes
+// legacy
 import companyRoutes from "./company.routes.js";
 import rolesRoutes from "./roles.routes.js";
 import permissionsRoutes from "./permissions.routes.js";
+import catalogsRoutes from "./catalogs.routes.js";
 
 const router = Router();
 
 /* =====================
    PÚBLICO
-   - auth.routes.ts maneja público/privado internamente
 ===================== */
 router.use("/auth", authRoutes);
 
 /* =====================
-   PRIVADO (requiere sesión)
+   PRIVADO
 ===================== */
 router.use("/movimientos", requireAuth, movimientosRoutes);
 router.use("/users", requireAuth, usersRoutes);
 router.use("/company", requireAuth, companyRoutes);
+router.use("/company/catalogs", requireAuth, catalogsRoutes);
 router.use("/roles", requireAuth, rolesRoutes);
 router.use("/permissions", requireAuth, permissionsRoutes);
 
