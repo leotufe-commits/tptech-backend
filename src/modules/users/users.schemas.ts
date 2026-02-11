@@ -1,73 +1,51 @@
-// tptech-backend/src/modules/users/users.roles.schemas.ts
+// tptech-backend/src/modules/users/users.schemas.ts
 import { z } from "zod";
 
 /* =========================
-   Helpers
+   UPDATE USER STATUS (ADMIN)
+   PATCH /users/:id/status
 ========================= */
-const idArray = z.array(z.string().min(1)).default([]);
-
-/**
- * Nombre de rol:
- * - trim
- * - 2..60 chars (ajustalo si querés)
- */
-const roleNameSchema = z
-  .string()
-  .trim()
-  .min(2, "El nombre del rol es muy corto.")
-  .max(60, "El nombre del rol es muy largo.");
-
-/* =========================
-   CREATE ROLE (ADMIN)
-   POST /roles
-========================= */
-export const createRoleSchema = z.object({
-  name: roleNameSchema,
-  /**
-   * permissionIds opcional:
-   * si viene vacío -> rol sin permisos (válido)
-   */
-  permissionIds: idArray.optional(),
+export const updateUserStatusSchema = z.object({
+  status: z.enum(["ACTIVE", "PENDING", "BLOCKED"]),
 });
 
 /* =========================
-   UPDATE ROLE (ADMIN)
-   PATCH /roles/:id
+   ASSIGN ROLES (ADMIN)
+   PUT /users/:id/roles
 ========================= */
-export const updateRoleSchema = z
-  .object({
-    name: roleNameSchema.optional(),
-  })
-  .refine((v) => Object.keys(v).length > 0, {
-    message: "No hay campos para actualizar.",
-  });
-
-/* =========================
-   SET ROLE PERMISSIONS (ADMIN)
-   PUT /roles/:id/permissions
-   - reemplaza TODO el set de permisos del rol
-========================= */
-export const setRolePermissionsSchema = z.object({
-  permissionIds: idArray,
+export const assignRolesSchema = z.object({
+  roleIds: z.array(z.string().min(1)).default([]),
 });
 
 /* =========================
-   CLONE ROLE (ADMIN) (opcional)
-   POST /roles/:id/clone
-   - clona nombre (con sufijo) + permisos
+   SET USER OVERRIDE (ADMIN)
+   POST /users/:id/overrides
 ========================= */
-export const cloneRoleSchema = z.object({
-  /**
-   * Si no viene, el controller puede setear algo tipo:
-   * `${role.name} (copia)`
-   */
-  name: roleNameSchema.optional(),
+export const userOverrideSchema = z.object({
+  permissionId: z.string().min(1),
+  effect: z.enum(["ALLOW", "DENY"]),
 });
 
 /* =========================
-   Types
+   CREATE USER (ADMIN)
+   POST /users
+   - password opcional:
+       • si viene -> puede quedar ACTIVE
+       • si NO viene -> lo normal es crear PENDING
+   - roleIds opcional
 ========================= */
-export type CreateRoleInput = z.infer<typeof createRoleSchema>;
-export type UpdateRoleInput = z.infer<typeof updateRoleSchema>;
-export type SetRolePermissionsInput = z.infer<typeof setRolePermissionsSchema>;
-export type CloneRoleInput = z.infer<typeof cloneRoleSchema>;
+export const createUserSchema = z.object({
+  email: z.string().email("Email inválido."),
+  name: z.string().trim().min(1).optional().nullable(),
+  password: z.string().min(6, "La contraseña debe tener al menos 6 caracteres.").optional(),
+  roleIds: z.array(z.string().min(1)).optional().default([]),
+  status: z.enum(["ACTIVE", "PENDING", "BLOCKED"]).optional(),
+});
+
+/* =========================
+   TYPES
+========================= */
+export type UpdateUserStatusInput = z.infer<typeof updateUserStatusSchema>;
+export type AssignRolesInput = z.infer<typeof assignRolesSchema>;
+export type UserOverrideInput = z.infer<typeof userOverrideSchema>;
+export type CreateUserInput = z.infer<typeof createUserSchema>;

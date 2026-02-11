@@ -6,16 +6,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 import { requirePermission } from "../../middlewares/requirePermission.js";
-import { uploadAvatar } from "../../middlewares/uploadAvatar.js"; // ✅ middleware central
+import { uploadAvatar } from "../../middlewares/uploadAvatar.js";
 import * as Users from "../../controllers/users.controller.js";
 
 const router = Router();
-
-/**
- * NOTA:
- * requireAuth ya se aplica en src/routes/index.ts
- * (router.use("/users", requireAuth, usersRoutes))
- */
 
 /* =========================
    Helpers
@@ -23,11 +17,6 @@ const router = Router();
 function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
-
-// ✅ Gates del módulo
-// OWNER bypass desde requirePermission (según tu comentario)
-const requireUsersView = requirePermission("USERS_ROLES", "VIEW");
-const requireUsersAdmin = requirePermission("USERS_ROLES", "ADMIN");
 
 /* =========================
    Multer storage (user attachments)
@@ -49,8 +38,7 @@ const userAttStorage = multer.diskStorage({
   },
 });
 
-// Adjuntos: permitimos cualquier tipo (controlás en frontend o controller)
-const uploadUserAttachments = multer({
+const uploadUserAttachmentsFiles = multer({
   storage: userAttStorage,
   limits: {
     fileSize: 20 * 1024 * 1024, // 20MB por archivo
@@ -58,103 +46,99 @@ const uploadUserAttachments = multer({
   },
 }).fields([
   { name: "attachments", maxCount: 10 },
-  { name: "attachments[]", maxCount: 10 }, // ✅ robusto
+  { name: "attachments[]", maxCount: 10 },
 ]);
 
-/* =========================================================
-   ✅ RUTAS /ME/* (NO requieren ADMIN)
-   - requireAuth ya alcanza
-   - /me debe ir ANTES que /:id
-========================================================= */
-
 /* =========================
-   FAVORITE WAREHOUSE (ME)
+   Gates
 ========================= */
-router.patch("/me/favorite-warehouse", Users.updateMyFavoriteWarehouse);
-
-/* =========================
-   CLAVE RÁPIDA (PIN) (ME)
-========================= */
-router.put("/me/quick-pin", Users.updateMyQuickPin);
-router.delete("/me/quick-pin", Users.removeMyQuickPin);
-
-/* =========================
-   AVATAR (ME)
-========================= */
-router.put("/me/avatar", uploadAvatar.single("avatar"), Users.updateMyAvatar);
-router.delete("/me/avatar", Users.removeMyAvatar);
-
-/* =========================
-   USER ATTACHMENTS (ME)
-   ⚠️ FIX: si el controller no existe todavía, NO crashear el server.
-========================= */
-const uploadMyAttachmentsHandler =
-  (Users as any).uploadMyAttachments ??
-  ((req: import("express").Request, res: import("express").Response) => {
-    return res.status(501).json({
-      message:
-        "uploadMyAttachments no está implementado/exportado en users.controller.ts. Implementalo o cambiá la ruta.",
-    });
-  });
-
-router.put("/me/attachments", uploadUserAttachments, uploadMyAttachmentsHandler);
+const requireUsersView = requirePermission("USERS_ROLES", "VIEW");
+const requireUsersAdmin = requirePermission("USERS_ROLES", "ADMIN");
 
 /* =========================================================
-   ✅ RUTAS VIEW (USERS_ROLES:VIEW)
-   - Lectura y descargas (como Empresa)
+   SAFE HANDLERS (evita crash si algún export falta)
 ========================================================= */
+type H = any;
+function h(fn: H, name: string) {
+  if (typeof fn === "function") return fn;
+  return (_req: any, res: any) =>
+    res.status(501).json({ message: `${name} no está exportado en users.controller.ts` });
+}
 
-// ✅ Listado (si tu UI permite USERS_ROLES:VIEW, el backend debe acompañar)
-router.get("/", requireUsersView, Users.listUsers);
+const updateMyFavoriteWarehouse = h((Users as any).updateMyFavoriteWarehouse, "updateMyFavoriteWarehouse");
+const updateMyQuickPin = h((Users as any).updateMyQuickPin, "updateMyQuickPin");
+const removeMyQuickPin = h((Users as any).removeMyQuickPin, "removeMyQuickPin");
+const updateMyAvatar = h((Users as any).updateMyAvatar, "updateMyAvatar");
+const removeMyAvatar = h((Users as any).removeMyAvatar, "removeMyAvatar");
+const uploadMyAttachments = h((Users as any).uploadMyAttachments, "uploadMyAttachments");
 
-// ✅ Ver detalle
-router.get("/:id", requireUsersView, Users.getUser);
+const listUsers = h((Users as any).listUsers, "listUsers");
+const getUser = h((Users as any).getUser, "getUser");
+const downloadUserAttachment = h((Users as any).downloadUserAttachment, "downloadUserAttachment");
 
-// ✅ Descargar adjunto (VIEW, no ADMIN)
-router.get("/:id/attachments/:attachmentId/download", requireUsersView, Users.downloadUserAttachment);
+const updateUserFavoriteWarehouse = h((Users as any).updateUserFavoriteWarehouse, "updateUserFavoriteWarehouse");
+const updateUserQuickPin = h((Users as any).updateUserQuickPin, "updateUserQuickPin");
+const removeUserQuickPin = h((Users as any).removeUserQuickPin, "removeUserQuickPin");
+const updateUserQuickPinEnabled = h((Users as any).updateUserQuickPinEnabled, "updateUserQuickPinEnabled");
+
+const updateUserAvatarForUser = h((Users as any).updateUserAvatarForUser, "updateUserAvatarForUser");
+const removeUserAvatarForUser = h((Users as any).removeUserAvatarForUser, "removeUserAvatarForUser");
+
+const uploadUserAttachments = h((Users as any).uploadUserAttachments, "uploadUserAttachments");
+const deleteUserAttachment = h((Users as any).deleteUserAttachment, "deleteUserAttachment");
+
+const createUser = h((Users as any).createUser, "createUser");
+const updateUserProfile = h((Users as any).updateUserProfile, "updateUserProfile");
+const updateUserStatus = h((Users as any).updateUserStatus, "updateUserStatus");
+const assignRolesToUser = h((Users as any).assignRolesToUser, "assignRolesToUser");
+const setUserOverride = h((Users as any).setUserOverride, "setUserOverride");
+const removeUserOverride = h((Users as any).removeUserOverride, "removeUserOverride");
+const softDeleteUser = h((Users as any).softDeleteUser, "softDeleteUser");
 
 /* =========================================================
-   ✅ RUTAS ADMIN (USERS_ROLES:ADMIN)
-   - Todo lo que modifica
+   /ME (antes que /:id)
 ========================================================= */
+router.patch("/me/favorite-warehouse", updateMyFavoriteWarehouse);
 
-/* =========================
-   FAVORITE WAREHOUSE (ADMIN)
-========================= */
-router.patch("/:id/favorite-warehouse", requireUsersAdmin, Users.updateUserFavoriteWarehouse);
+router.put("/me/quick-pin", updateMyQuickPin);
+router.delete("/me/quick-pin", removeMyQuickPin);
 
-/* =========================
-   CLAVE RÁPIDA (PIN) (ADMIN)
-========================= */
-router.put("/:id/quick-pin", requireUsersAdmin, Users.updateUserQuickPin);
-router.delete("/:id/quick-pin", requireUsersAdmin, Users.removeUserQuickPin);
-router.patch("/:id/quick-pin/enabled", requireUsersAdmin, Users.updateUserQuickPinEnabled);
+router.put("/me/avatar", uploadAvatar.single("avatar"), updateMyAvatar);
+router.delete("/me/avatar", removeMyAvatar);
 
-/* =========================
-   AVATAR (ADMIN)
-========================= */
-router.put("/:id/avatar", requireUsersAdmin, uploadAvatar.single("avatar"), Users.updateUserAvatarForUser);
-router.delete("/:id/avatar", requireUsersAdmin, Users.removeUserAvatarForUser);
+router.put("/me/attachments", uploadUserAttachmentsFiles, uploadMyAttachments);
 
-/* =========================
-   USER ATTACHMENTS (ADMIN)
-========================= */
-router.put("/:id/attachments", requireUsersAdmin, uploadUserAttachments, Users.uploadUserAttachments);
-router.delete("/:id/attachments/:attachmentId", requireUsersAdmin, Users.deleteUserAttachment);
+/* =========================================================
+   VIEW
+========================================================= */
+router.get("/", requireUsersView, listUsers);
+router.get("/:id", requireUsersView, getUser);
+router.get("/:id/attachments/:attachmentId/download", requireUsersView, downloadUserAttachment);
 
-/* =========================
-   USERS CRUD / ADMIN
-========================= */
-router.post("/", requireUsersAdmin, Users.createUser);
+/* =========================================================
+   ADMIN
+========================================================= */
+router.patch("/:id/favorite-warehouse", requireUsersAdmin, updateUserFavoriteWarehouse);
 
-router.patch("/:id", requireUsersAdmin, Users.updateUserProfile);
-router.patch("/:id/status", requireUsersAdmin, Users.updateUserStatus);
-router.put("/:id/roles", requireUsersAdmin, Users.assignRolesToUser);
+router.put("/:id/quick-pin", requireUsersAdmin, updateUserQuickPin);
+router.delete("/:id/quick-pin", requireUsersAdmin, removeUserQuickPin);
+router.patch("/:id/quick-pin/enabled", requireUsersAdmin, updateUserQuickPinEnabled);
 
-router.post("/:id/overrides", requireUsersAdmin, Users.setUserOverride);
-router.delete("/:id/overrides/:permissionId", requireUsersAdmin, Users.removeUserOverride);
+router.put("/:id/avatar", requireUsersAdmin, uploadAvatar.single("avatar"), updateUserAvatarForUser);
+router.delete("/:id/avatar", requireUsersAdmin, removeUserAvatarForUser);
 
-router.delete("/:id", requireUsersAdmin, Users.softDeleteUser);
+router.put("/:id/attachments", requireUsersAdmin, uploadUserAttachmentsFiles, uploadUserAttachments);
+router.delete("/:id/attachments/:attachmentId", requireUsersAdmin, deleteUserAttachment);
+
+router.post("/", requireUsersAdmin, createUser);
+router.patch("/:id", requireUsersAdmin, updateUserProfile);
+router.patch("/:id/status", requireUsersAdmin, updateUserStatus);
+router.put("/:id/roles", requireUsersAdmin, assignRolesToUser);
+
+router.post("/:id/overrides", requireUsersAdmin, setUserOverride);
+router.delete("/:id/overrides/:permissionId", requireUsersAdmin, removeUserOverride);
+
+router.delete("/:id", requireUsersAdmin, softDeleteUser);
 
 /* =========================
    Multer error handler
@@ -162,21 +146,9 @@ router.delete("/:id", requireUsersAdmin, Users.softDeleteUser);
 router.use((err: any, _req: any, res: any, next: any) => {
   if (!err) return next();
 
-  if (err?.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({ message: "El archivo supera el máximo permitido." });
-  }
-  if (err?.code === "LIMIT_FILE_COUNT") {
-    return res.status(400).json({ message: "Demasiados archivos." });
-  }
-  if (err?.code === "LIMIT_UNEXPECTED_FILE") {
-    return res.status(400).json({ message: "Archivo inesperado. Revisá el field multipart." });
-  }
-
-  if (typeof err?.message === "string") {
-    if (err.message.toLowerCase().includes("imagen")) {
-      return res.status(400).json({ message: err.message });
-    }
-  }
+  if (err?.code === "LIMIT_FILE_SIZE") return res.status(413).json({ message: "El archivo supera el máximo permitido." });
+  if (err?.code === "LIMIT_FILE_COUNT") return res.status(400).json({ message: "Demasiados archivos." });
+  if (err?.code === "LIMIT_UNEXPECTED_FILE") return res.status(400).json({ message: "Archivo inesperado. Revisá el field multipart." });
 
   return res.status(500).json({ message: err?.message || "Error subiendo archivo." });
 });
