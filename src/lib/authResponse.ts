@@ -84,9 +84,15 @@ export function mapRoles(user: any) {
 
 export function normalizeJewelrySecurity(j: any) {
   if (!j) return null;
+
   return {
     ...j,
-    pinLockEnabled: j.pinLockEnabled ?? true,
+
+    // ✅ IMPORTANTE: default false (coincide con tu AuthContext)
+    // si nunca se configuró el lock, NO debe bloquear por defecto
+    pinLockEnabled: j.pinLockEnabled ?? false,
+
+    // defaults “seguros” para UI/settings (solo si faltan)
     pinLockTimeoutSec: j.pinLockTimeoutSec ?? 300,
     pinLockRequireOnUserSwitch: j.pinLockRequireOnUserSwitch ?? true,
     quickSwitchEnabled: j.quickSwitchEnabled ?? false,
@@ -102,11 +108,7 @@ export function sanitizeUser(user: any) {
   return safeUser;
 }
 
-export function buildAuthResponse(args: {
-  user: any;
-  token?: string;
-  includeToken?: boolean;
-}) {
+export function buildAuthResponse(args: { user: any; token?: string; includeToken?: boolean }) {
   const { user, token, includeToken } = args;
 
   const roles = mapRoles(user);
@@ -132,6 +134,7 @@ export function buildAuthResponse(args: {
 
     permissions,
     favoriteWarehouse: user?.favoriteWarehouse ?? null,
+
     ...(includeToken
       ? {
           token,

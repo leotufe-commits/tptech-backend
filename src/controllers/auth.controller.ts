@@ -946,6 +946,7 @@ export async function resetPassword(req: Request, res: Response) {
     return res.status(401).json({ message: "Token inválido." });
   }
 }
+
 // =========================
 // PARTE 2 / 2
 // =========================
@@ -1098,7 +1099,6 @@ export async function setMyPin(req: Request, res: Response) {
   return res.json({ ok: true });
 }
 
-
 export async function disableMyPin(req: Request, res: Response) {
   const meUser = await requireActiveMe(req);
   if (!meUser) return res.status(401).json({ message: "Unauthorized" });
@@ -1165,7 +1165,6 @@ export async function disableMyPin(req: Request, res: Response) {
 
   return res.json({ ok: true });
 }
-
 
 /* ---------- UNLOCK ---------- */
 export async function unlockWithPin(req: Request, res: Response) {
@@ -1262,7 +1261,6 @@ export async function quickUsers(req: Request, res: Response) {
         .filter((r: any) => typeof r?.name === "string" && r.name.trim());
 
       const roleNames = roles.map((r: any) => String(r.name).trim()).filter(Boolean);
-
       const roleLabel = roleNames.length ? roleNames.join(" • ") : "";
 
       const hasQuickPin = Boolean(u.quickPinEnabled && u.quickPinHash);
@@ -1419,6 +1417,8 @@ export async function setQuickSwitchForJewelry(req: Request, res: Response) {
 
 /* =========================
    PIN LOCK SETTINGS (joyería)
+   ✅ req.body ya viene normalizado por pinLockSettingsSchema.transform()
+   - canonical: pinLockEnabled, pinLockTimeoutSec, pinLockRequireOnUserSwitch, quickSwitchEnabled
 ========================= */
 export async function setPinLockSettingsForJewelry(req: Request, res: Response) {
   const userId = (req as any).userId as string | undefined;
@@ -1427,36 +1427,20 @@ export async function setPinLockSettingsForJewelry(req: Request, res: Response) 
   if (!userId) return res.status(401).json({ message: "Unauthorized" });
   if (!tenantId) return res.status(400).json({ message: "Tenant no definido." });
 
-  const b = (req.body ?? {}) as any;
+  const body = (req.body ?? {}) as any;
 
-  const toBool = (v: any): boolean | undefined => {
-    if (v === undefined || v === null) return undefined;
-    if (typeof v === "boolean") return v;
-    const s = String(v).trim().toLowerCase();
-    if (s === "true" || s === "1") return true;
-    if (s === "false" || s === "0") return false;
-    return undefined;
-  };
-
-  const pinLockEnabled = toBool(b.pinLockEnabled);
-  const pinLockRequireOnUserSwitch = toBool(b.pinLockRequireOnUserSwitch);
-  const quickSwitchEnabled = toBool(b.quickSwitchEnabled);
-
-  let pinLockTimeoutSec: number | undefined = undefined;
-  if (b.pinLockTimeoutSec !== undefined && b.pinLockTimeoutSec !== null && b.pinLockTimeoutSec !== "") {
-    const n = Number(b.pinLockTimeoutSec);
-    if (!Number.isFinite(n)) {
-      return res.status(400).json({ message: "pinLockTimeoutSec inválido." });
-    }
-    pinLockTimeoutSec = Math.max(10, Math.min(60 * 60 * 12, Math.trunc(n)));
-  }
-
+  // ✅ validateBody(pinLockSettingsSchema) garantiza:
+  // - al menos 1 campo
+  // - timeout en rango (si vino)
+  // - tipos normalizados
   const data: any = {};
-  if (pinLockEnabled !== undefined) data.pinLockEnabled = pinLockEnabled;
-  if (pinLockTimeoutSec !== undefined) data.pinLockTimeoutSec = pinLockTimeoutSec;
-  if (pinLockRequireOnUserSwitch !== undefined) data.pinLockRequireOnUserSwitch = pinLockRequireOnUserSwitch;
-  if (quickSwitchEnabled !== undefined) data.quickSwitchEnabled = quickSwitchEnabled;
+  if (typeof body.pinLockEnabled === "boolean") data.pinLockEnabled = body.pinLockEnabled;
+  if (typeof body.pinLockTimeoutSec === "number") data.pinLockTimeoutSec = body.pinLockTimeoutSec;
+  if (typeof body.pinLockRequireOnUserSwitch === "boolean")
+    data.pinLockRequireOnUserSwitch = body.pinLockRequireOnUserSwitch;
+  if (typeof body.quickSwitchEnabled === "boolean") data.quickSwitchEnabled = body.quickSwitchEnabled;
 
+  // (por seguridad extra: si algo raro pasó y llegó vacío)
   if (!Object.keys(data).length) {
     return res.status(400).json({ message: "No hay campos para actualizar." });
   }

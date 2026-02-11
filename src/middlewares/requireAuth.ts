@@ -53,34 +53,40 @@ function readCookieToken(req: Request): string | null {
 }
 
 /**
- * ✅ FIX:
- * - Si existe cookie, la priorizamos SIEMPRE.
- *   Motivo: en el frontend web puede quedar un Bearer legacy válido de firma,
- *   pero con tokenVersion viejo → disparaba "Sesión expirada" aunque la cookie sea válida.
- * - Si no hay cookie, usamos Bearer (útil para clientes/API).
+ * ✅ Política correcta para cookie httpOnly:
+ * - Si HAY cookie → SOLO cookie (si no valida, 401)
+ * - Si NO hay cookie → usamos Bearer (útil para clients/API)
+ *
+ * Motivo:
+ * - Evita que un Bearer legacy “resucite” sesión cuando querés forzar cookie.
+ * - Evita inconsistencias si cookie y bearer difieren.
  */
 function verifyAnyToken(req: Request): any | null {
   const cookie = readCookieToken(req);
-  const bearer = readBearer(req);
 
-  const candidates = [cookie, bearer].filter((t): t is string =>
-  Boolean(typeof t === "string" && t.trim())
-);
-
-
-  for (const token of candidates) {
+  // ✅ si existe cookie, NO hacemos fallback a bearer
+  if (cookie) {
     try {
-      const payload = jwt.verify(token, JWT_SECRET_SAFE, {
+      return jwt.verify(cookie, JWT_SECRET_SAFE, {
         issuer: JWT_ISSUER,
         audience: JWT_AUDIENCE,
       }) as any;
-      return payload;
     } catch {
-      // probar siguiente candidato
+      return null;
     }
   }
 
-  return null;
+  const bearer = readBearer(req);
+  if (!bearer) return null;
+
+  try {
+    return jwt.verify(bearer, JWT_SECRET_SAFE, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }) as any;
+  } catch {
+    return null;
+  }
 }
 
 function toPermKey(module: any, action: any) {
