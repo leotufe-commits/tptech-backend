@@ -1,7 +1,5 @@
-// tptech-frontend/src/services/catalogs.ts
-// ✅
-import { prisma } from "../lib/prisma.js";
-
+// tptech-backend/src/services/catalogs.ts
+import { apiFetch } from "../lib/api.js";
 
 export type CatalogType =
   | "IVA_CONDITION"
@@ -18,7 +16,7 @@ export type CatalogItem = {
   isActive: boolean;
   sortOrder: number;
 
-  // ✅ NUEVO: favorito (puede no existir si DB vieja)
+  // ✅ opcional (por compatibilidad)
   isFavorite?: boolean;
 
   createdAt?: string;
@@ -29,7 +27,7 @@ export type CatalogItem = {
  * ✅ Devuelve ARRAY directo (CatalogItem[])
  * opts:
  * - includeInactive: ver inactivos (admin)
- * - force: cache-bust (por si usás caches arriba)
+ * - force: cache-bust (si tenés caches arriba)
  */
 export async function listCatalog(
   type: CatalogType,
@@ -42,16 +40,17 @@ export async function listCatalog(
 
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
 
-  const resp = await apiFetch<{ items: CatalogItem[] }>(`/company/catalogs/${type}${suffix}`);
-
+  // El backend puede devolver { items } o array directo (por robustez)
+  const resp = await apiFetch<any>(`/company/catalogs/${type}${suffix}`);
   const items = (resp as any)?.items ?? resp;
+
   return Array.isArray(items) ? (items as CatalogItem[]) : [];
 }
 
 export async function createCatalogItem(type: CatalogType, label: string, sortOrder = 0) {
   return apiFetch<{ item: CatalogItem; created?: boolean }>(`/company/catalogs/${type}`, {
     method: "POST",
-    body: { label, sortOrder }, // ✅ apiFetch serializa
+    body: { label, sortOrder },
   });
 }
 
@@ -60,7 +59,7 @@ export async function bulkCreateCatalogItems(type: CatalogType, labels: string[]
     `/company/catalogs/${type}/bulk`,
     {
       method: "POST",
-      body: { labels, sortOrderStart }, // ✅ apiFetch serializa
+      body: { labels, sortOrderStart },
     }
   );
 }
@@ -71,12 +70,12 @@ export async function updateCatalogItem(
 ) {
   return apiFetch<{ item: CatalogItem }>(`/company/catalogs/item/${id}`, {
     method: "PATCH",
-    body: patch, // ✅ apiFetch serializa
+    body: patch,
   });
 }
 
 /**
- * ✅ Endpoint dedicado a favorito (recomendado)
+ * ✅ Endpoint dedicado a favorito
  * PATCH /company/catalogs/item/:id/favorite
  * Body: { isFavorite: boolean }
  */
