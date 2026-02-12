@@ -5,11 +5,18 @@ import path from "node:path";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
+import { requireAuth } from "../../middlewares/requireAuth.js";
 import { requirePermission } from "../../middlewares/requirePermission.js";
 import { uploadAvatar } from "../../middlewares/uploadAvatar.js";
 import * as Users from "../../controllers/users.controller.js";
 
 const router = Router();
+
+/* =========================
+   ✅ AUTH (cookie httpOnly)
+   Esto asegura req.user en TODO el router
+========================= */
+router.use(requireAuth);
 
 /* =========================
    Helpers

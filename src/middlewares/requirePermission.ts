@@ -7,18 +7,23 @@ import type { Request, Response, NextFunction } from "express";
  * - req.isOwner (boolean)
  * - req.role / req.userRole (string)
  * - req.roles (string[]) / req.userRoles (string[])
+ * - req.user.role / req.user.roles
  */
 function isOwnerReq(req: Request): boolean {
   const anyReq = req as any;
 
   if (anyReq?.isOwner === true) return true;
 
-  const role = String(anyReq?.role ?? anyReq?.userRole ?? "")
+  const role = String(anyReq?.role ?? anyReq?.userRole ?? anyReq?.user?.role ?? "")
     .trim()
     .toUpperCase();
   if (role === "OWNER") return true;
 
-  const roles = (anyReq?.roles ?? anyReq?.userRoles) as unknown;
+  const roles = (anyReq?.roles ??
+    anyReq?.userRoles ??
+    anyReq?.user?.roles ??
+    anyReq?.user?.roleCodes) as unknown;
+
   if (Array.isArray(roles)) {
     return roles.map((x) => String(x).trim().toUpperCase()).includes("OWNER");
   }
@@ -26,12 +31,24 @@ function isOwnerReq(req: Request): boolean {
   return false;
 }
 
+/**
+ * ✅ Authed si requireAuth setea:
+ * - (legacy) req.userId + req.tenantId
+ * - (tenant) req.userId + req.jewelryId
+ * - (nuevo)  req.user.id + (req.user.tenantId || req.user.jewelryId)
+ */
 function isAuthed(req: Request) {
-  return Boolean((req as any).userId && (req as any).tenantId);
+  const anyReq = req as any;
+
+  const userId = anyReq?.userId ?? anyReq?.user?.id;
+  const tenantId = anyReq?.tenantId ?? anyReq?.user?.tenantId;
+  const jewelryId = anyReq?.jewelryId ?? anyReq?.user?.jewelryId;
+
+  return Boolean(userId && (tenantId || jewelryId));
 }
 
 /**
- * Normaliza req.permissions a un Set<string> con claves "MODULE:ACTION"
+ * Normaliza permisos a Set<string> con claves "MODULE:ACTION"
  * Soporta:
  * - string[]: ["USERS_ROLES:ADMIN"]
  * - object[]: [{ module:"USERS_ROLES", action:"ADMIN" }]
@@ -45,14 +62,13 @@ function permsToSet(perms: unknown): Set<string> {
   for (const p of perms) {
     if (typeof p === "string") {
       const s = p.trim();
-      if (s) out.add(s);
+      if (s) out.add(s.toUpperCase());
       continue;
     }
 
     if (p && typeof p === "object") {
       const obj = p as any;
 
-      // si ya viene como string key
       const key =
         obj.key ??
         obj.code ??
@@ -65,13 +81,12 @@ function permsToSet(perms: unknown): Set<string> {
 
       if (typeof key === "string") {
         const s = key.trim();
-        if (s) out.add(s);
+        if (s) out.add(s.toUpperCase());
       }
 
-      // por si vienen separados
       const mod = String(obj.module ?? obj.permModule ?? "").trim();
       const act = String(obj.action ?? obj.permAction ?? "").trim();
-      if (mod && act) out.add(`${mod}:${act}`);
+      if (mod && act) out.add(`${mod}:${act}`.toUpperCase());
     }
   }
 
@@ -84,11 +99,12 @@ function permsToSet(perms: unknown): Set<string> {
  * ✅ NO consulta Prisma
  *
  * Regla:
+ * - Si no autenticado => 401
  * - Si es OWNER => allow (bypass)
- * - Si el permiso requerido no está en req.permissions => 403
+ * - Si no tiene permiso => 403
  */
 export function requirePermission(module: string, action: string) {
-  const wanted = `${String(module).trim()}:${String(action).trim()}`;
+  const wanted = `${String(module).trim()}:${String(action).trim()}`.toUpperCase();
 
   return (req: Request, res: Response, next: NextFunction) => {
     if (!isAuthed(req)) return res.status(401).json({ message: "No autenticado" });
@@ -111,6 +127,7 @@ export function requirePermission(module: string, action: string) {
 
 /**
  * requireAnyPermission(["USERS_ROLES:ADMIN", "USERS_ROLES:EDIT"])
+ * - Si no autenticado => 401
  * - Si es OWNER => allow (bypass)
  * - Si tiene cualquiera => allow
  */
@@ -119,7 +136,7 @@ export function requireAnyPermission(wanted: string[]) {
     ? Array.from(
         new Set(
           wanted
-            .map((x) => String(x ?? "").trim())
+            .map((x) => String(x ?? "").trim().toUpperCase())
             .filter(Boolean)
         )
       )

@@ -56,10 +56,6 @@ function readCookieToken(req: Request): string | null {
  * ✅ Política correcta para cookie httpOnly:
  * - Si HAY cookie → SOLO cookie (si no valida, 401)
  * - Si NO hay cookie → usamos Bearer (útil para clients/API)
- *
- * Motivo:
- * - Evita que un Bearer legacy “resucite” sesión cuando querés forzar cookie.
- * - Evita inconsistencias si cookie y bearer difieren.
  */
 function verifyAnyToken(req: Request): any | null {
   const cookie = readCookieToken(req);
@@ -161,9 +157,20 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       return unauthorized(res, "Sesión expirada");
     }
 
-    // req context
+    // =========================
+    // ✅ CONTEXTO REQ (compat)
+    // =========================
     (req as any).userId = user.id;
     (req as any).tenantId = user.jewelryId;
+
+    // ✅ Alias útiles (algunos módulos usan jewelryId)
+    (req as any).jewelryId = user.jewelryId;
+
+    // ✅ CLAVE: algunos handlers (attachments) leen req.user
+    (req as any).user = {
+      id: user.id,
+      jewelryId: user.jewelryId,
+    };
 
     const roleNames: string[] = [];
     for (const ur of user.roles ?? []) {
