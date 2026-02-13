@@ -4,9 +4,16 @@ import jwt from "jsonwebtoken";
 import { UserStatus, OverrideEffect } from "@prisma/client";
 
 import { prisma, setContextTenantId, setContextUserId } from "../lib/prisma.js";
-import { getEnv } from "../config/env.js";
 
-// mismo nombre que en auth.controller.ts
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
+const JWT_SECRET_SAFE: string = JWT_SECRET;
+
+// ✅ defaults seguros (y no dependen del tipado de getEnv)
+const JWT_ISSUER = process.env.JWT_ISSUER || "tptech";
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "tptech-web";
+
+// mismo nombre que en auth.base.controller.ts
 const AUTH_COOKIE = "tptech_session";
 
 function isProd() {
@@ -21,7 +28,9 @@ function clearAuthCookie(res: Response) {
       sameSite: isProd() ? "none" : "lax",
       path: "/",
     });
-  } catch {}
+  } catch {
+    // no-op
+  }
 }
 
 function unauthorized(res: Response, message = "Unauthorized") {
@@ -47,23 +56,19 @@ function readCookieToken(req: Request): string | null {
 }
 
 /**
- * ✅ Política cookie-first:
- * - Si HAY cookie → SOLO cookie (si no valida, 401)
- * - Si NO hay cookie → usamos Bearer (útil para clients/API)
+ * ✅ Política correcta:
+ * - Si HAY cookie → SOLO cookie
+ * - Si NO hay cookie → Bearer (útil para clients/API)
  */
 function verifyAnyToken(req: Request): any | null {
-  const env = getEnv();
-
   const cookie = readCookieToken(req);
 
+  // ✅ si existe cookie, NO hacemos fallback a bearer
   if (cookie) {
     try {
-      // tolerancia por si alguna vez guardaste "Bearer xxx" dentro de la cookie
-      const token = cookie.toLowerCase().startsWith("bearer ") ? cookie.slice(7).trim() : cookie;
-
-      return jwt.verify(token, env.JWT_SECRET, {
-        issuer: env.JWT_ISSUER,
-        audience: env.JWT_AUDIENCE,
+      return jwt.verify(cookie, JWT_SECRET_SAFE, {
+        issuer: JWT_ISSUER,
+        audience: JWT_AUDIENCE,
       }) as any;
     } catch {
       return null;
@@ -74,9 +79,9 @@ function verifyAnyToken(req: Request): any | null {
   if (!bearer) return null;
 
   try {
-    return jwt.verify(bearer, env.JWT_SECRET, {
-      issuer: env.JWT_ISSUER,
-      audience: env.JWT_AUDIENCE,
+    return jwt.verify(bearer, JWT_SECRET_SAFE, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
     }) as any;
   } catch {
     return null;
@@ -89,7 +94,6 @@ function toPermKey(module: any, action: any) {
 
 function readTokenVersion(payload: any): number | null {
   const raw = payload?.tokenVersion ?? payload?.tv ?? payload?.ver ?? payload?.token_ver;
-
   if (raw === undefined || raw === null || raw === "") return null;
 
   const n = Number(raw);
@@ -161,10 +165,10 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     (req as any).userId = user.id;
     (req as any).tenantId = user.jewelryId;
 
-    // ✅ Alias útiles (algunos módulos usan jewelryId)
+    // ✅ Alias útiles
     (req as any).jewelryId = user.jewelryId;
 
-    // ✅ CLAVE: algunos handlers (attachments) leen req.user
+    // ✅ CLAVE: algunos handlers leen req.user
     (req as any).user = {
       id: user.id,
       jewelryId: user.jewelryId,
@@ -185,7 +189,9 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     try {
       setContextUserId(user.id);
       setContextTenantId(user.jewelryId);
-    } catch {}
+    } catch {
+      // no-op
+    }
 
     const base = new Set<string>();
 
