@@ -19,11 +19,7 @@ export function getRequestContext() {
   return als.getStore();
 }
 
-export function requestContextMiddleware(
-  _req: Request,
-  _res: Response,
-  next: NextFunction
-) {
+export function requestContextMiddleware(_req: Request, _res: Response, next: NextFunction) {
   als.run({ tenantId: undefined, userId: undefined }, () => next());
 }
 
@@ -78,13 +74,29 @@ if (process.env.NODE_ENV !== "production") {
 /* =========================
    MULTI-TENANT ENFORCEMENT
 ========================= */
-const TENANT_MODELS = new Set(["User", "Role", "Warehouse", "AuditLog"]);
+/**
+ * Incluí SOLO modelos que tengan un campo directo jewelryId (o el campo definido abajo).
+ * NO incluyas modelos que no tengan tenant directo (ej: UserAttachment tiene userId, no jewelryId).
+ */
+const TENANT_MODELS = new Set([
+  "User",
+  "Role",
+  "Warehouse",
+  "AuditLog",
+
+  // ✅ del schema que pegaste
+  "CatalogItem",
+  "JewelryAttachment",
+]);
 
 const TENANT_FIELD_BY_MODEL: Record<string, string> = {
   User: "jewelryId",
   Role: "jewelryId",
   Warehouse: "jewelryId",
   AuditLog: "jewelryId",
+
+  CatalogItem: "jewelryId",
+  JewelryAttachment: "jewelryId",
 };
 
 function isTenantModel(model?: string) {
@@ -105,8 +117,13 @@ function addTenantToCreateData(data: any, field: string, tenantId: string) {
 
 /**
  * Prisma extendido:
- * - agrega tenantId automáticamente
- * - filtra por tenantId en queries
+ * - agrega tenantId automáticamente en creates
+ * - filtra por tenantId en queries "where"
+ *
+ * Nota:
+ * - Para operaciones que usan "where UNIQUE" (findUnique, update, delete, upsert),
+ *   NO intentamos inyectar jewelryId en where porque puede romper (unique compuesto).
+ *   Para esos casos, mantenemos validación en capa de controllers/services.
  */
 export const prisma: PrismaClient = basePrisma.$extends({
   query: {
@@ -127,20 +144,26 @@ export const prisma: PrismaClient = basePrisma.$extends({
         const field = tenantFieldFor(model!);
         const a: any = args ?? {};
 
+        // ✅ Lecturas "where" seguras
         if (
           operation === "findMany" ||
           operation === "findFirst" ||
-          operation === "findFirstOrThrow"
+          operation === "findFirstOrThrow" ||
+          operation === "count" ||
+          operation === "aggregate" ||
+          operation === "groupBy"
         ) {
           a.where = mergeWhereWithTenant(a.where, field, tenantId);
           return query(a);
         }
 
+        // ✅ Mutaciones con where NO-unique
         if (operation === "updateMany" || operation === "deleteMany") {
           a.where = mergeWhereWithTenant(a.where, field, tenantId);
           return query(a);
         }
 
+        // ✅ Crea con tenant auto
         if (operation === "create") {
           a.data = addTenantToCreateData(a.data, field, tenantId);
           return query(a);
@@ -153,12 +176,14 @@ export const prisma: PrismaClient = basePrisma.$extends({
           return query(a);
         }
 
+        // ✅ IMPORTANTE: NO tocar where en upsert (puede ser unique compuesto)
         if (operation === "upsert") {
           a.create = addTenantToCreateData(a.create, field, tenantId);
-          a.where = mergeWhereWithTenant(a.where, field, tenantId);
           return query(a);
         }
 
+        // findUnique / update / delete:
+        // NO inyectamos tenant acá para no romper where unique.
         return query(args);
       },
     },

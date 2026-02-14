@@ -7,6 +7,9 @@ import crypto from "node:crypto";
 import path from "node:path";
 import fs from "node:fs/promises";
 
+import { signResetToken, buildResetLink } from "../../lib/authTokens.js";
+import { sendResetEmail } from "../../lib/mailer.js";
+
 import { prisma } from "../../lib/prisma.js";
 import { auditLog } from "../../lib/auditLogger.js";
 
@@ -22,9 +25,7 @@ import {
   filenameFromAnyUrl,
   isValidUserStatus,
   isValidOverrideEffect,
-  // isValidPin4 ❌ sacalo
 } from "./users.helpers.js";
-
 
 /* =========================
    Helpers internos
@@ -64,6 +65,26 @@ function mapRolesForTenant(tenantId: string, roles: any[] | undefined) {
     .map((ur) => ur.role)
     .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
     .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem }));
+}
+
+/* ✅ IP helper (proxy-friendly) */
+function getReqIp(req: Request) {
+  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim();
+  return xf || (req.socket?.remoteAddress ? String(req.socket.remoteAddress) : undefined);
+}
+
+/* ✅ Limpieza/higiene de tokens reset/invite */
+async function cleanupResetAuthTokens() {
+  try {
+    await prisma.authToken.deleteMany({
+      where: {
+        type: "reset",
+        OR: [{ expiresAt: { lt: new Date() } }, { usedAt: { not: null } }],
+      },
+    });
+  } catch {
+    // ignore
+  }
 }
 
 /* =========================
@@ -269,12 +290,12 @@ export async function createUser(req: Request, res: Response) {
     desiredStatus === "BLOCKED"
       ? UserStatus.BLOCKED
       : desiredStatus === "PENDING"
-        ? UserStatus.PENDING
-        : desiredStatus === "ACTIVE"
-          ? UserStatus.ACTIVE
-          : hasPassword
-            ? UserStatus.ACTIVE
-            : UserStatus.PENDING;
+      ? UserStatus.PENDING
+      : desiredStatus === "ACTIVE"
+      ? UserStatus.ACTIVE
+      : hasPassword
+      ? UserStatus.ACTIVE
+      : UserStatus.PENDING;
 
   const existing = await prisma.user.findFirst({
     where: { jewelryId: tenantId, email },
@@ -700,8 +721,7 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
     return res.status(400).json({ message: "warehouseId inválido." });
   }
 
-  const cleanId =
-    typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
+  const cleanId = typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
 
   if (cleanId === "") return res.status(400).json({ message: "warehouseId inválido." });
 
@@ -759,8 +779,7 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
     return res.status(400).json({ message: "warehouseId inválido." });
   }
 
-  const cleanId =
-    typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
+  const cleanId = typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
 
   if (cleanId === "") return res.status(400).json({ message: "warehouseId inválido." });
 
@@ -1057,4 +1076,95 @@ export async function softDeleteUser(req: Request, res: Response) {
   });
 
   return res.json({ ok: true });
+}
+
+/* =========================
+   INVITE (ADMIN) - single-use real
+   POST /users/:id/invite
+========================= */
+export async function sendUserInvite(req: Request, res: Response) {
+  const actorId = (req as any).userId as string;
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const targetUserId = String(req.params.id || "").trim();
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
+
+  const user = await prisma.user.findFirst({
+    where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
+    select: { id: true, email: true, status: true, jewelryId: true },
+  });
+
+  if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
+
+  // ✅ seguridad de negocio: invitación solo para PENDING (evita spam a activos / bloqueados)
+  if (user.status !== UserStatus.PENDING) {
+    auditLog(req, {
+      action: "users.invite_send",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId: user.id, email: user.email, status: user.status, reason: "not_pending" },
+    });
+    return res.status(400).json({ message: "La invitación solo está disponible para usuarios Pendiente." });
+  }
+
+  // higiene: limpiezas viejas
+  await cleanupResetAuthTokens();
+
+  const jti = crypto.randomUUID();
+  const resetToken = signResetToken(user.id, jti, "7d"); // invitación válida 7 días
+  const resetLink = buildResetLink(resetToken);
+
+  // ✅ single-use real: guardamos registro en DB con expiración (7 días)
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  try {
+    await prisma.authToken.create({
+      data: {
+        type: "reset",
+        jti,
+        userId: user.id,
+        expiresAt,
+        emailSnapshot: user.email,
+        ip: getReqIp(req),
+        userAgent: String(req.headers["user-agent"] || ""),
+      },
+      select: { id: true },
+    });
+  } catch {
+    auditLog(req, {
+      action: "users.invite_send",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId: user.id, email: user.email, status: user.status, jti, reason: "authtoken_create_failed" },
+    });
+    return res.status(500).json({ message: "No se pudo generar la invitación." });
+  }
+
+  try {
+    await sendResetEmail(user.email, resetLink);
+  } catch (e: any) {
+    auditLog(req, {
+      action: "users.invite_send",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId: user.id, email: user.email, status: user.status, jti, reason: "mailer_failed" },
+    });
+    return res.status(500).json({ message: e?.message || "No se pudo enviar la invitación." });
+  }
+
+  auditLog(req, {
+    action: "users.invite_send",
+    success: true,
+    userId: actorId,
+    tenantId,
+    meta: { targetUserId: user.id, email: user.email, status: user.status, jti },
+  });
+
+  // ✅ DEV: devolvemos link para test manual si querés (sin exponer en producción)
+  const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
+  return res.json(isDev ? { ok: true, devLink: resetLink } : { ok: true });
 }

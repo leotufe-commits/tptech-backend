@@ -10,24 +10,41 @@ import { prisma } from "../../lib/prisma.js";
 ========================================================= */
 const PROJECT_ROOT = process.cwd();
 
+// ✅ Permitimos SOLO dentro de esta carpeta
+const USER_ATTACHMENTS_DIR = path.join(PROJECT_ROOT, "uploads", "user-attachments");
+
 function contentDisposition(filename: string) {
   const safe = String(filename || "archivo").replace(/[\r\n"]/g, "").slice(0, 180);
   const enc = encodeURIComponent(safe);
   return `attachment; filename="${safe}"; filename*=UTF-8''${enc}`;
 }
 
-function resolveAbsFromUrl(url: string) {
+function ensureUnderDir(absPath: string, allowedDirAbs: string) {
+  const abs = path.resolve(absPath);
+  const root = path.resolve(allowedDirAbs);
+  // incluye igualdad exacta, y el caso con sep
+  if (abs === root) return true;
+  return abs.startsWith(root + path.sep);
+}
+
+/**
+ * ✅ Resuelve una URL relativa ("/uploads/user-attachments/xxx") a path absoluto
+ * PERO SOLO si está dentro de uploads/user-attachments.
+ */
+function resolveAbsFromAttachmentUrl(url: string) {
   const u = String(url || "").trim();
 
-  // si viniera http(s) no hacemos proxy acá
+  // si viniera http(s), no hacemos proxy
   if (/^https?:\/\//i.test(u)) return null;
 
+  // normaliza a path relativo desde PROJECT_ROOT
   const rel = u.replace(/^\/+/, ""); // saca "/" inicial
+  if (!rel) return null;
+
   const abs = path.resolve(PROJECT_ROOT, rel);
 
-  // evita traversal
-  const rootAbs = path.resolve(PROJECT_ROOT);
-  if (!abs.startsWith(rootAbs + path.sep) && abs !== rootAbs) return null;
+  // ✅ bloqueo fuerte: solo dentro de USER_ATTACHMENTS_DIR
+  if (!ensureUnderDir(abs, USER_ATTACHMENTS_DIR)) return null;
 
   return abs;
 }
@@ -42,12 +59,14 @@ function urlFromAbs(absPath: string) {
   const rootAbs = path.resolve(PROJECT_ROOT);
   const abs = path.resolve(absPath);
 
+  // ✅ Debe estar dentro de USER_ATTACHMENTS_DIR
+  if (!ensureUnderDir(abs, USER_ATTACHMENTS_DIR)) return "";
+
   if (abs.startsWith(rootAbs + path.sep)) {
     const rel = abs.slice(rootAbs.length + 1).replace(/\\/g, "/");
     return "/" + rel;
   }
 
-  // fallback (no debería pasar)
   return "";
 }
 
@@ -104,6 +123,9 @@ export async function uploadMyAttachments(req: Request, res: Response) {
       const abs = f.path ? path.resolve(String(f.path)) : "";
       const url = abs ? urlFromAbs(abs) : "";
 
+      // ✅ si no pudimos construir una URL válida dentro de uploads/user-attachments, cortamos
+      if (!url) return res.status(500).json({ message: "Error interno: ruta de archivo inválida." });
+
       const row = await prisma.userAttachment.create({
         data: {
           userId: myId,
@@ -147,6 +169,8 @@ export async function uploadUserAttachments(req: Request, res: Response) {
     for (const f of files) {
       const abs = f.path ? path.resolve(String(f.path)) : "";
       const url = abs ? urlFromAbs(abs) : "";
+
+      if (!url) return res.status(500).json({ message: "Error interno: ruta de archivo inválida." });
 
       const row = await prisma.userAttachment.create({
         data: {
@@ -195,7 +219,7 @@ export async function deleteUserAttachment(req: Request, res: Response) {
 
     // intenta borrar el archivo físico
     try {
-      const abs = resolveAbsFromUrl(att.url);
+      const abs = resolveAbsFromAttachmentUrl(att.url);
       if (abs && fs.existsSync(abs)) fs.unlinkSync(abs);
     } catch {
       // no-op
@@ -230,7 +254,7 @@ export async function downloadUserAttachment(req: Request, res: Response) {
     });
     if (!att) return res.status(404).json({ message: "Adjunto no encontrado." });
 
-    const abs = resolveAbsFromUrl(att.url);
+    const abs = resolveAbsFromAttachmentUrl(att.url);
     if (!abs) return res.status(400).json({ message: "Ruta de archivo inválida." });
     if (!fs.existsSync(abs)) return res.status(404).json({ message: "Archivo no encontrado en el servidor." });
 

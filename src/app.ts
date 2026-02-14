@@ -1,3 +1,4 @@
+// tptech-backend/src/app.ts
 import express from "express";
 import cookieParser from "cookie-parser";
 import path from "node:path";
@@ -8,6 +9,9 @@ import { perfLogger } from "./middlewares/perfLogger.js";
 import { errorHandler } from "./middlewares/errorHandler.js";
 import { buildCorsMiddleware } from "./config/cors.js";
 import { buildHelmetMiddleware, buildRateLimitMiddleware } from "./config/security.js";
+
+// ✅ NEW: Mail Preview route (DEV)
+import { registerMailPreviewRoute } from "./lib/mail.service.js";
 
 export function createApp() {
   const app = express();
@@ -63,6 +67,11 @@ export function createApp() {
   app.get("/", (_req, res) => {
     res.status(200).send("TPTech Backend OK 🚀");
   });
+
+  // 🔵 Mail Preview (solo dev / staging)
+  if (process.env.MAIL_MODE !== "production") {
+    registerMailPreviewRoute(app);
+  }
 
   // Error handler
   app.use(errorHandler);
