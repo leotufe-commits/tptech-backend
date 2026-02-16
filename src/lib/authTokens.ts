@@ -1,16 +1,28 @@
 // tptech-backend/src/lib/authTokens.ts
 import jwt from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
+function mustEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`❌ ${name} no está configurado`);
+  return v;
+}
 
+const JWT_SECRET = mustEnv("JWT_SECRET");
 export const JWT_SECRET_SAFE: string = JWT_SECRET;
 
 export const APP_URL = process.env.APP_URL || "http://localhost:5173";
 export const JWT_ISSUER = process.env.JWT_ISSUER || "tptech";
 export const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "tptech-web";
 
-export function signResetToken(userId: string, jti: string, expiresIn: string) {
+/**
+ * ✅ expiresIn ahora usa el tipo correcto de jsonwebtoken
+ * (evita TS2769 con @types/jsonwebtoken nuevos)
+ */
+export function signResetToken(
+  userId: string,
+  jti: string,
+  expiresIn: jwt.SignOptions["expiresIn"]
+) {
   return jwt.sign({ sub: userId, type: "reset", jti }, JWT_SECRET_SAFE, {
     expiresIn,
     issuer: JWT_ISSUER,

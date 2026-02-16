@@ -1,7 +1,7 @@
 // tptech-backend/src/lib/mail.provider.postmark.ts
-import type { SendMailOptions } from "./mail.service";
+import type { SendMailOptions } from "./mail.service.js";
 
-function mustEnv(name: string) {
+function mustEnv(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`[MAIL] Missing env ${name}`);
   return v;
@@ -37,17 +37,18 @@ export async function postmarkSendMail(options: SendMailOptions) {
     body: JSON.stringify(payload),
   });
 
-  const data = await res.json().catch(() => ({} as any));
+  const data: any = await res.json().catch(() => ({}));
 
   if (!res.ok) {
     const msg =
       data?.Message || data?.ErrorCode
         ? `${data?.Message || "Postmark error"} (code ${data?.ErrorCode})`
         : `Postmark HTTP ${res.status}`;
+
     throw new Error(`[MAIL] ${msg}`);
   }
 
-  return data;
+  return data; // MessageID, To, SubmittedAt, etc.
 }
 
 // ✅ opcional por compatibilidad

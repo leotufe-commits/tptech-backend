@@ -1,8 +1,10 @@
+// tptech-backend/src/controllers/storage.controller.ts
 import type { Request, Response } from "express";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-import { r2, R2_BUCKET, R2_PUBLIC_BASE_URL } from "../lib/storage/r2";
+// ✅ FIX TS2835: agregar .js en imports relativos (node16/nodenext)
+import { r2, R2_BUCKET, R2_PUBLIC_BASE_URL } from "../lib/storage/r2.js";
 import { buildObjectKey } from "../lib/storage/keys.js";
 
 function s(v: any) {
@@ -34,7 +36,9 @@ export async function signUpload(req: Request, res: Response) {
 
   if (!kind) return res.status(400).json({ message: "kind requerido" });
   if (!mime) return res.status(400).json({ message: "mime requerido" });
-  if (!Number.isFinite(size) || size <= 0) return res.status(400).json({ message: "size inválido" });
+  if (!Number.isFinite(size) || size <= 0) {
+    return res.status(400).json({ message: "size inválido" });
+  }
 
   const MAX_IMAGE = 8 * 1024 * 1024;
   const MAX_FILE = 30 * 1024 * 1024;
@@ -44,9 +48,17 @@ export async function signUpload(req: Request, res: Response) {
   const isImage = mime.startsWith("image/");
   const isPdf = mime === "application/pdf";
 
-  if (isImage && size > MAX_IMAGE) return res.status(400).json({ message: "Imagen demasiado grande (máx 8MB)" });
-  if (isVideo && size > MAX_VIDEO) return res.status(400).json({ message: "Video demasiado grande (máx 200MB)" });
-  if (!isVideo && !isImage && !isPdf && size > MAX_FILE) return res.status(400).json({ message: "Archivo demasiado grande (máx 30MB)" });
+  if (isImage && size > MAX_IMAGE) {
+    return res.status(400).json({ message: "Imagen demasiado grande (máx 8MB)" });
+  }
+
+  if (isVideo && size > MAX_VIDEO) {
+    return res.status(400).json({ message: "Video demasiado grande (máx 200MB)" });
+  }
+
+  if (!isVideo && !isImage && !isPdf && size > MAX_FILE) {
+    return res.status(400).json({ message: "Archivo demasiado grande (máx 30MB)" });
+  }
 
   const ext = guessExtFromMime(mime);
 
@@ -77,5 +89,4 @@ export async function signUpload(req: Request, res: Response) {
   });
 }
 
-// ✅ CLAVE: para que también exista "default"
 export default signUpload;
