@@ -2,8 +2,8 @@
 import type { Request, Response } from "express";
 import crypto from "node:crypto";
 
-// ✅ IMPORT CORRECTO (mismo folder, sin .js)
-import { postmarkSendMail } from "./mail.provider.postmark";
+// ✅ ESM + node16/nodenext: imports relativos con extensión .js
+import { postmarkSendMail } from "./mail.provider.postmark.js";
 
 export type SendMailOptions = {
   to: string;
@@ -13,7 +13,7 @@ export type SendMailOptions = {
   from?: string;
 };
 
-const MAIL_MODE = (process.env.MAIL_MODE || "preview").toLowerCase(); // preview | console | production
+const MAIL_MODE = String(process.env.MAIL_MODE || "preview").toLowerCase(); // preview | console | production
 
 const previewStore = new Map<
   string,
