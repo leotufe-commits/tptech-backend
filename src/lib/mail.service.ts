@@ -1,5 +1,9 @@
+// tptech-backend/src/lib/mail.service.ts
 import type { Request, Response } from "express";
 import crypto from "node:crypto";
+
+// ✅ IMPORT CORRECTO (mismo folder, sin .js)
+import { postmarkSendMail } from "./mail.provider.postmark";
 
 export type SendMailOptions = {
   to: string;
@@ -9,9 +13,8 @@ export type SendMailOptions = {
   from?: string;
 };
 
-const MAIL_MODE = process.env.MAIL_MODE || "preview"; // preview | console | production
+const MAIL_MODE = (process.env.MAIL_MODE || "preview").toLowerCase(); // preview | console | production
 
-// Preview store (memoria). Suficiente para dev.
 const previewStore = new Map<
   string,
   { subject: string; html: string; text?: string; to: string; from?: string; createdAt: number }
@@ -24,7 +27,6 @@ export async function sendMail(options: SendMailOptions) {
     const id = crypto.randomUUID();
     previewStore.set(id, { subject, html, text, to, from, createdAt: Date.now() });
 
-    // Te dejamos una URL fácil de abrir
     console.log("📧 [MAIL PREVIEW] Subject:", subject);
     console.log("👉 Preview URL:", `/dev/mail/${id}`);
     return { previewId: id };
@@ -37,11 +39,22 @@ export async function sendMail(options: SendMailOptions) {
     return;
   }
 
-  // production lo conectamos a Postmark cuando esté aprobado
   if (MAIL_MODE === "production") {
-    console.log("🚀 [MAIL] Production mode todavía no conectado (Postmark pendiente).");
+    // ✅ Postmark real (cuando tengas token)
+    await postmarkSendMail({
+      to,
+      from: from || process.env.MAIL_FROM || "no-reply@tptech.local",
+      subject,
+      html,
+      text,
+    });
     return;
   }
+
+  // fallback
+  console.log("⚠️ [MAIL] MAIL_MODE inválido, usando console");
+  console.log({ to, from, subject });
+  console.log(text || "");
 }
 
 export function registerMailPreviewRoute(app: any) {
@@ -71,7 +84,6 @@ export function registerMailPreviewRoute(app: any) {
   });
 }
 
-// helper simple para evitar HTML injection en la cabecera del preview
 function escapeHtml(s: string) {
   return String(s || "")
     .replaceAll("&", "&amp;")

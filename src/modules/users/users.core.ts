@@ -9,6 +9,7 @@ import fs from "node:fs/promises";
 
 import { signResetToken, buildResetLink } from "../../lib/authTokens.js";
 import { sendResetEmail } from "../../lib/mailer.js";
+import { createAuthTokenRecord } from "../../lib/authTokenStore.js";
 
 import { prisma } from "../../lib/prisma.js";
 import { auditLog } from "../../lib/auditLogger.js";
@@ -65,26 +66,6 @@ function mapRolesForTenant(tenantId: string, roles: any[] | undefined) {
     .map((ur) => ur.role)
     .filter((r) => r && r.jewelryId === tenantId && !r.deletedAt)
     .map((r) => ({ id: r.id, name: r.name, isSystem: r.isSystem }));
-}
-
-/* ✅ IP helper (proxy-friendly) */
-function getReqIp(req: Request) {
-  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim();
-  return xf || (req.socket?.remoteAddress ? String(req.socket.remoteAddress) : undefined);
-}
-
-/* ✅ Limpieza/higiene de tokens reset/invite */
-async function cleanupResetAuthTokens() {
-  try {
-    await prisma.authToken.deleteMany({
-      where: {
-        type: "reset",
-        OR: [{ expiresAt: { lt: new Date() } }, { usedAt: { not: null } }],
-      },
-    });
-  } catch {
-    // ignore
-  }
 }
 
 /* =========================
@@ -324,7 +305,9 @@ export async function createUser(req: Request, res: Response) {
     }
   }
 
-  const passwordHash = hasPassword ? await bcrypt.hash(String(body.password), 10) : await randomPasswordHash();
+  const passwordHash = hasPassword
+    ? await bcrypt.hash(String(body.password), 10)
+    : await randomPasswordHash();
 
   const created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const user = await tx.user.create({
@@ -721,7 +704,8 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
     return res.status(400).json({ message: "warehouseId inválido." });
   }
 
-  const cleanId = typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
+  const cleanId =
+    typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
 
   if (cleanId === "") return res.status(400).json({ message: "warehouseId inválido." });
 
@@ -779,7 +763,8 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
     return res.status(400).json({ message: "warehouseId inválido." });
   }
 
-  const cleanId = typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
+  const cleanId =
+    typeof warehouseId === "string" ? warehouseId.trim() : warehouseId === null ? null : undefined;
 
   if (cleanId === "") return res.status(400).json({ message: "warehouseId inválido." });
 
@@ -1109,9 +1094,6 @@ export async function sendUserInvite(req: Request, res: Response) {
     return res.status(400).json({ message: "La invitación solo está disponible para usuarios Pendiente." });
   }
 
-  // higiene: limpiezas viejas
-  await cleanupResetAuthTokens();
-
   const jti = crypto.randomUUID();
   const resetToken = signResetToken(user.id, jti, "7d"); // invitación válida 7 días
   const resetLink = buildResetLink(resetToken);
@@ -1120,17 +1102,13 @@ export async function sendUserInvite(req: Request, res: Response) {
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   try {
-    await prisma.authToken.create({
-      data: {
-        type: "reset",
-        jti,
-        userId: user.id,
-        expiresAt,
-        emailSnapshot: user.email,
-        ip: getReqIp(req),
-        userAgent: String(req.headers["user-agent"] || ""),
-      },
-      select: { id: true },
+    await createAuthTokenRecord({
+      type: "reset",
+      userId: user.id,
+      jti,
+      expiresAt,
+      emailSnapshot: user.email,
+      req,
     });
   } catch {
     auditLog(req, {
@@ -1138,7 +1116,13 @@ export async function sendUserInvite(req: Request, res: Response) {
       success: false,
       userId: actorId,
       tenantId,
-      meta: { targetUserId: user.id, email: user.email, status: user.status, jti, reason: "authtoken_create_failed" },
+      meta: {
+        targetUserId: user.id,
+        email: user.email,
+        status: user.status,
+        jti,
+        reason: "authtoken_create_failed",
+      },
     });
     return res.status(500).json({ message: "No se pudo generar la invitación." });
   }

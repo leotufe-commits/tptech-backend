@@ -1,3 +1,5 @@
+// prisma/schema.prisma
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -24,7 +26,6 @@ model Jewelry {
   postalCode   String
   country      String
 
-  // Datos fiscales / empresa
   logoUrl      String @default("")
   legalName    String @default("")
   cuit         String @default("")
@@ -33,7 +34,6 @@ model Jewelry {
   website      String @default("")
   notes        String @default("")
 
-  // ✅ Cambio rápido de usuario (PIN) dentro del sistema
   quickSwitchEnabled         Boolean @default(false)
   pinLockEnabled             Boolean @default(false)
   pinLockTimeoutSec          Int     @default(120)
@@ -42,13 +42,11 @@ model Jewelry {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  auditLogs   AuditLog[]
-  roles       Role[]
-  users       User[]
-  warehouses  Warehouse[]
-  attachments JewelryAttachment[]
-
-  // ✅ Catálogos administrables (relación inversa)
+  auditLogs    AuditLog[]
+  roles        Role[]
+  users        User[]
+  warehouses   Warehouse[]
+  attachments  JewelryAttachment[]
   catalogItems CatalogItem[]
 
   @@index([createdAt])
@@ -108,13 +106,9 @@ model User {
   avatarUrl String?
   jewelryId String
 
-  // ⭐ ALMACÉN FAVORITO
   favoriteWarehouseId String?
+  deletedAt           DateTime?
 
-  // ✅ SOFT DELETE
-  deletedAt DateTime?
-
-  // Datos personales
   phoneCountry   String @default("")
   phoneNumber    String @default("")
   documentType   String @default("")
@@ -127,7 +121,6 @@ model User {
   country        String @default("")
   notes          String @default("")
 
-  // ✅ CLAVE RÁPIDA (PIN)
   quickPinHash        String?
   quickPinEnabled     Boolean   @default(false)
   quickPinUpdatedAt   DateTime?
@@ -137,7 +130,6 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // Relaciones
   jewelry           Jewelry    @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
   favoriteWarehouse Warehouse? @relation("UserFavoriteWarehouse", fields: [favoriteWarehouseId], references: [id])
 
@@ -146,7 +138,6 @@ model User {
   attachments         UserAttachment[]
   auditLogs           AuditLog[]
 
-  // ✅ NUEVO: tokens (reset/invite) single-use
   authTokens AuthToken[]
 
   @@unique([jewelryId, email])
@@ -156,24 +147,6 @@ model User {
   @@index([jewelryId, deletedAt])
   @@index([quickPinUpdatedAt])
   @@index([quickPinEnabled])
-}
-
-//////////////////////////////
-// ✅ AUTH TOKENS (RESET / INVITE) - single-use
-//////////////////////////////
-model AuthToken {
-  id        String   @id @default(cuid())
-  userId    String
-  purpose   String   // "RESET" | "INVITE"
-  jti       String   @unique
-  expiresAt DateTime
-  usedAt    DateTime?
-  createdAt DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, purpose])
-  @@index([expiresAt])
 }
 
 //////////////////////////////
@@ -193,6 +166,31 @@ model UserAttachment {
 
   @@index([userId])
   @@index([createdAt])
+}
+
+//////////////////////////////
+// AUTH TOKENS
+//////////////////////////////
+model AuthToken {
+  id   String @id @default(cuid())
+  type String @default("reset")
+  jti  String @unique
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  emailSnapshot String  @default("")
+  ip            String?
+  userAgent     String?
+
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([type, expiresAt])
+  @@index([usedAt])
 }
 
 //////////////////////////////
@@ -333,7 +331,7 @@ enum OverrideEffect {
 }
 
 //////////////////////////////
-// CATÁLOGOS (COMBOS ADMINISTRABLES)
+// CATÁLOGOS
 //////////////////////////////
 enum CatalogType {
   IVA_CONDITION
@@ -345,23 +343,21 @@ enum CatalogType {
 }
 
 model CatalogItem {
-  id        String      @id @default(cuid())
-  jewelryId String
-  type      CatalogType
-  label     String
-  isActive  Boolean     @default(true)
-  sortOrder Int         @default(0)
-
-  // ✅ NUEVO: favorito por tipo (1 por type)
-  isFavorite Boolean    @default(false)
+  id         String      @id @default(cuid())
+  jewelryId  String
+  type       CatalogType
+  label      String
+  isActive   Boolean     @default(true)
+  sortOrder  Int         @default(0)
+  isFavorite Boolean     @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   jewelry Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
 
+  @@unique([jewelryId, type, label])
   @@index([jewelryId])
   @@index([jewelryId, type, isActive])
-  @@index([jewelryId, type, isFavorite]) // opcional pero útil
-  @@unique([jewelryId, type, label])
+  @@index([jewelryId, type, isFavorite])
 }
