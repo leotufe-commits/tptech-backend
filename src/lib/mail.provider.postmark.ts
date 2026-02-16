@@ -14,11 +14,24 @@ export async function postmarkSendMail(options: SendMailOptions) {
   const defaultFrom = process.env.MAIL_FROM || "";
   const messageStream = process.env.POSTMARK_MESSAGE_STREAM || "outbound";
 
+  // 🔒 Validaciones preventivas
+  if (!options?.to) {
+    throw new Error("[MAIL] Missing recipient (options.to)");
+  }
+
+  if (!options?.subject) {
+    throw new Error("[MAIL] Missing subject");
+  }
+
+  if (!options?.html && !options?.text) {
+    throw new Error("[MAIL] Missing email body (html or text)");
+  }
+
   const payload = {
     From: options.from || defaultFrom,
     To: options.to,
     Subject: options.subject,
-    HtmlBody: options.html,
+    HtmlBody: options.html || undefined,
     TextBody: options.text || undefined,
     MessageStream: messageStream,
   };
@@ -27,19 +40,51 @@ export async function postmarkSendMail(options: SendMailOptions) {
     throw new Error("[MAIL] Missing From (set MAIL_FROM or pass options.from)");
   }
 
-  const res = await fetch("https://api.postmarkapp.com/email", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      "X-Postmark-Server-Token": token,
-    },
-    body: JSON.stringify(payload),
+  // 🧠 Log controlado
+  console.log("[MAIL] Sending via Postmark →", {
+    to: payload.To,
+    subject: payload.Subject,
+    stream: payload.MessageStream,
   });
+
+  // ⏱ Timeout de seguridad
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  let res: Response;
+
+  try {
+    res = await fetch("https://api.postmarkapp.com/email", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-Postmark-Server-Token": token,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    clearTimeout(timeout);
+
+    if (err?.name === "AbortError") {
+      throw new Error("[MAIL] Postmark request timeout");
+    }
+
+    throw new Error(`[MAIL] Network error: ${err?.message || err}`);
+  }
+
+  clearTimeout(timeout);
 
   const data: any = await res.json().catch(() => ({}));
 
   if (!res.ok) {
+    console.error("[MAIL] Postmark failed →", {
+      to: payload.To,
+      status: res.status,
+      response: data,
+    });
+
     const msg =
       data?.Message || data?.ErrorCode
         ? `${data?.Message || "Postmark error"} (code ${data?.ErrorCode})`
@@ -47,6 +92,11 @@ export async function postmarkSendMail(options: SendMailOptions) {
 
     throw new Error(`[MAIL] ${msg}`);
   }
+
+  console.log("[MAIL] Sent OK →", {
+    to: payload.To,
+    messageId: data?.MessageID,
+  });
 
   return data; // MessageID, To, SubmittedAt, etc.
 }
