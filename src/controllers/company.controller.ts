@@ -2,9 +2,13 @@
 import type { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { auditLog } from "../lib/auditLogger.js";
-import path from "node:path";
-import fs from "node:fs/promises";
 import fsSync from "node:fs";
+
+import {
+  toPublicUploadUrl,
+  absLocalUploadFromUrl,
+  safeDeleteLocalUploadByUrl,
+} from "../lib/uploads/localUploads.js";
 
 /* =========================
    HELPERS
@@ -22,70 +26,6 @@ function clampInt(v: any, def: number, min: number, max: number) {
   const n = Number(v);
   if (!Number.isFinite(n)) return def;
   return Math.max(min, Math.min(max, Math.trunc(n)));
-}
-
-function publicBaseUrl(req: Request) {
-  const envBase = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-  if (envBase) return envBase;
-  return `${req.protocol}://${req.get("host")}`;
-}
-
-function toPublicUrlFromReq(req: Request, relativePath: string) {
-  const base = publicBaseUrl(req);
-  const p = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
-  return `${base}${p}`;
-}
-
-function filenameFromAnyUrl(u: string) {
-  try {
-    if (u.startsWith("http://") || u.startsWith("https://")) {
-      const url = new URL(u);
-      return decodeURIComponent(url.pathname.split("/").pop() || "");
-    }
-  } catch {
-    // ignore
-  }
-  const parts = String(u || "").split("/");
-  return decodeURIComponent(parts[parts.length - 1] || "");
-}
-
-async function safeDeleteLocalJewelryFileByUrl(url: string | null) {
-  if (!url) return;
-
-  const s = String(url || "");
-  // ✅ solo archivos subidos localmente por este backend
-  if (!s.includes("/uploads/jewelry/")) return;
-
-  const filename = filenameFromAnyUrl(s);
-  if (!filename) return;
-
-  const safeName = path.basename(filename);
-  if (!safeName) return;
-
-  const abs = path.join(process.cwd(), "uploads", "jewelry", safeName);
-
-  try {
-    await fs.unlink(abs);
-  } catch {
-    // ignore
-  }
-}
-
-/**
- * Convierte una url pública local (…/uploads/jewelry/FILE) en path absoluto.
- * Devuelve null si no parece un archivo local del backend.
- */
-function absLocalJewelryFileFromUrl(url: string) {
-  const s = String(url || "");
-  if (!s.includes("/uploads/jewelry/")) return null;
-
-  const filename = filenameFromAnyUrl(s);
-  if (!filename) return null;
-
-  const safeName = path.basename(filename);
-  if (!safeName) return null;
-
-  return path.join(process.cwd(), "uploads", "jewelry", safeName);
 }
 
 /* =========================
@@ -232,8 +172,8 @@ export async function uploadCompanyLogo(req: Request, res: Response) {
 
   if (!prev) return res.status(404).json({ message: "Joyería no encontrada." });
 
-  const rel = `/uploads/jewelry/${logoFile.filename}`;
-  const logoUrl = toPublicUrlFromReq(req, rel);
+  // ✅ NUEVO: logos van a /uploads/jewelry/logos/...
+  const logoUrl = toPublicUploadUrl(req, "jewelry/logos", logoFile.filename);
 
   const updated = await prisma.jewelry.update({
     where: { id: tenantId },
@@ -241,8 +181,8 @@ export async function uploadCompanyLogo(req: Request, res: Response) {
     select: { id: true, logoUrl: true },
   });
 
-  // borrar el anterior si era local
-  await safeDeleteLocalJewelryFileByUrl(prev.logoUrl);
+  // ✅ borrar anterior si era local y era logo
+  await safeDeleteLocalUploadByUrl(prev.logoUrl, "jewelry/logos");
 
   auditLog(req, {
     action: "company.logo.upload",
@@ -257,8 +197,6 @@ export async function uploadCompanyLogo(req: Request, res: Response) {
 
 /* =========================
    ✅ DELETE /company/logo
-   - setea logoUrl = ""
-   - borra archivo anterior si era local
 ========================= */
 export async function deleteCompanyLogo(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -279,8 +217,7 @@ export async function deleteCompanyLogo(req: Request, res: Response) {
     select: { id: true, logoUrl: true },
   });
 
-  // borrar el anterior si era local
-  await safeDeleteLocalJewelryFileByUrl(prev.logoUrl);
+  await safeDeleteLocalUploadByUrl(prev.logoUrl, "jewelry/logos");
 
   auditLog(req, {
     action: "company.logo.delete",
@@ -296,7 +233,6 @@ export async function deleteCompanyLogo(req: Request, res: Response) {
 /* =========================
    ✅ PUT /company/attachments
    multipart fields: attachments | attachments[]
-   - usa uploadJewelryFiles middleware
 ========================= */
 export async function uploadCompanyAttachments(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -319,18 +255,15 @@ export async function uploadCompanyAttachments(req: Request, res: Response) {
     return res.status(400).json({ message: "No se recibieron archivos (field: attachments)." });
   }
 
-  // persistir en DB
   const created = await prisma.jewelryAttachment.createMany({
-    data: files.map((f) => {
-      const rel = `/uploads/jewelry/${f.filename}`;
-      return {
-        jewelryId: tenantId,
-        url: toPublicUrlFromReq(req, rel),
-        filename: f.originalname || f.filename,
-        mimeType: f.mimetype || "application/octet-stream",
-        size: typeof f.size === "number" ? f.size : 0,
-      };
-    }),
+    data: files.map((f) => ({
+      jewelryId: tenantId,
+      // ✅ NUEVO: adjuntos van a /uploads/jewelry/attachments/...
+      url: toPublicUploadUrl(req, "jewelry/attachments", f.filename),
+      filename: f.originalname || f.filename,
+      mimeType: f.mimetype || "application/octet-stream",
+      size: typeof f.size === "number" ? f.size : 0,
+    })),
     skipDuplicates: true,
   });
 
@@ -353,9 +286,7 @@ export async function uploadCompanyAttachments(req: Request, res: Response) {
 
 /* =========================
    ✅ GET /company/attachments/:attachmentId/download
-   - fuerza descarga (Content-Disposition)
-   - valida tenant
-   - soporta: URL externa -> redirect, URL local -> stream
+   - sirve archivo si está en /uploads/...
 ========================= */
 export async function downloadCompanyAttachment(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -373,60 +304,13 @@ export async function downloadCompanyAttachment(req: Request, res: Response) {
 
   if (!att) return res.status(404).json({ message: "Adjunto no encontrado." });
 
-  // Si algún día guardás URLs externas reales: redirect.
-  if (att.url.startsWith("http://") || att.url.startsWith("https://")) {
-    const abs = absLocalJewelryFileFromUrl(att.url);
-
-    // URL externa real (no local del backend)
-    if (!abs) {
-      auditLog(req, {
-        action: "company.attachments.download",
-        success: true,
-        userId: actorId,
-        tenantId,
-        meta: { attachmentId, mode: "redirect" },
-      });
-      return res.redirect(att.url);
-    }
-
-    // URL pública local -> servir archivo local
-    if (!fsSync.existsSync(abs)) {
-      return res.status(404).json({ message: "Archivo no encontrado en disco." });
-    }
-
-    res.setHeader("Content-Type", att.mimeType || "application/octet-stream");
-    res.setHeader("Content-Length", String(att.size || fsSync.statSync(abs).size));
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${encodeURIComponent(att.filename || "archivo")}"`
-    );
-
-    auditLog(req, {
-      action: "company.attachments.download",
-      success: true,
-      userId: actorId,
-      tenantId,
-      meta: { attachmentId, mode: "local" },
-    });
-
-    return fsSync.createReadStream(abs).pipe(res);
-  }
-
-  // Robustez por si algún día guardás path relativo en vez de URL
-  const abs = absLocalJewelryFileFromUrl(att.url);
-  if (!abs) {
-    return res.status(400).json({ message: "URL de adjunto inválida." });
-  }
-  if (!fsSync.existsSync(abs)) {
-    return res.status(404).json({ message: "Archivo no encontrado en disco." });
-  }
+  const abs = absLocalUploadFromUrl(att.url);
+  if (!abs) return res.status(400).json({ message: "URL de adjunto inválida." });
+  if (!fsSync.existsSync(abs)) return res.status(404).json({ message: "Archivo no encontrado en disco." });
 
   res.setHeader("Content-Type", att.mimeType || "application/octet-stream");
   res.setHeader("Content-Length", String(att.size || fsSync.statSync(abs).size));
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${encodeURIComponent(att.filename || "archivo")}"`
-  );
+  res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(att.filename || "archivo")}"`);
 
   auditLog(req, {
     action: "company.attachments.download",
@@ -460,7 +344,7 @@ export async function deleteCompanyAttachment(req: Request, res: Response) {
 
   await prisma.jewelryAttachment.delete({ where: { id: att.id } });
 
-  await safeDeleteLocalJewelryFileByUrl(att.url);
+  await safeDeleteLocalUploadByUrl(att.url, "jewelry/attachments");
 
   auditLog(req, {
     action: "company.attachments.delete",

@@ -2,7 +2,8 @@ import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
 
-const UPLOAD_DIR = path.join(process.cwd(), "uploads", "avatars");
+const UPLOAD_ROOT = path.join(process.cwd(), "uploads");
+const UPLOAD_DIR = path.join(UPLOAD_ROOT, "users", "avatars");
 
 function ensureDir() {
   if (!fs.existsSync(UPLOAD_DIR)) {
