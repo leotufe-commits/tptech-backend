@@ -70,8 +70,6 @@ function mapRolesForTenant(tenantId: string, roles: any[] | undefined) {
 
 /* =========================
    GET /users
-   paginado + search
-   incluye attachmentsCount + overridesCount
 ========================= */
 export async function listUsers(req: Request, res: Response) {
   const tenantId = requireTenantId(req, res);
@@ -220,7 +218,8 @@ export async function getUser(req: Request, res: Response) {
       },
 
       attachments: {
-        select: { id: true, url: true, filename: true, mimeType: true, size: true, createdAt: true },
+        select: { id: true, url: true, filename: true, mimeType: true, size: true, createdAt: true, deletedAt: true },
+        where: { deletedAt: null },
         orderBy: { createdAt: "desc" },
       },
     },
@@ -283,6 +282,7 @@ export async function createUser(req: Request, res: Response) {
     select: { id: true, deletedAt: true },
   });
 
+  // ✅ Si existe "vivo" => conflicto
   if (existing && existing.deletedAt == null) {
     auditLog(req, {
       action: "users.create",
@@ -292,6 +292,18 @@ export async function createUser(req: Request, res: Response) {
       meta: { email, reason: "email_already_exists" },
     });
     return res.status(409).json({ message: "El email ya está registrado." });
+  }
+
+  // ✅ Si existe "borrado", lo más seguro es pedir restaurar (evita choques del unique si quedó viejo)
+  if (existing && existing.deletedAt != null) {
+    auditLog(req, {
+      action: "users.create",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { email, reason: "email_soft_deleted_exists" },
+    });
+    return res.status(409).json({ message: "Ese email pertenece a un usuario eliminado. Restauralo en vez de crearlo de nuevo." });
   }
 
   if (roleIds.length) {
@@ -691,7 +703,6 @@ export async function removeUserOverride(req: Request, res: Response) {
 
 /* =========================
    ⭐ FAVORITE WAREHOUSE (ME)
-   PATCH /users/me/favorite-warehouse
 ========================= */
 export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -711,7 +722,7 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
 
   if (cleanId) {
     const wh = await prisma.warehouse.findFirst({
-      where: { id: cleanId, jewelryId: tenantId, isActive: true },
+      where: { id: cleanId, jewelryId: tenantId, isActive: true, deletedAt: null },
       select: { id: true },
     });
     if (!wh) {
@@ -747,7 +758,6 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
 
 /* =========================
    ⭐ FAVORITE WAREHOUSE (ADMIN)
-   PATCH /users/:id/favorite-warehouse
 ========================= */
 export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -776,7 +786,7 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
 
   if (cleanId) {
     const wh = await prisma.warehouse.findFirst({
-      where: { id: cleanId, jewelryId: tenantId, isActive: true },
+      where: { id: cleanId, jewelryId: tenantId, isActive: true, deletedAt: null },
       select: { id: true },
     });
     if (!wh) {
@@ -812,8 +822,6 @@ export async function updateUserFavoriteWarehouse(req: Request, res: Response) {
 
 /* =========================
    AVATAR (ME)
-   PUT /users/me/avatar
-   DELETE /users/me/avatar
 ========================= */
 export async function updateMyAvatar(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -901,8 +909,6 @@ export async function removeMyAvatar(req: Request, res: Response) {
 
 /* =========================
    AVATAR (ADMIN)
-   PUT /users/:id/avatar
-   DELETE /users/:id/avatar
 ========================= */
 export async function updateUserAvatarForUser(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -1022,13 +1028,21 @@ export async function softDeleteUser(req: Request, res: Response) {
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
 
   const now = new Date();
+
+  // ✅ opcional: liberar email para poder crear otro usuario con el mismo email
   const suffix = crypto.randomBytes(6).toString("hex");
   const freedEmail = `deleted__${target.id}__${now.getTime()}__${suffix}@deleted.local`;
 
   await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Estos dos se pueden borrar porque son "vínculos / reglas", no datos de negocio
     await tx.userPermissionOverride.deleteMany({ where: { userId: targetUserId } });
     await tx.userRole.deleteMany({ where: { userId: targetUserId } });
-    await tx.userAttachment.deleteMany({ where: { userId: targetUserId } });
+
+    // ✅ Adjuntos: NO se borran, se marcan eliminados
+    await tx.userAttachment.updateMany({
+      where: { userId: targetUserId, deletedAt: null },
+      data: { deletedAt: now },
+    });
 
     await tx.user.update({
       where: { id: targetUserId },
@@ -1036,13 +1050,16 @@ export async function softDeleteUser(req: Request, res: Response) {
         deletedAt: now,
         status: UserStatus.BLOCKED,
         tokenVersion: { increment: 1 },
+
+        // limpiamos datos visibles
         avatarUrl: null,
         email: freedEmail,
         name: null,
 
+        // pin fuera
         quickPinHash: null,
         quickPinEnabled: false,
-        quickPinUpdatedAt: new Date(),
+        quickPinUpdatedAt: now,
         quickPinFailedCount: 0,
         quickPinLockedUntil: null,
       },
@@ -1064,8 +1081,7 @@ export async function softDeleteUser(req: Request, res: Response) {
 }
 
 /* =========================
-   INVITE (ADMIN) - single-use real
-   POST /users/:id/invite
+   INVITE (ADMIN)
 ========================= */
 export async function sendUserInvite(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
@@ -1082,7 +1098,6 @@ export async function sendUserInvite(req: Request, res: Response) {
 
   if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
 
-  // ✅ seguridad de negocio: invitación solo para PENDING (evita spam a activos / bloqueados)
   if (user.status !== UserStatus.PENDING) {
     auditLog(req, {
       action: "users.invite_send",
@@ -1095,10 +1110,9 @@ export async function sendUserInvite(req: Request, res: Response) {
   }
 
   const jti = crypto.randomUUID();
-  const resetToken = signResetToken(user.id, jti, "7d"); // invitación válida 7 días
+  const resetToken = signResetToken(user.id, jti, "7d");
   const resetLink = buildResetLink(resetToken);
 
-  // ✅ single-use real: guardamos registro en DB con expiración (7 días)
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   try {
@@ -1148,7 +1162,6 @@ export async function sendUserInvite(req: Request, res: Response) {
     meta: { targetUserId: user.id, email: user.email, status: user.status, jti },
   });
 
-  // ✅ DEV: devolvemos link para test manual si querés (sin exponer en producción)
   const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
   return res.json(isDev ? { ok: true, devLink: resetLink } : { ok: true });
 }

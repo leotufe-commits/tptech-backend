@@ -1,125 +1,112 @@
 // tptech-backend/src/lib/uploads/localUploads.ts
-import type { Request } from "express";
 import path from "node:path";
-import fs from "node:fs/promises";
-import fsSync from "node:fs";
+import fs from "node:fs";
+import type { Request } from "express";
+import { r2, R2_PUBLIC_BASE_URL, R2_ENDPOINT } from "../storage/r2.js";
 
-/**
- * Estructura esperada de uploads:
- * /uploads/<scope>/<file>
- *
- * Ejemplos:
- * - /uploads/jewelry/xxxx.png
- * - /uploads/users/avatars/xxxx.png
- * - /uploads/avatars/legacy.png   (compat)
- */
+function stripSlashes(s: string) {
+  return String(s || "").replace(/^\/+|\/+$/g, "");
+}
 
 function publicBaseUrl(req: Request) {
-  const envBase = String(process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-  if (envBase) return envBase;
-
-  return `${req.protocol}://${req.get("host")}`;
+  const envBase = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "");
+  return envBase || `${req.protocol}://${req.get("host")}`;
 }
 
-function filenameFromAnyUrl(u: string) {
-  try {
-    if (u.startsWith("http://") || u.startsWith("https://")) {
-      const url = new URL(u);
-      return decodeURIComponent(url.pathname.split("/").pop() || "");
-    }
-  } catch {
-    // ignore
-  }
-
-  const parts = String(u || "").split("/");
-  return decodeURIComponent(parts[parts.length - 1] || "");
-}
-
-function isLocalUploadsUrl(url: string) {
-  const s = String(url || "");
-  return s.includes("/uploads/");
+function normalizeBaseUrl(s: string) {
+  return String(s || "").trim().replace(/\/+$/g, "");
 }
 
 /**
- * Construye URL pública a partir de un archivo subido local.
- * scope:
- *  - "jewelry"
- *  - "users/avatars"
- *  - "avatars" (legacy)
+ * ✅ Regla “para siempre”:
+ * - si R2 está configurado (r2 existe) => tratamos uploads como R2
+ * - si no => tratamos uploads como local (/uploads)
  */
-export function toPublicUploadUrl(req: Request, scope: string, filename: string) {
-  const base = publicBaseUrl(req);
-  const cleanScope = String(scope || "").replace(/^\/+|\/+$/g, "");
-  const safeName = path.basename(String(filename || ""));
-  return `${base}/uploads/${cleanScope}/${encodeURIComponent(safeName)}`;
+function isR2Enabled() {
+  return Boolean(r2);
 }
 
 /**
- * Borra un archivo previo si:
- * - es URL local de este backend (/uploads/...)
- * - pertenece al scope indicado
+ * Intenta obtener un base público para R2.
+ * Preferencias:
+ * 1) R2_PUBLIC_BASE_URL (ideal: tu dominio/CDN)
+ * 2) R2_ENDPOINT (a veces sirve, depende cómo lo tengas publicado)
+ *
+ * Si no hay nada, devuelve "" y caemos a local.
  */
-export async function safeDeleteLocalUploadByUrl(
-  url: string | null,
-  scope: string
-) {
-  if (!url) return;
+function r2PublicBase() {
+  const b1 = normalizeBaseUrl(R2_PUBLIC_BASE_URL || "");
+  if (b1) return b1;
 
-  const s = String(url || "");
-  if (!isLocalUploadsUrl(s)) return;
+  const b2 = normalizeBaseUrl(R2_ENDPOINT || "");
+  if (b2) return b2;
 
-  const cleanScope = String(scope || "").replace(/^\/+|\/+$/g, "");
-  const expected = `/uploads/${cleanScope}/`;
-  if (!s.includes(expected)) return;
-
-  const filename = filenameFromAnyUrl(s);
-  if (!filename) return;
-
-  const safeName = path.basename(filename);
-  if (!safeName) return;
-
-  const abs = path.join(process.cwd(), "uploads", cleanScope, safeName);
-
-  try {
-    if (!fsSync.existsSync(abs)) return;
-    await fs.unlink(abs);
-  } catch {
-    // ignore
-  }
+  return "";
 }
 
 /**
- * Convierte una URL/ruta de /uploads/... a un path ABSOLUTO local.
- * Soporta:
- * - URL completa: https://dominio.com/uploads/jewelry/xxx.png
- * - Ruta: /uploads/jewelry/xxx.png
- * - Relativo: uploads/jewelry/xxx.png
+ * Convierte (folder + filename) a URL pública.
+ * - Si R2 está habilitado y hay base pública => usa R2
+ * - Si no => usa /uploads local
  */
-export function absLocalUploadFromUrl(urlOrPath: string) {
-  const s = String(urlOrPath || "").trim();
-  if (!s) return "";
+export function toPublicUploadUrl(req: Request, folder: string, filename: string) {
+  const f = stripSlashes(folder);
+  const name = String(filename || "").trim();
+  if (!name) return "";
 
-  if (path.isAbsolute(s)) return s;
+  if (isR2Enabled()) {
+    const base = r2PublicBase();
+    // Si está R2 pero no hay base pública, igual no rompemos: caemos a local
+    if (base) return `${base}/${encodeURI(f)}/${encodeURIComponent(name)}`;
+  }
 
-  let pathname = s;
+  return `${publicBaseUrl(req)}/uploads/${encodeURI(f)}/${encodeURIComponent(name)}`;
+}
+
+/**
+ * Solo para modo local: intenta traducir una URL /uploads/... a path absoluto.
+ * Si es R2 => null
+ */
+export function absLocalUploadFromUrl(url: string) {
+  const u = String(url || "").trim();
+  if (!u) return null;
+
+  // Si R2 está habilitado y la URL parece ser R2 (match con base pública), no es local
+  if (isR2Enabled()) {
+    const base = r2PublicBase();
+    if (base && u.startsWith(base)) return null;
+  }
+
+  // buscamos "/uploads/..."
+  const idx = u.indexOf("/uploads/");
+  if (idx === -1) return null;
+
+  const rel = u.slice(idx + "/uploads/".length);
+  const safeRel = rel.split("?")[0].split("#")[0];
+  const abs = path.join(process.cwd(), "uploads", safeRel);
+  return abs;
+}
+
+/**
+ * Borra un archivo local si:
+ * - la URL es local (no R2)
+ * - y matchea el prefixFolder esperado (para evitar borrar cualquier cosa)
+ */
+export async function safeDeleteLocalUploadByUrl(url: string | null | undefined, prefixFolder: string) {
+  const u = String(url || "").trim();
+  if (!u) return;
+
+  const abs = absLocalUploadFromUrl(u);
+  if (!abs) return;
+
+  const prefix = path.join(process.cwd(), "uploads", stripSlashes(prefixFolder)) + path.sep;
+
+  const normalized = path.normalize(abs);
+  if (!normalized.startsWith(prefix)) return;
 
   try {
-    if (s.startsWith("http://") || s.startsWith("https://")) {
-      pathname = new URL(s).pathname;
-    }
+    await fs.promises.unlink(normalized);
   } catch {
     // ignore
   }
-
-  pathname = pathname.replace(/\\/g, "/");
-
-  const marker = "/uploads/";
-  const idx = pathname.indexOf(marker);
-
-  const rel =
-    idx >= 0
-      ? pathname.slice(idx + marker.length)
-      : pathname.replace(/^\/+/, "").replace(/^uploads\/+/, "");
-
-  return path.join(process.cwd(), "uploads", rel);
 }

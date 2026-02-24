@@ -1,11 +1,13 @@
+// tptech-backend/src/modules/auth/auth.routes.ts
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { requireAuth } from "../../middlewares/requireAuth.js";
 import { validateBody } from "../../middlewares/validate.js";
 import { authLoginLimiter, authForgotLimiter, authResetLimiter } from "../../config/rateLimit.js";
 
-import * as Auth from "../../controllers/auth.base.controller.js";
-import * as Pin from "../../controllers/auth.pin.controller.js";
-import * as CompanyMe from "../../controllers/company.me.controller.js";
+// ✅ AHORA desde modules (no controllers)
+import * as Auth from "./auth.controller.js";
+import * as Pin from "./auth.pin.controller.js";
+import * as CompanyMe from "../company/company.controller.js";
 
 import {
   registerSchema,
@@ -98,14 +100,23 @@ router.delete(
 ========================= */
 
 router.post("/register", validateBody(registerSchema), safeMw((Auth as any).register));
+
+/**
+ * ✅ POST (oficial)
+ */
 router.post("/login/options", validateBody(loginOptionsSchema), safeMw((Auth as any).loginOptions));
 
-router.post(
-  "/login",
-  safeMw(authLoginLimiter),
-  validateBody(loginSchema),
-  safeMw((Auth as any).login)
-);
+/**
+ * ✅ GET (compat) -> para tu frontend actual que hace GET /api/auth/login/options?email=...
+ * Devuelve exactamente lo mismo que loginOptions.
+ */
+router.get("/login/options", (req, res) => {
+  const email = String((req.query as any)?.email ?? "").trim();
+  (req as any).body = { email };
+  return (Auth as any).loginOptions(req, res);
+});
+
+router.post("/login", safeMw(authLoginLimiter), validateBody(loginSchema), safeMw((Auth as any).login));
 
 router.post(
   "/forgot-password",
@@ -114,38 +125,18 @@ router.post(
   safeMw((Auth as any).forgotPassword)
 );
 
-router.post(
-  "/reset-password",
-  safeMw(authResetLimiter),
-  validateBody(resetSchema),
-  safeMw((Auth as any).resetPassword)
-);
+router.post("/reset-password", safeMw(authResetLimiter), validateBody(resetSchema), safeMw((Auth as any).resetPassword));
 
 /* =========================
    🔐 PIN / LOCK / QUICK SWITCH
 ========================= */
 
 router.post("/me/pin/set", requireAuth, validateBody(pinSetSchema), safeMw((Pin as any).setMyPin));
-router.post(
-  "/me/pin/disable",
-  requireAuth,
-  validateBody(pinDisableSchema),
-  safeMw((Pin as any).disableMyPin)
-);
-router.post(
-  "/me/pin/unlock",
-  requireAuth,
-  validateBody(pinUnlockSchema),
-  safeMw((Pin as any).unlockWithPin)
-);
+router.post("/me/pin/disable", requireAuth, validateBody(pinDisableSchema), safeMw((Pin as any).disableMyPin));
+router.post("/me/pin/unlock", requireAuth, validateBody(pinUnlockSchema), safeMw((Pin as any).unlockWithPin));
 
 router.get("/me/pin/quick-users", requireAuth, safeMw((Pin as any).quickUsers));
-router.post(
-  "/me/pin/switch",
-  requireAuth,
-  validateBody(pinSwitchSchema),
-  safeMw((Pin as any).switchUserWithPin)
-);
+router.post("/me/pin/switch", requireAuth, validateBody(pinSwitchSchema), safeMw((Pin as any).switchUserWithPin));
 
 router.patch(
   "/company/security/pin-lock",

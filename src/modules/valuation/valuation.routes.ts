@@ -4,77 +4,72 @@ import { Router } from "express";
 import { requireAuth } from "../../middlewares/requireAuth.js";
 import { requirePermission } from "../../middlewares/requirePermission.js";
 
-// ✅ IMPORT ROBUSTO: named exports
 import * as c from "./valuation.controller.js";
 
-const r = Router();
-
-r.use(requireAuth);
+const router = Router();
 
 /* =========================
-   Monedas (FX)
+   AUTH
 ========================= */
-
-r.get("/currencies", requirePermission("CURRENCIES", "VIEW"), c.getCurrencies);
-
-r.post("/currencies", requirePermission("CURRENCIES", "CREATE"), c.postCurrency);
-
-r.patch("/currencies/:currencyId", requirePermission("CURRENCIES", "EDIT"), c.patchCurrency);
-
-r.delete("/currencies/:currencyId", requirePermission("CURRENCIES", "DELETE"), c.deleteCurrency);
-
-r.post("/currencies/:currencyId/set-base", requirePermission("CURRENCIES", "ADMIN"), c.postSetBaseCurrency);
-
-r.patch("/currencies/:currencyId/active", requirePermission("CURRENCIES", "EDIT"), c.patchCurrencyActive);
-
-r.post("/currencies/:currencyId/rates", requirePermission("CURRENCIES", "CREATE"), c.postCurrencyRate);
-
-r.get("/currencies/:currencyId/rates", requirePermission("CURRENCIES", "VIEW"), c.getCurrencyRates);
-
-r.get("/currencies/:currencyId/history", requirePermission("CURRENCIES", "VIEW"), c.getCurrencyRateHistory);
+router.use(requireAuth);
 
 /* =========================
-   Metales / Divisas
+   PERMISSIONS (simple)
+   Ajustá si querés más fino después
 ========================= */
+const canView = requirePermission("CURRENCIES", "VIEW");
+const canEdit = requirePermission("CURRENCIES", "EDIT");
 
-r.get("/metals", requirePermission("CURRENCIES", "VIEW"), c.getMetals);
+/* =========================================================
+   MONEDAS (FX)
+========================================================= */
+router.get("/currencies", canView, c.getCurrencies);
+router.post("/currencies", canEdit, c.postCurrency);
+router.patch("/currencies/:currencyId", canEdit, c.patchCurrency);
+router.delete("/currencies/:currencyId", canEdit, c.deleteCurrency);
 
-r.post("/metals", requirePermission("CURRENCIES", "CREATE"), c.postMetal);
+router.post("/currencies/:currencyId/set-base", canEdit, c.postSetBaseCurrency);
+router.patch("/currencies/:currencyId/active", canEdit, c.patchCurrencyActive);
 
-r.patch("/metals/:metalId", requirePermission("CURRENCIES", "EDIT"), c.patchMetal);
+router.post("/currencies/:currencyId/rates", canEdit, c.postCurrencyRate);
+router.get("/currencies/:currencyId/rates", canView, c.getCurrencyRates);
+router.get("/currencies/:currencyId/rate-history", canView, c.getCurrencyRateHistory);
 
-r.delete("/metals/:metalId", requirePermission("CURRENCIES", "DELETE"), c.deleteMetal);
+/* =========================================================
+   METALES PADRES
+========================================================= */
+router.get("/metals", canView, c.getMetals);
+router.post("/metals", canEdit, c.postMetal);
+router.patch("/metals/:metalId", canEdit, c.patchMetal);
+router.delete("/metals/:metalId", canEdit, c.deleteMetal);
 
-r.patch("/metals/:metalId/active", requirePermission("CURRENCIES", "EDIT"), c.patchMetalActive);
+router.patch("/metals/:metalId/active", canEdit, c.patchMetalActive);
 
-r.post("/metals/:metalId/move", requirePermission("CURRENCIES", "EDIT"), c.postMoveMetal);
+/* =========================================================
+   ORDEN / HISTORIAL METALES
+========================================================= */
+router.post("/metals/:metalId/move", canEdit, c.postMoveMetal);
+router.get("/metals/:metalId/ref-history", canView, c.getMetalRefHistory);
 
-r.get("/metals/:metalId/ref-history", requirePermission("CURRENCIES", "VIEW"), c.getMetalRefHistory);
+/* =========================================================
+   VARIANTES
+========================================================= */
+router.post("/variants", canEdit, c.postMetalVariant);
+router.get("/metals/:metalId/variants", canView, c.getMetalVariants);
 
-/* =========================
-   Variantes
-========================= */
+router.patch("/variants/:variantId", canEdit, c.patchVariant);
+router.patch("/variants/:variantId/pricing", canEdit, c.patchVariantPricing);
+router.patch("/variants/:variantId/active", canEdit, c.patchVariantActive);
 
-r.post("/variants", requirePermission("CURRENCIES", "CREATE"), c.postMetalVariant);
+router.post("/variants/:variantId/set-favorite", canEdit, c.postSetFavoriteVariant);
+router.post("/metals/:metalId/clear-favorite", canEdit, c.postClearFavoriteVariant);
 
-r.get("/metals/:metalId/variants", requirePermission("CURRENCIES", "VIEW"), c.getMetalVariants);
+router.delete("/variants/:variantId", canEdit, c.deleteVariant);
 
-r.patch("/variants/:variantId/active", requirePermission("CURRENCIES", "EDIT"), c.patchVariantActive);
+/* =========================================================
+   COTIZACIONES (QUOTES)
+========================================================= */
+router.post("/quotes", canEdit, c.postMetalQuote);
+router.get("/variants/:variantId/quotes", canView, c.getMetalQuotes);
 
-r.post("/variants/:variantId/set-favorite", requirePermission("CURRENCIES", "ADMIN"), c.postSetFavoriteVariant);
-
-// ✅ Pricing (factor + override)
-r.patch("/variants/:variantId/pricing", requirePermission("CURRENCIES", "EDIT"), c.patchVariantPricing);
-
-// ✅ eliminar variante
-r.delete("/variants/:variantId", requirePermission("CURRENCIES", "DELETE"), c.deleteVariant);
-
-/* =========================
-   Cotizaciones Metales
-========================= */
-
-r.post("/quotes", requirePermission("CURRENCIES", "CREATE"), c.postMetalQuote);
-
-r.get("/variants/:variantId/quotes", requirePermission("CURRENCIES", "VIEW"), c.getMetalQuotes);
-
-export default r;
+export default router;

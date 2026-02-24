@@ -1,44 +1,47 @@
+// tptech-backend/src/modules/valuation/valuation.controller.ts
 import type { Request, Response } from "express";
 
 import { prisma } from "../../lib/prisma.js";
 import { requireTenantId } from "../users/users.helpers.js";
 import { auditLog } from "../../lib/auditLogger.js";
 
+// ✅ MONEDAS (mover a service específico)
 import {
   listCurrencies,
   createCurrency,
   updateCurrency,
+  deleteCurrency as deleteCurrencySvc,
   setBaseCurrencyAndRecalc,
   toggleCurrencyActive,
   addCurrencyRate,
   listCurrencyRates,
+} from "./valuation.currencies.service.js";
 
+// ✅ METALES PADRES (service específico)
+import {
   createMetal,
   listMetals,
-  toggleMetalActive,
   updateMetal,
   deleteMetal as deleteMetalSvc,
-
+  toggleMetalActive,
   moveMetal,
   listMetalRefHistory,
+} from "./valuation.metals.service.js";
 
+// ✅ VARIANTES (service específico)
+import {
   createMetalVariant,
   listMetalVariants,
+  updateMetalVariant,
   updateMetalVariantPricing,
   setFavoriteVariant,
-  toggleVariantActive,
-
-  deleteVariant as deleteVariantSvc,
-
-  addMetalQuote,
-  listMetalQuotes,
-
-  deleteCurrency as deleteCurrencySvc,
-
-  // ✅ NUEVO
-  updateMetalVariant,
   clearFavoriteVariant,
+  toggleVariantActive,
+  deleteMetalVariant as deleteVariantSvc,
 } from "./valuation.service.js";
+
+// ✅ COTIZACIONES (service específico)
+import { addMetalQuote, listMetalQuotes } from "./valuation.quotes.service.js";
 
 import {
   createCurrencySchema,
@@ -50,7 +53,7 @@ import {
 
   createMetalVariantSchema,
   updateMetalVariantPricingSchema,
-  updateMetalVariantSchema, // ✅ NUEVO
+  updateMetalVariantSchema,
   createMetalQuoteSchema,
 } from "./valuation.schemas.js";
 
@@ -187,7 +190,7 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
     });
 
     const row = await prisma.currency.findFirst({
-      where: { id: currencyId, jewelryId },
+      where: { id: currencyId, jewelryId, deletedAt: null },
       select: { id: true, code: true, name: true, symbol: true, isBase: true, isActive: true },
     });
 
@@ -276,7 +279,7 @@ export async function getCurrencyRateHistory(req: Request, res: Response) {
   const take = getTake(req, 80);
 
   const currency = await prisma.currency.findFirst({
-    where: { id: currencyId, jewelryId },
+    where: { id: currencyId, jewelryId, deletedAt: null },
     select: { id: true, code: true, name: true, symbol: true, isBase: true, isActive: true },
   });
   if (!currency) return res.status(404).json({ ok: false, error: "Moneda no encontrada." });
@@ -464,7 +467,7 @@ export async function getMetalRefHistory(req: Request, res: Response) {
 
   try {
     const metal = await prisma.metal.findFirst({
-      where: { id: metalId, jewelryId },
+      where: { id: metalId, jewelryId, deletedAt: null },
       select: { id: true, name: true, symbol: true, referenceValue: true, isActive: true, sortOrder: true },
     });
 
@@ -526,7 +529,6 @@ export async function getMetalVariants(req: Request, res: Response) {
   res.json({ ok: true, rows });
 }
 
-// ✅ NUEVO: editar variante (PATCH /variants/:variantId)
 export async function patchVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
   const userId = (req as any).user?.id ?? null;
@@ -564,8 +566,7 @@ export async function patchVariantPricing(req: Request, res: Response) {
   const parsed = updateMetalVariantPricingSchema.parse(req.body);
 
   try {
-    // ✅ NOTA: si tu service NO recibe actorUserId, sacá el 4to parámetro.
-    const row = await (updateMetalVariantPricing as any)(jewelryId, variantId, parsed, userId);
+    const row = await updateMetalVariantPricing(jewelryId, variantId, parsed);
 
     await auditLog(req, {
       action: "valuation.variant.pricing.update",
@@ -632,7 +633,6 @@ export async function postSetFavoriteVariant(req: Request, res: Response) {
   }
 }
 
-// ✅ NUEVO: limpiar favorito del metal (dejar sin favorito)
 export async function postClearFavoriteVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
   const userId = (req as any).user?.id ?? null;
@@ -728,15 +728,12 @@ export async function getMetalQuotes(req: Request, res: Response) {
 }
 
 /* =========================================================
-   ✅ Aliases para routes con import * as c
+   Aliases para routes con import * as c
 ========================================================= */
 export const deleteCurrency = deleteCurrencyCtrl;
 export const deleteMetal = deleteMetalCtrl;
 export const deleteVariant = deleteVariantCtrl;
 
-/* =========================================================
-   Default export (opcional)
-========================================================= */
 export default {
   getCurrencies,
   postCurrency,
@@ -759,11 +756,11 @@ export default {
 
   postMetalVariant,
   getMetalVariants,
-  patchVariant, // ✅ NUEVO
+  patchVariant,
   patchVariantPricing,
   patchVariantActive,
   postSetFavoriteVariant,
-  postClearFavoriteVariant, // ✅ NUEVO
+  postClearFavoriteVariant,
   deleteVariant: deleteVariantCtrl,
 
   postMetalQuote,

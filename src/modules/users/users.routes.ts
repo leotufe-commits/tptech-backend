@@ -3,26 +3,16 @@ import { Router } from "express";
 
 import { requireAuth } from "../../middlewares/requireAuth.js";
 import { requirePermission } from "../../middlewares/requirePermission.js";
-import { uploadAvatar } from "../../middlewares/uploadAvatar.js";
 
-// 👇 Módulos separados
+import { uploadAvatarMiddleware } from "../../middlewares/uploadAvatar.js";
+
 import * as Core from "./users.core.js";
 import * as Pin from "./users.quickpin.js";
 import * as Attachments from "./users.attachments.js";
 
-// 👇 Avatar unificado (ME + ADMIN)
-import {
-  uploadMyAvatar,
-  deleteMyAvatar,
-  uploadUserAvatar,
-  deleteUserAvatar,
-} from "./users.avatar.js";
+import { uploadMyAvatar, deleteMyAvatar, uploadUserAvatar, deleteUserAvatar } from "./users.avatar.js";
 
-// 👇 Middleware attachments
-import {
-  uploadUserAttachmentsFiles,
-  handleMulterErrors,
-} from "../../middlewares/uploadUserAttachments.js";
+import { uploadUserAttachmentsFiles, handleMulterErrors } from "../../middlewares/uploadUserAttachments.js";
 
 const router = Router();
 
@@ -38,18 +28,18 @@ const requireUsersView = requirePermission("USERS_ROLES", "VIEW");
 const requireUsersAdmin = requirePermission("USERS_ROLES", "ADMIN");
 
 /* =========================================================
-   /ME  (antes que /:id)
+   /ME
 ========================================================= */
 router.patch("/me/favorite-warehouse", Core.updateMyFavoriteWarehouse);
 
 router.put("/me/quick-pin", Pin.updateMyQuickPin);
 router.delete("/me/quick-pin", Pin.removeMyQuickPin);
 
-// ✅ Avatar propio (sistema unificado)
-router.put("/me/avatar", uploadAvatar.single("avatar"), uploadMyAvatar);
+// Avatar propio
+router.put("/me/avatar", uploadAvatarMiddleware, uploadMyAvatar);
 router.delete("/me/avatar", deleteMyAvatar);
 
-// ✅ Attachments propios
+// Attachments propios
 router.put("/me/attachments", uploadUserAttachmentsFiles, Attachments.uploadMyAttachments);
 
 /* =========================================================
@@ -68,39 +58,35 @@ router.put("/:id/quick-pin", requireUsersAdmin, Pin.updateUserQuickPin);
 router.delete("/:id/quick-pin", requireUsersAdmin, Pin.removeUserQuickPin);
 router.patch("/:id/quick-pin/enabled", requireUsersAdmin, Pin.updateUserQuickPinEnabled);
 
-// ✅ Avatar ADMIN (sistema unificado)
-router.put("/:id/avatar", requireUsersAdmin, uploadAvatar.single("avatar"), uploadUserAvatar);
+// Avatar ADMIN
+router.put("/:id/avatar", requireUsersAdmin, uploadAvatarMiddleware, uploadUserAvatar);
 router.delete("/:id/avatar", requireUsersAdmin, deleteUserAvatar);
 
-// ✅ Attachments ADMIN
+// Attachments ADMIN
 router.put("/:id/attachments", requireUsersAdmin, uploadUserAttachmentsFiles, Attachments.uploadUserAttachments);
 router.delete("/:id/attachments/:attachmentId", requireUsersAdmin, Attachments.deleteUserAttachment);
 
-// ✅ Invite
+// Invite
 router.post("/:id/invite", requireUsersAdmin, Core.sendUserInvite);
 
-// ✅ CRUD user
+// CRUD user
 router.post("/", requireUsersAdmin, Core.createUser);
 router.patch("/:id", requireUsersAdmin, Core.updateUserProfile);
 router.patch("/:id/status", requireUsersAdmin, Core.updateUserStatus);
 router.put("/:id/roles", requireUsersAdmin, Core.assignRolesToUser);
 
-// ✅ Overrides
+// Overrides
 router.post("/:id/overrides", requireUsersAdmin, Core.setUserOverride);
 router.delete("/:id/overrides/:permissionId", requireUsersAdmin, Core.removeUserOverride);
 
-// ✅ Soft delete
+// Soft delete
 router.delete("/:id", requireUsersAdmin, Core.softDeleteUser);
 
 /* =========================
    Multer error handler
-   (solo si hubo error en subidas)
 ========================= */
 router.use((err: any, req: any, res: any, next: any) => {
-  // si no es error, seguimos
   if (!err) return next();
-
-  // si el error viene de multer/subidas, lo manejamos
   return handleMulterErrors(err, req, res, next);
 });
 

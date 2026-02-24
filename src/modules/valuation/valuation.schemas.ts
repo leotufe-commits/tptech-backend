@@ -1,4 +1,23 @@
+// tptech-backend/src/modules/valuation/valuation.schemas.ts
 import { z } from "zod";
+
+/* =========================
+   Helpers Zod
+========================= */
+
+const zSku = z
+  .string()
+  .trim()
+  .min(1, "SKU requerido.")
+  .max(60, "SKU muy largo.")
+  .transform((s) => String(s).trim().toUpperCase());
+
+const zPurity = z.coerce
+  .number()
+  .gt(0, "Pureza/Ley inválida. Debe ser mayor a 0.")
+  .lte(1, "Pureza/Ley inválida. Debe ser hasta 1 (ej: 0.750).");
+
+const zFactorPos = z.coerce.number().gt(0, "Factor inválido. Debe ser mayor a 0.");
 
 /* =========================
    Monedas
@@ -37,10 +56,7 @@ export const createMetalSchema = z.object({
     .transform((s) => String(s ?? "").trim()),
 
   // ✅ valor referencia (en moneda base)
-  referenceValue: z.coerce
-    .number()
-    .min(0, "El valor de referencia no puede ser negativo.")
-    .optional(),
+  referenceValue: z.coerce.number().min(0, "El valor de referencia no puede ser negativo.").optional(),
 });
 
 // ✅ EDIT metal padre
@@ -53,39 +69,54 @@ export const updateMetalSchema = z.object({
     .transform((s) => String(s ?? "").trim()),
 
   // ✅ valor referencia (en moneda base)
-  referenceValue: z.coerce
-    .number()
-    .min(0, "El valor de referencia no puede ser negativo.")
-    .optional(),
+  referenceValue: z.coerce.number().min(0, "El valor de referencia no puede ser negativo.").optional(),
 });
 
+/**
+ * ✅ CREATE variante
+ * - purity: (0, 1]
+ * - factors: opcionales, pero si vienen deben ser > 0
+ * - overrides: number >= 0 o null
+ */
 export const createMetalVariantSchema = z.object({
   metalId: z.string().trim().min(1),
-  name: z.string().trim().min(1).max(60),
-  sku: z.string().trim().min(1).max(60),
+  name: z.string().trim().min(1, "Nombre requerido.").max(60, "Nombre muy largo."),
+  sku: zSku,
 
-  // 0..1
-  purity: z.coerce.number().min(0).max(1),
+  purity: zPurity,
 
-  // ✅ NUEVO: factor comercial (opcionales, default 1.0 en DB)
-  buyFactor: z.coerce.number().min(0).optional(),
-  saleFactor: z.coerce.number().min(0).optional(),
+  buyFactor: zFactorPos.optional(),
+  saleFactor: zFactorPos.optional(),
 
-  // ✅ NUEVO: override manual (si viene, se guarda)
-  purchasePriceOverride: z.coerce.number().min(0).optional().nullable(),
-  salePriceOverride: z.coerce.number().min(0).optional().nullable(),
+  purchasePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
+  salePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
 });
 
-// ✅ NUEVO: actualizar pricing de variante
+// ✅ actualizar pricing de variante (PATCH /valuation/variants/:id/pricing)
 export const updateMetalVariantPricingSchema = z.object({
-  buyFactor: z.coerce.number().min(0).optional(),
-  saleFactor: z.coerce.number().min(0).optional(),
-  purchasePriceOverride: z.coerce.number().min(0).optional().nullable(),
-  salePriceOverride: z.coerce.number().min(0).optional().nullable(),
+  buyFactor: zFactorPos.optional(),
+  saleFactor: zFactorPos.optional(),
+
+  purchasePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
+  salePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
 
   // helpers
   clearPurchaseOverride: z.coerce.boolean().optional(),
   clearSaleOverride: z.coerce.boolean().optional(),
+});
+
+/**
+ * ✅ editar variante (PATCH /valuation/variants/:variantId)
+ * IMPORTANTE: tu service updateMetalVariant() requiere name + sku + purity (no opcional)
+ */
+export const updateMetalVariantSchema = z.object({
+  name: z.string().trim().min(1, "Nombre requerido.").max(60, "Nombre muy largo."),
+  sku: zSku,
+  purity: zPurity,
+
+  // (por ahora solo editamos venta desde este endpoint)
+  saleFactor: zFactorPos.optional(),
+  salePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
 });
 
 export const createMetalQuoteSchema = z.object({
@@ -95,35 +126,3 @@ export const createMetalQuoteSchema = z.object({
   salePrice: z.coerce.number().min(0),
   effectiveAt: z.coerce.date().optional(),
 });
-// ✅ NUEVO: editar variante (PATCH /valuation/variants/:variantId)
-export const updateMetalVariantSchema = z
-  .object({
-    name: z.string().trim().min(1).max(60).optional(),
-    sku: z.string().trim().min(1).max(60).optional(),
-
-    // 0..1 (pero para negocio conviene > 0)
-    purity: z.coerce.number().min(0).max(1).optional(),
-
-    saleFactor: z.coerce.number().min(0).optional(),
-
-    // null = limpiar override; number >= 0 = setear; undefined = no tocar
-    salePriceOverride: z
-      .union([z.coerce.number().min(0), z.null()])
-      .optional(),
-  })
-  .superRefine((v, ctx) => {
-    if (v.purity !== undefined && v.purity <= 0) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["purity"],
-        message: "Pureza/Ley inválida. Debe ser mayor a 0 y hasta 1.",
-      });
-    }
-    if (v.saleFactor !== undefined && v.saleFactor <= 0) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["saleFactor"],
-        message: "Ajuste venta (factor) inválido. Debe ser mayor a 0.",
-      });
-    }
-  });
