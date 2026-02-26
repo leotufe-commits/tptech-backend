@@ -80,6 +80,19 @@ function numQ(v: any) {
   return n;
 }
 
+/**
+ * ✅ Algunas acciones requieren usuario sí o sí (porque el service espera string).
+ * Si no hay usuario → 401.
+ */
+function requireUserId(req: Request, res: Response): string | null {
+  const userId = String((req as any).user?.id || "").trim();
+  if (!userId) {
+    res.status(401).json({ ok: false, error: "Usuario no autenticado." });
+    return null;
+  }
+  return userId;
+}
+
 /* =========================================================
    MONEDAS (FX)
 ========================================================= */
@@ -159,7 +172,10 @@ export async function deleteCurrencyCtrl(req: Request, res: Response) {
 
 export async function postSetBaseCurrency(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ acá el service espera string (no null)
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const currencyId = String(req.params.currencyId || "").trim();
   if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
@@ -168,7 +184,7 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
     const result = await setBaseCurrencyAndRecalc({
       jewelryId,
       newBaseCurrencyId: currencyId,
-      actorUserId: userId ?? null,
+      actorUserId: userId,
       effectiveAt: new Date(),
     });
 
@@ -225,7 +241,10 @@ export async function patchCurrencyActive(req: Request, res: Response) {
 
 export async function postCurrencyRate(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ acá el service espera string (no undefined)
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const currencyId = String(req.params.currencyId || "").trim();
   if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
@@ -314,7 +333,10 @@ export async function getMetals(req: Request, res: Response) {
 
 export async function postMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ acá el service espera string (no undefined)
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const parsed = createMetalSchema.parse(req.body);
 
@@ -337,7 +359,10 @@ export async function postMetal(req: Request, res: Response) {
 
 export async function patchMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ acá el service espera string (no undefined)
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const metalId = String(req.params.metalId || "").trim();
   if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });

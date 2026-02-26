@@ -1,13 +1,31 @@
+// tptech-backend/src/modules/users/users.helpers.ts
 import type { Request, Response } from "express";
 import { UserStatus } from "@prisma/client";
 import path from "node:path";
 
-export function requireTenantId(req: Request, res: Response): string | null {
+/**
+ * ✅ Compat:
+ * - requireTenantId(req) => string (si falta tenant => throw 400)
+ * - requireTenantId(req, res) => string | null (si falta tenant => res 400 + null)
+ */
+export function requireTenantId(req: Request): string;
+export function requireTenantId(req: Request, res: Response): string | null;
+export function requireTenantId(req: Request, res?: Response): string | null {
   const tenantId = (req as any).tenantId as string | undefined;
+
   if (!tenantId) {
-    res.status(400).json({ message: "Tenant no definido en el request." });
-    return null;
+    // Si viene res (modo antiguo)
+    if (res) {
+      res.status(400).json({ message: "Tenant no definido en el request." });
+      return null;
+    }
+
+    // Si NO viene res (modo nuevo) => throw para que lo maneje errorHandler
+    const err: any = new Error("Tenant no definido en el request.");
+    err.status = 400;
+    throw err;
   }
+
   return String(tenantId);
 }
 
