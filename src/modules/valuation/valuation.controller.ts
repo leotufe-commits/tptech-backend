@@ -92,7 +92,7 @@ export async function getCurrencies(req: Request, res: Response) {
 
 export async function postCurrency(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const parsed = createCurrencySchema.parse(req.body);
   const row = await createCurrency(jewelryId, parsed);
@@ -101,7 +101,6 @@ export async function postCurrency(req: Request, res: Response) {
     action: "valuation.currency.create",
     success: true,
     userId,
-    jewelryId,
     meta: { id: row.id, code: row.code },
   });
 
@@ -110,7 +109,7 @@ export async function postCurrency(req: Request, res: Response) {
 
 export async function patchCurrency(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
   if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
@@ -124,7 +123,6 @@ export async function patchCurrency(req: Request, res: Response) {
       action: "valuation.currency.update",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, code: row.code },
     });
 
@@ -137,7 +135,7 @@ export async function patchCurrency(req: Request, res: Response) {
 
 export async function deleteCurrencyCtrl(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
   if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
@@ -149,7 +147,6 @@ export async function deleteCurrencyCtrl(req: Request, res: Response) {
       action: "valuation.currency.delete",
       success: true,
       userId,
-      jewelryId,
       meta: { currencyId },
     });
 
@@ -162,7 +159,7 @@ export async function deleteCurrencyCtrl(req: Request, res: Response) {
 
 export async function postSetBaseCurrency(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
   if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
@@ -171,7 +168,7 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
     const result = await setBaseCurrencyAndRecalc({
       jewelryId,
       newBaseCurrencyId: currencyId,
-      actorUserId: userId,
+      actorUserId: userId ?? null,
       effectiveAt: new Date(),
     });
 
@@ -179,7 +176,6 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
       action: "valuation.currency.set_base",
       success: true,
       userId,
-      jewelryId,
       meta: {
         newBaseCurrencyId: currencyId,
         changed: (result as any)?.changed ?? true,
@@ -205,7 +201,7 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
 
 export async function patchCurrencyActive(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
   const isActive = !!req.body?.isActive;
@@ -217,7 +213,6 @@ export async function patchCurrencyActive(req: Request, res: Response) {
       action: "valuation.currency.toggle_active",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, isActive },
     });
 
@@ -230,7 +225,7 @@ export async function patchCurrencyActive(req: Request, res: Response) {
 
 export async function postCurrencyRate(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
   if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
@@ -244,7 +239,6 @@ export async function postCurrencyRate(req: Request, res: Response) {
       action: "valuation.currency.rate.create",
       success: true,
       userId,
-      jewelryId,
       meta: { currencyId, currencyRateId: row.id, rate: parsed.rate, effectiveAt: parsed.effectiveAt },
     });
 
@@ -320,7 +314,7 @@ export async function getMetals(req: Request, res: Response) {
 
 export async function postMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const parsed = createMetalSchema.parse(req.body);
 
@@ -331,7 +325,6 @@ export async function postMetal(req: Request, res: Response) {
       action: "valuation.metal.create",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, name: row.name, symbol: (row as any).symbol ?? "" },
     });
 
@@ -344,7 +337,7 @@ export async function postMetal(req: Request, res: Response) {
 
 export async function patchMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
   if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
@@ -358,7 +351,6 @@ export async function patchMetal(req: Request, res: Response) {
       action: "valuation.metal.update",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, name: row.name, symbol: (row as any).symbol ?? "" },
     });
 
@@ -371,7 +363,7 @@ export async function patchMetal(req: Request, res: Response) {
 
 export async function deleteMetalCtrl(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
   if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
@@ -383,7 +375,6 @@ export async function deleteMetalCtrl(req: Request, res: Response) {
       action: "valuation.metal.delete",
       success: true,
       userId,
-      jewelryId,
       meta: { metalId },
     });
 
@@ -396,7 +387,7 @@ export async function deleteMetalCtrl(req: Request, res: Response) {
 
 export async function patchMetalActive(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
   const isActive = !!req.body?.isActive;
@@ -408,7 +399,6 @@ export async function patchMetalActive(req: Request, res: Response) {
       action: "valuation.metal.toggle_active",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, isActive },
     });
 
@@ -425,7 +415,7 @@ export async function patchMetalActive(req: Request, res: Response) {
 
 export async function postMoveMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
   if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
@@ -442,7 +432,6 @@ export async function postMoveMetal(req: Request, res: Response) {
       action: "valuation.metal.move",
       success: true,
       userId,
-      jewelryId,
       meta: { metalId, dir, changed: out.changed },
     });
 
@@ -488,7 +477,7 @@ export async function getMetalRefHistory(req: Request, res: Response) {
 
 export async function postMetalVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const parsed = createMetalVariantSchema.parse(req.body);
 
@@ -499,7 +488,6 @@ export async function postMetalVariant(req: Request, res: Response) {
       action: "valuation.variant.create",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, metalId: row.metalId, sku: row.sku },
     });
 
@@ -531,7 +519,7 @@ export async function getMetalVariants(req: Request, res: Response) {
 
 export async function patchVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
   if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
@@ -545,7 +533,6 @@ export async function patchVariant(req: Request, res: Response) {
       action: "valuation.variant.update",
       success: true,
       userId,
-      jewelryId,
       meta: { variantId, ...parsed },
     });
 
@@ -558,7 +545,7 @@ export async function patchVariant(req: Request, res: Response) {
 
 export async function patchVariantPricing(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
   if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
@@ -572,7 +559,6 @@ export async function patchVariantPricing(req: Request, res: Response) {
       action: "valuation.variant.pricing.update",
       success: true,
       userId,
-      jewelryId,
       meta: { variantId, ...parsed },
     });
 
@@ -585,7 +571,7 @@ export async function patchVariantPricing(req: Request, res: Response) {
 
 export async function patchVariantActive(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
   const isActive = !!req.body?.isActive;
@@ -597,7 +583,6 @@ export async function patchVariantActive(req: Request, res: Response) {
       action: "valuation.variant.toggle_active",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id, isActive },
     });
 
@@ -610,7 +595,7 @@ export async function patchVariantActive(req: Request, res: Response) {
 
 export async function postSetFavoriteVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
   if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
@@ -622,7 +607,6 @@ export async function postSetFavoriteVariant(req: Request, res: Response) {
       action: "valuation.variant.set_favorite",
       success: true,
       userId,
-      jewelryId,
       meta: { id: row.id },
     });
 
@@ -635,7 +619,7 @@ export async function postSetFavoriteVariant(req: Request, res: Response) {
 
 export async function postClearFavoriteVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
   if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
@@ -647,7 +631,6 @@ export async function postClearFavoriteVariant(req: Request, res: Response) {
       action: "valuation.metal.clear_favorite",
       success: true,
       userId,
-      jewelryId,
       meta: { metalId },
     });
 
@@ -660,7 +643,7 @@ export async function postClearFavoriteVariant(req: Request, res: Response) {
 
 export async function deleteVariantCtrl(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
   if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
@@ -672,7 +655,6 @@ export async function deleteVariantCtrl(req: Request, res: Response) {
       action: "valuation.variant.delete",
       success: true,
       userId,
-      jewelryId,
       meta: { variantId },
     });
 
@@ -689,7 +671,7 @@ export async function deleteVariantCtrl(req: Request, res: Response) {
 
 export async function postMetalQuote(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId = (req as any).user?.id ?? null;
+  const userId: string | undefined = (req as any).user?.id;
 
   const parsed = createMetalQuoteSchema.parse(req.body);
 
@@ -700,7 +682,6 @@ export async function postMetalQuote(req: Request, res: Response) {
       action: "valuation.quote.create",
       success: true,
       userId,
-      jewelryId,
       meta: parsed,
     });
 
