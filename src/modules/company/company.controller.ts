@@ -1,37 +1,78 @@
 // src/modules/company/company.controller.ts
 import type { Request, Response } from "express";
-import fs from "node:fs";
-import path from "node:path";
 import { prisma } from "../../lib/prisma.js";
 import { auditLog } from "../../lib/auditLogger.js";
+
+import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { r2, R2_BUCKET, R2_ENABLED, R2_PUBLIC_BASE_URL, R2_ENDPOINT } from "../../lib/storage/r2.js";
+import { toPublicUploadUrl, safeDeleteLocalUploadByUrl } from "../../lib/uploads/localUploads.js";
 
 type MulterFile = {
   filename: string;
   originalname: string;
   mimetype: string;
   size: number;
+  _tpFolder?: string;
 };
 
-function publicBaseUrl(req: Request) {
-  const envBase = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "");
-  return envBase || `${req.protocol}://${req.get("host")}`;
+function s(v: any) {
+  return String(v ?? "").trim();
 }
 
-function fileUrl(req: Request, folder: string, filename: string) {
-  return `${publicBaseUrl(req)}/uploads/${folder}/${encodeURIComponent(filename)}`;
+function normalizeBaseUrl(v: string) {
+  return String(v || "").trim().replace(/\/+$/g, "");
 }
 
-function safeFilename(name: string) {
-  return path.basename(String(name || ""));
+function r2PublicBase() {
+  const b1 = normalizeBaseUrl(R2_PUBLIC_BASE_URL || "");
+  if (b1) return b1;
+
+  const b2 = normalizeBaseUrl(R2_ENDPOINT || "");
+  if (b2) return b2;
+
+  return "";
 }
 
-async function deleteLocalFile(folder: string, filename: string) {
-  if (!folder || !filename) return;
+/**
+ * Dada una publicUrl armada por toPublicUploadUrl, intenta obtener el key de R2.
+ * (asume que la URL es base + "/" + folder + "/" + filename)
+ */
+function extractR2KeyFromUrl(url: string) {
+  const u = s(url);
+  if (!u) return null;
 
-  const p = path.join(process.cwd(), "uploads", folder, safeFilename(filename));
-  try {
-    await fs.promises.unlink(p);
-  } catch {}
+  const base = r2PublicBase();
+  if (!base) return null;
+
+  if (!u.startsWith(base)) return null;
+
+  const rest = u.slice(base.length);
+  const rest2 = rest.startsWith("/") ? rest.slice(1) : rest;
+  const key = decodeURIComponent(rest2.split("?")[0].split("#")[0]);
+  return key || null;
+}
+
+async function safeDeleteUploadByUrl(url: string | null | undefined, expectedPrefixFolder: string) {
+  const u = s(url);
+  if (!u) return;
+
+  // Si R2 está habilitado => intentamos borrar en R2
+  if (R2_ENABLED && r2 && R2_BUCKET) {
+    const key = extractR2KeyFromUrl(u);
+    if (key) {
+      try {
+        await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    // Si no pudimos extraer key, NO hacemos nada (evita borrar cosas incorrectas)
+    return;
+  }
+
+  // Si no hay R2 => borrar local con safety-check
+  await safeDeleteLocalUploadByUrl(u, expectedPrefixFolder);
 }
 
 async function getMyJewelry(req: Request) {
@@ -133,7 +174,8 @@ export async function uploadMyJewelryLogo(req: Request, res: Response) {
     return res.status(400).json({ message: "El logo debe ser una imagen." });
   }
 
-  const newUrl = fileUrl(req, "jewelry/logos", file.filename);
+  const folder = file._tpFolder || "jewelry/logos";
+  const newUrl = toPublicUploadUrl(req, folder, file.filename);
 
   const prev = await prisma.jewelry.findUnique({
     where: { id: me.jewelryId },
@@ -145,12 +187,9 @@ export async function uploadMyJewelryLogo(req: Request, res: Response) {
     data: { logoUrl: newUrl },
   });
 
+  // ✅ borrar anterior (R2 o local)
   if (prev?.logoUrl) {
-    const parts = prev.logoUrl.split("/");
-    const filename = parts.pop();
-    if (filename) {
-      await deleteLocalFile("jewelry/logos", filename);
-    }
+    await safeDeleteUploadByUrl(prev.logoUrl, "jewelry/logos");
   }
 
   const fresh = await getMyJewelry(req);
@@ -160,6 +199,7 @@ export async function uploadMyJewelryLogo(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: me.jewelryId,
+    meta: { storage: R2_ENABLED ? "r2" : "local" },
   });
 
   return res.json({ jewelry: { ...fresh?.jewelry, attachments: fresh?.attachments } });
@@ -191,11 +231,7 @@ export async function deleteMyJewelryLogo(req: Request, res: Response) {
   });
 
   if (prev?.logoUrl) {
-    const parts = prev.logoUrl.split("/");
-    const filename = parts.pop();
-    if (filename) {
-      await deleteLocalFile("jewelry/logos", filename);
-    }
+    await safeDeleteUploadByUrl(prev.logoUrl, "jewelry/logos");
   }
 
   const fresh = await getMyJewelry(req);
@@ -205,6 +241,7 @@ export async function deleteMyJewelryLogo(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: me.jewelryId,
+    meta: { storage: R2_ENABLED ? "r2" : "local" },
   });
 
   return res.json({ jewelry: { ...fresh?.jewelry, attachments: fresh?.attachments } });
@@ -225,22 +262,25 @@ export async function uploadMyJewelryAttachments(req: Request, res: Response) {
     return res.status(400).json({ message: "Jewelry no configurada." });
   }
 
-  const files = (req as any).files as { attachments?: MulterFile[] };
+  const files = (req as any).files as { attachments?: MulterFile[]; "attachments[]"?: MulterFile[] };
 
-  const list = files?.attachments ?? [];
+  const list = [...(files?.attachments ?? []), ...(files?.["attachments[]"] ?? [])];
 
   if (!list.length) {
     return res.status(400).json({ message: "No se recibieron archivos." });
   }
 
   await prisma.jewelryAttachment.createMany({
-    data: list.map((f) => ({
-      jewelryId: me.jewelryId,
-      url: fileUrl(req, "jewelry/attachments", f.filename),
-      filename: f.originalname,
-      mimeType: f.mimetype,
-      size: f.size,
-    })),
+    data: list.map((f) => {
+      const folder = f._tpFolder || "jewelry/attachments";
+      return {
+        jewelryId: me.jewelryId!,
+        url: toPublicUploadUrl(req, folder, f.filename),
+        filename: f.originalname,
+        mimeType: f.mimetype,
+        size: f.size,
+      };
+    }),
   });
 
   const fresh = await getMyJewelry(req);
@@ -250,7 +290,7 @@ export async function uploadMyJewelryAttachments(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: me.jewelryId,
-    meta: { count: list.length },
+    meta: { count: list.length, storage: R2_ENABLED ? "r2" : "local" },
   });
 
   return res.json({ jewelry: { ...fresh?.jewelry, attachments: fresh?.attachments } });
@@ -286,11 +326,7 @@ export async function deleteMyJewelryAttachment(req: Request, res: Response) {
 
   await prisma.jewelryAttachment.delete({ where: { id } });
 
-  const parts = att.url.split("/");
-  const filename = parts.pop();
-  if (filename) {
-    await deleteLocalFile("jewelry/attachments", filename);
-  }
+  await safeDeleteUploadByUrl(att.url, "jewelry/attachments");
 
   const fresh = await getMyJewelry(req);
 
@@ -299,6 +335,7 @@ export async function deleteMyJewelryAttachment(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: me.jewelryId,
+    meta: { storage: R2_ENABLED ? "r2" : "local" },
   });
 
   return res.json({ jewelry: { ...fresh?.jewelry, attachments: fresh?.attachments } });

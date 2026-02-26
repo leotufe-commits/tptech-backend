@@ -10,6 +10,17 @@ function s(v: any) {
   return String(v ?? "").trim();
 }
 
+function normalizeBaseUrl(v: string) {
+  return String(v || "").trim().replace(/\/+$/g, "");
+}
+
+// El key puede tener "/" (path). encodeURI lo mantiene, pero escapa espacios y cosas raras.
+function publicUrlFromKey(base: string, key: string) {
+  const b = normalizeBaseUrl(base);
+  const k = String(key || "").replace(/^\/+/, "");
+  return `${b}/${encodeURI(k)}`;
+}
+
 function guessExtFromMime(mime: string) {
   const m = s(mime).toLowerCase();
   if (m === "image/jpeg") return "jpg";
@@ -49,8 +60,18 @@ export async function signUpload(req: Request, res: Response) {
   const tenantId = s((req as any).tenantId || (req as any).jewelryId);
   if (!tenantId) return res.status(401).json({ message: "Unauthorized" });
 
+  // ✅ Si usás este endpoint, asumimos R2 sí o sí
   if (!r2 || !R2_BUCKET) {
-    return res.status(500).json({ message: "Storage no configurado" });
+    return res.status(500).json({ message: "Storage no configurado (R2)" });
+  }
+
+  // ✅ Profesional: sin R2_PUBLIC_BASE_URL no hay URL pública confiable
+  const basePublic = normalizeBaseUrl(R2_PUBLIC_BASE_URL || "");
+  if (!basePublic) {
+    return res.status(500).json({
+      message:
+        "Storage configurado pero falta R2_PUBLIC_BASE_URL (necesario para generar links públicos).",
+    });
   }
 
   const body = (req.body || {}) as any;
@@ -109,17 +130,15 @@ export async function signUpload(req: Request, res: Response) {
     Bucket: R2_BUCKET,
     Key: key,
     ContentType: mime,
-    CacheControl: isImage
-      ? "public, max-age=31536000, immutable"
-      : "public, max-age=3600",
+    CacheControl: isImage ? "public, max-age=31536000, immutable" : "public, max-age=3600",
   });
 
   const uploadUrl = await getSignedUrl(r2, cmd, { expiresIn: 60 * 15 });
 
-  const base = String(R2_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-  const publicUrl = base ? `${base}/${key}` : `/${key}`;
+  const publicUrl = publicUrlFromKey(basePublic, key);
 
   return res.json({
+    ok: true,
     kind: kindRaw,
     normalizedKind: kind,
     key,

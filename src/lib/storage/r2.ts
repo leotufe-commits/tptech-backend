@@ -29,13 +29,13 @@ export const R2_ENDPOINT = getEnv("R2_ENDPOINT");
 export const R2_ACCESS_KEY_ID = getEnv("R2_ACCESS_KEY_ID");
 export const R2_SECRET_ACCESS_KEY = getEnv("R2_SECRET_ACCESS_KEY");
 
-// ✅ URL pública (tu dominio/CDN). Si no está, queda ""
+// ✅ URL pública (tu dominio/CDN)
 export const R2_PUBLIC_BASE_URL = normalizeBaseUrl(getEnv("R2_PUBLIC_BASE_URL") || "");
 
 // Región (para R2 suele ser "auto")
 export const R2_REGION = process.env.R2_REGION || "auto";
 
-// ✅ Config completa
+// ✅ Config completa (para poder operar contra R2)
 const R2_CONFIG_OK = Boolean(
   R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET
 );
@@ -49,11 +49,6 @@ const FORCE_R2 = STORAGE_DRIVER === "r2";
 // - y hay config completa
 export const R2_ENABLED = !FORCE_LOCAL && R2_CONFIG_OK;
 
-/**
- * En producción:
- * - Si STORAGE_DRIVER=r2 => es obligatorio tener R2 configurado
- * - Si STORAGE_DRIVER=auto => NO crashea si falta (solo avisa)
- */
 function missingVars() {
   const missing: string[] = [];
   if (!R2_BUCKET) missing.push("R2_BUCKET");
@@ -63,19 +58,38 @@ function missingVars() {
   return missing;
 }
 
+function missingPublicBase() {
+  return !R2_PUBLIC_BASE_URL;
+}
+
 if (IS_PROD) {
-  if (FORCE_R2 && !R2_CONFIG_OK) {
-    throw new Error(
-      `[R2] STORAGE_DRIVER=r2 pero falta configuración: ${missingVars().join(", ")}`
-    );
+  // ✅ Si forzás R2, tiene que estar todo OK (incluyendo public base)
+  if (FORCE_R2) {
+    if (!R2_CONFIG_OK) {
+      throw new Error(
+        `[R2] STORAGE_DRIVER=r2 pero falta configuración: ${missingVars().join(", ")}`
+      );
+    }
+    if (missingPublicBase()) {
+      throw new Error(
+        "[R2] STORAGE_DRIVER=r2 pero falta R2_PUBLIC_BASE_URL (necesario para URLs públicas)."
+      );
+    }
   }
 
+  // ✅ Auto: no rompe deploy si falta config, pero avisa
   if (STORAGE_DRIVER === "auto" && !R2_CONFIG_OK) {
-    // ✅ No rompemos el deploy: solo informamos que se usará local
     console.warn(
       `[R2] R2 no configurado (${missingVars().join(
         ", "
       )}). STORAGE_DRIVER=auto → usando storage local.`
+    );
+  }
+
+  // ✅ Auto: si R2 está configurado pero no hay public base, avisamos (no rompemos)
+  if (STORAGE_DRIVER === "auto" && R2_CONFIG_OK && missingPublicBase()) {
+    console.warn(
+      "[R2] R2 está configurado pero falta R2_PUBLIC_BASE_URL. Se podrán subir archivos, pero las URLs públicas pueden no ser correctas."
     );
   }
 }
