@@ -2,7 +2,14 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
-import { dec, assertNonEmpty, assertPurity, assertFactor, computeSuggested, computeFinal } from "./valuation.helpers.js";
+import {
+  dec,
+  assertNonEmpty,
+  assertPurity,
+  assertFactor,
+  computeSuggested,
+  computeFinal,
+} from "./valuation.helpers.js";
 
 function freedSku(sku: string, id: string) {
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -53,24 +60,45 @@ export async function createMetalVariant(
     throw err;
   }
 
-  const pOverrideIn = data.purchasePriceOverride === undefined ? undefined : data.purchasePriceOverride;
-  const sOverrideIn = data.salePriceOverride === undefined ? undefined : data.salePriceOverride;
+  const pOverrideIn =
+    data.purchasePriceOverride === undefined
+      ? undefined
+      : data.purchasePriceOverride;
+  const sOverrideIn =
+    data.salePriceOverride === undefined ? undefined : data.salePriceOverride;
 
   const pricingMode =
-    (pOverrideIn ?? null) !== null || (sOverrideIn ?? null) !== null ? ("OVERRIDE" as any) : ("AUTO" as any);
+    (pOverrideIn ?? null) !== null || (sOverrideIn ?? null) !== null
+      ? ("OVERRIDE" as any)
+      : ("AUTO" as any);
 
-  const buyFactor = buyFactorN !== undefined ? dec(buyFactorN, 1) : new Prisma.Decimal(1);
-  const saleFactor = saleFactorN !== undefined ? dec(saleFactorN, 1) : new Prisma.Decimal(1);
+  const buyFactor =
+    buyFactorN !== undefined ? dec(buyFactorN, 1) : new Prisma.Decimal(1);
+  const saleFactor =
+    saleFactorN !== undefined ? dec(saleFactorN, 1) : new Prisma.Decimal(1);
 
-  const pOverride = pOverrideIn === undefined ? undefined : pOverrideIn === null ? null : dec(pOverrideIn);
-  const sOverride = sOverrideIn === undefined ? undefined : sOverrideIn === null ? null : dec(sOverrideIn);
+  const pOverride =
+    pOverrideIn === undefined
+      ? undefined
+      : pOverrideIn === null
+      ? null
+      : dec(pOverrideIn);
+  const sOverride =
+    sOverrideIn === undefined
+      ? undefined
+      : sOverrideIn === null
+      ? null
+      : dec(sOverrideIn);
 
   const v = await prisma.metalVariant.create({
     data: {
       metalId: data.metalId,
       name,
       sku,
-      purity: dec(purityN, 0),
+
+      // ✅ FIX: guardamos pureza con 4 decimales (schema: Decimal(6,4))
+      purity: dec(purityN, 4),
+
       isActive: true,
       isFavorite: false,
       deletedAt: null,
@@ -103,11 +131,25 @@ export async function createMetalVariant(
   const purity = new Prisma.Decimal(v.purity ?? 0);
   const suggested = computeSuggested(ref, purity);
 
-  const pOv = v.purchasePriceOverride !== null ? new Prisma.Decimal(v.purchasePriceOverride as any) : null;
-  const sOv = v.salePriceOverride !== null ? new Prisma.Decimal(v.salePriceOverride as any) : null;
+  const pOv =
+    v.purchasePriceOverride !== null
+      ? new Prisma.Decimal(v.purchasePriceOverride as any)
+      : null;
+  const sOv =
+    v.salePriceOverride !== null
+      ? new Prisma.Decimal(v.salePriceOverride as any)
+      : null;
 
-  const finalPurchase = computeFinal(suggested, new Prisma.Decimal(v.buyFactor ?? 1), pOv);
-  const finalSale = computeFinal(suggested, new Prisma.Decimal(v.saleFactor ?? 1), sOv);
+  const finalPurchase = computeFinal(
+    suggested,
+    new Prisma.Decimal(v.buyFactor ?? 1),
+    pOv
+  );
+  const finalSale = computeFinal(
+    suggested,
+    new Prisma.Decimal(v.saleFactor ?? 1),
+    sOv
+  );
 
   return {
     id: v.id,
@@ -123,8 +165,10 @@ export async function createMetalVariant(
 
     buyFactor: Number(v.buyFactor ?? 1),
     saleFactor: Number(v.saleFactor ?? 1),
-    purchasePriceOverride: v.purchasePriceOverride === null ? null : Number(v.purchasePriceOverride),
-    salePriceOverride: v.salePriceOverride === null ? null : Number(v.salePriceOverride),
+    purchasePriceOverride:
+      v.purchasePriceOverride === null ? null : Number(v.purchasePriceOverride),
+    salePriceOverride:
+      v.salePriceOverride === null ? null : Number(v.salePriceOverride),
     pricingMode: (v as any).pricingMode ?? "AUTO",
 
     suggestedPrice: Number(suggested),
@@ -146,7 +190,11 @@ export async function updateMetalVariant(
   }
 ) {
   const existing = await prisma.metalVariant.findFirst({
-    where: { id: variantId, deletedAt: null, metal: { jewelryId, deletedAt: null } },
+    where: {
+      id: variantId,
+      deletedAt: null,
+      metal: { jewelryId, deletedAt: null },
+    },
     select: {
       id: true,
       metalId: true,
@@ -174,7 +222,12 @@ export async function updateMetalVariant(
   const purityN = assertPurity(data.purity);
 
   const dup = await prisma.metalVariant.findFirst({
-    where: { metalId: existing.metalId, sku: nextSku, deletedAt: null, id: { not: variantId } },
+    where: {
+      metalId: existing.metalId,
+      sku: nextSku,
+      deletedAt: null,
+      id: { not: variantId },
+    },
     select: { id: true },
   });
   if (dup) {
@@ -183,16 +236,26 @@ export async function updateMetalVariant(
     throw err;
   }
 
-  const purityDec = dec(purityN, 0);
+  // ✅ FIX: 4 decimales (schema Decimal(6,4))
+  const purityDec = dec(purityN, 4);
 
   const saleFactorN = assertFactor(data.saleFactor, "Ajuste venta (factor)");
-  const saleFactorDec = saleFactorN !== undefined ? dec(saleFactorN, 1) : undefined;
+  const saleFactorDec =
+    saleFactorN !== undefined ? dec(saleFactorN, 1) : undefined;
 
   const saleOverrideDec =
-    data.salePriceOverride === undefined ? undefined : data.salePriceOverride === null ? null : dec(data.salePriceOverride);
+    data.salePriceOverride === undefined
+      ? undefined
+      : data.salePriceOverride === null
+      ? null
+      : dec(data.salePriceOverride);
 
   const pricingMode =
-    saleOverrideDec === undefined ? undefined : saleOverrideDec === null ? ("AUTO" as any) : ("OVERRIDE" as any);
+    saleOverrideDec === undefined
+      ? undefined
+      : saleOverrideDec === null
+      ? ("AUTO" as any)
+      : ("OVERRIDE" as any);
 
   const updated = await prisma.metalVariant.update({
     where: { id: variantId },
@@ -201,7 +264,9 @@ export async function updateMetalVariant(
       sku: nextSku,
       purity: purityDec,
       ...(saleFactorDec !== undefined ? { saleFactor: saleFactorDec } : {}),
-      ...(saleOverrideDec !== undefined ? { salePriceOverride: saleOverrideDec } : {}),
+      ...(saleOverrideDec !== undefined
+        ? { salePriceOverride: saleOverrideDec }
+        : {}),
       ...(pricingMode !== undefined ? { pricingMode } : {}),
     },
     select: {
@@ -229,13 +294,17 @@ export async function updateMetalVariant(
   const finalPurchase = computeFinal(
     suggested,
     new Prisma.Decimal(updated.buyFactor ?? 1),
-    updated.purchasePriceOverride !== null ? new Prisma.Decimal(updated.purchasePriceOverride as any) : null
+    updated.purchasePriceOverride !== null
+      ? new Prisma.Decimal(updated.purchasePriceOverride as any)
+      : null
   );
 
   const finalSale = computeFinal(
     suggested,
     new Prisma.Decimal(updated.saleFactor ?? 1),
-    updated.salePriceOverride !== null ? new Prisma.Decimal(updated.salePriceOverride as any) : null
+    updated.salePriceOverride !== null
+      ? new Prisma.Decimal(updated.salePriceOverride as any)
+      : null
   );
 
   return {
@@ -252,8 +321,12 @@ export async function updateMetalVariant(
 
     buyFactor: Number(updated.buyFactor ?? 1),
     saleFactor: Number(updated.saleFactor ?? 1),
-    purchasePriceOverride: updated.purchasePriceOverride === null ? null : Number(updated.purchasePriceOverride),
-    salePriceOverride: updated.salePriceOverride === null ? null : Number(updated.salePriceOverride),
+    purchasePriceOverride:
+      updated.purchasePriceOverride === null
+        ? null
+        : Number(updated.purchasePriceOverride),
+    salePriceOverride:
+      updated.salePriceOverride === null ? null : Number(updated.salePriceOverride),
     pricingMode: (updated as any).pricingMode ?? "AUTO",
 
     suggestedPrice: Number(suggested),
@@ -309,7 +382,8 @@ export async function updateMetalVariantPricing(
     patch.salePriceOverride = data.salePriceOverride === null ? null : dec(data.salePriceOverride);
   }
 
-  const nextPurchase = patch.purchasePriceOverride !== undefined ? patch.purchasePriceOverride : v.purchasePriceOverride;
+  const nextPurchase =
+    patch.purchasePriceOverride !== undefined ? patch.purchasePriceOverride : v.purchasePriceOverride;
   const nextSale = patch.salePriceOverride !== undefined ? patch.salePriceOverride : v.salePriceOverride;
 
   patch.pricingMode =
