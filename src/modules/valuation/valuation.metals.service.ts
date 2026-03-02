@@ -205,6 +205,11 @@ export async function updateMetal(
   });
 }
 
+/**
+ * ✅ REGLA:
+ * - Si Metal Padre pasa a INACTIVO => TODAS sus variantes deben quedar INACTIVAS.
+ * - Si Metal Padre pasa a ACTIVO => NO tocamos variantes (cada variante define su estado).
+ */
 export async function toggleMetalActive(jewelryId: string, metalId: string, isActive: boolean) {
   const metal = await prisma.metal.findFirst({
     where: { id: metalId, jewelryId, deletedAt: null },
@@ -216,31 +221,42 @@ export async function toggleMetalActive(jewelryId: string, metalId: string, isAc
     throw err;
   }
 
-  const row = await prisma.metal.update({
-    where: { id: metalId },
-    data: { isActive },
-    select: {
-      id: true,
-      name: true,
-      symbol: true,
-      referenceValue: true,
-      sortOrder: true,
-      isActive: true,
-      createdAt: true,
-      updatedAt: true,
-    },
-  });
+  return prisma.$transaction(async (tx) => {
+    // 1) actualizar metal
+    const row = await tx.metal.update({
+      where: { id: metalId },
+      data: { isActive },
+      select: {
+        id: true,
+        name: true,
+        symbol: true,
+        referenceValue: true,
+        sortOrder: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
 
-  return {
-    id: row.id,
-    name: row.name,
-    symbol: row.symbol ?? "",
-    referenceValue: Number(row.referenceValue ?? 0),
-    sortOrder: row.sortOrder ?? 0,
-    isActive: row.isActive,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  };
+    // 2) si se desactiva el padre, forzar variantes a inactivas (solo no borradas)
+    if (!isActive) {
+      await tx.metalVariant.updateMany({
+        where: { metalId: metalId, deletedAt: null, isActive: true },
+        data: { isActive: false },
+      });
+    }
+
+    return {
+      id: row.id,
+      name: row.name,
+      symbol: row.symbol ?? "",
+      referenceValue: Number(row.referenceValue ?? 0),
+      sortOrder: row.sortOrder ?? 0,
+      isActive: row.isActive,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  });
 }
 
 /* =========================

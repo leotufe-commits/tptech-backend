@@ -16,6 +16,25 @@ function freedSku(sku: string, id: string) {
   return `deleted__${sku}__${id}__${suffix}`;
 }
 
+/** ✅ override válido: > 0; 0 o negativos => null */
+function normalizeOverrideIn(v: any) {
+  if (v === undefined) return undefined; // "no tocar"
+  if (v === null) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return null;
+  return n;
+}
+
+/** ✅ salida: si es 0/negativo o no numérico => null */
+function normalizeOverrideOut(v: any) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return null;
+  return n;
+}
+
 /* =========================
    Variantes
 ========================= */
@@ -60,12 +79,9 @@ export async function createMetalVariant(
     throw err;
   }
 
-  const pOverrideIn =
-    data.purchasePriceOverride === undefined
-      ? undefined
-      : data.purchasePriceOverride;
-  const sOverrideIn =
-    data.salePriceOverride === undefined ? undefined : data.salePriceOverride;
+  // ✅ normalizamos overrides: 0 => null
+  const pOverrideIn = normalizeOverrideIn(data.purchasePriceOverride);
+  const sOverrideIn = normalizeOverrideIn(data.salePriceOverride);
 
   const pricingMode =
     (pOverrideIn ?? null) !== null || (sOverrideIn ?? null) !== null
@@ -83,6 +99,7 @@ export async function createMetalVariant(
       : pOverrideIn === null
       ? null
       : dec(pOverrideIn);
+
   const sOverride =
     sOverrideIn === undefined
       ? undefined
@@ -131,14 +148,12 @@ export async function createMetalVariant(
   const purity = new Prisma.Decimal(v.purity ?? 0);
   const suggested = computeSuggested(ref, purity);
 
-  const pOv =
-    v.purchasePriceOverride !== null
-      ? new Prisma.Decimal(v.purchasePriceOverride as any)
-      : null;
-  const sOv =
-    v.salePriceOverride !== null
-      ? new Prisma.Decimal(v.salePriceOverride as any)
-      : null;
+  // ✅ si override es 0/negativo => lo tratamos como null
+  const pOvNum = normalizeOverrideOut(v.purchasePriceOverride);
+  const sOvNum = normalizeOverrideOut(v.salePriceOverride);
+
+  const pOv = pOvNum !== null ? new Prisma.Decimal(v.purchasePriceOverride as any) : null;
+  const sOv = sOvNum !== null ? new Prisma.Decimal(v.salePriceOverride as any) : null;
 
   const finalPurchase = computeFinal(
     suggested,
@@ -165,10 +180,10 @@ export async function createMetalVariant(
 
     buyFactor: Number(v.buyFactor ?? 1),
     saleFactor: Number(v.saleFactor ?? 1),
-    purchasePriceOverride:
-      v.purchasePriceOverride === null ? null : Number(v.purchasePriceOverride),
-    salePriceOverride:
-      v.salePriceOverride === null ? null : Number(v.salePriceOverride),
+
+    purchasePriceOverride: pOvNum,
+    salePriceOverride: sOvNum,
+
     pricingMode: (v as any).pricingMode ?? "AUTO",
 
     suggestedPrice: Number(suggested),
@@ -243,12 +258,14 @@ export async function updateMetalVariant(
   const saleFactorDec =
     saleFactorN !== undefined ? dec(saleFactorN, 1) : undefined;
 
+  // ✅ normalizamos override: 0 => null
+  const saleOverrideN = normalizeOverrideIn(data.salePriceOverride);
   const saleOverrideDec =
-    data.salePriceOverride === undefined
+    saleOverrideN === undefined
       ? undefined
-      : data.salePriceOverride === null
+      : saleOverrideN === null
       ? null
-      : dec(data.salePriceOverride);
+      : dec(saleOverrideN);
 
   const pricingMode =
     saleOverrideDec === undefined
@@ -291,10 +308,13 @@ export async function updateMetalVariant(
   const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
   const suggested = computeSuggested(ref, new Prisma.Decimal(updated.purity ?? 0));
 
+  const pOvNum = normalizeOverrideOut(updated.purchasePriceOverride);
+  const sOvNum = normalizeOverrideOut(updated.salePriceOverride);
+
   const finalPurchase = computeFinal(
     suggested,
     new Prisma.Decimal(updated.buyFactor ?? 1),
-    updated.purchasePriceOverride !== null
+    pOvNum !== null
       ? new Prisma.Decimal(updated.purchasePriceOverride as any)
       : null
   );
@@ -302,7 +322,7 @@ export async function updateMetalVariant(
   const finalSale = computeFinal(
     suggested,
     new Prisma.Decimal(updated.saleFactor ?? 1),
-    updated.salePriceOverride !== null
+    sOvNum !== null
       ? new Prisma.Decimal(updated.salePriceOverride as any)
       : null
   );
@@ -321,12 +341,10 @@ export async function updateMetalVariant(
 
     buyFactor: Number(updated.buyFactor ?? 1),
     saleFactor: Number(updated.saleFactor ?? 1),
-    purchasePriceOverride:
-      updated.purchasePriceOverride === null
-        ? null
-        : Number(updated.purchasePriceOverride),
-    salePriceOverride:
-      updated.salePriceOverride === null ? null : Number(updated.salePriceOverride),
+
+    purchasePriceOverride: pOvNum,
+    salePriceOverride: sOvNum,
+
     pricingMode: (updated as any).pricingMode ?? "AUTO",
 
     suggestedPrice: Number(suggested),
@@ -376,10 +394,12 @@ export async function updateMetalVariantPricing(
   if (data.clearSaleOverride) patch.salePriceOverride = null;
 
   if (data.purchasePriceOverride !== undefined) {
-    patch.purchasePriceOverride = data.purchasePriceOverride === null ? null : dec(data.purchasePriceOverride);
+    const n = normalizeOverrideIn(data.purchasePriceOverride);
+    patch.purchasePriceOverride = n === undefined ? undefined : n === null ? null : dec(n);
   }
   if (data.salePriceOverride !== undefined) {
-    patch.salePriceOverride = data.salePriceOverride === null ? null : dec(data.salePriceOverride);
+    const n = normalizeOverrideIn(data.salePriceOverride);
+    patch.salePriceOverride = n === undefined ? undefined : n === null ? null : dec(n);
   }
 
   const nextPurchase =
@@ -416,16 +436,19 @@ export async function updateMetalVariantPricing(
   const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
   const suggested = computeSuggested(ref, new Prisma.Decimal(updated.purity ?? 0));
 
+  const pOvNum = normalizeOverrideOut(updated.purchasePriceOverride);
+  const sOvNum = normalizeOverrideOut(updated.salePriceOverride);
+
   const finalPurchase = computeFinal(
     suggested,
     new Prisma.Decimal(updated.buyFactor ?? 1),
-    updated.purchasePriceOverride !== null ? new Prisma.Decimal(updated.purchasePriceOverride as any) : null
+    pOvNum !== null ? new Prisma.Decimal(updated.purchasePriceOverride as any) : null
   );
 
   const finalSale = computeFinal(
     suggested,
     new Prisma.Decimal(updated.saleFactor ?? 1),
-    updated.salePriceOverride !== null ? new Prisma.Decimal(updated.salePriceOverride as any) : null
+    sOvNum !== null ? new Prisma.Decimal(updated.salePriceOverride as any) : null
   );
 
   return {
@@ -442,8 +465,10 @@ export async function updateMetalVariantPricing(
 
     buyFactor: Number(updated.buyFactor ?? 1),
     saleFactor: Number(updated.saleFactor ?? 1),
-    purchasePriceOverride: updated.purchasePriceOverride === null ? null : Number(updated.purchasePriceOverride),
-    salePriceOverride: updated.salePriceOverride === null ? null : Number(updated.salePriceOverride),
+
+    purchasePriceOverride: pOvNum,
+    salePriceOverride: sOvNum,
+
     pricingMode: (updated as any).pricingMode ?? "AUTO",
 
     suggestedPrice: Number(suggested),
@@ -518,11 +543,17 @@ export async function listMetalVariants(
     const buyFactor = new Prisma.Decimal(v.buyFactor ?? 1);
     const saleFactor = new Prisma.Decimal(v.saleFactor ?? 1);
 
-    const pOverride = v.purchasePriceOverride !== null ? new Prisma.Decimal(v.purchasePriceOverride as any) : null;
-    const sOverride = v.salePriceOverride !== null ? new Prisma.Decimal(v.salePriceOverride as any) : null;
+    const pOvNum = normalizeOverrideOut(v.purchasePriceOverride);
+    const sOvNum = normalizeOverrideOut(v.salePriceOverride);
+
+    const pOverride = pOvNum !== null ? new Prisma.Decimal(v.purchasePriceOverride as any) : null;
+    const sOverride = sOvNum !== null ? new Prisma.Decimal(v.salePriceOverride as any) : null;
 
     const finalPurchase = computeFinal(suggested, buyFactor, pOverride);
     const finalSale = computeFinal(suggested, saleFactor, sOverride);
+
+    const effectivePricingMode =
+      (pOvNum !== null || sOvNum !== null) ? ((v as any).pricingMode ?? "OVERRIDE") : "AUTO";
 
     return {
       id: v.id,
@@ -538,9 +569,11 @@ export async function listMetalVariants(
 
       buyFactor: Number(v.buyFactor ?? 1),
       saleFactor: Number(v.saleFactor ?? 1),
-      purchasePriceOverride: v.purchasePriceOverride === null ? null : Number(v.purchasePriceOverride),
-      salePriceOverride: v.salePriceOverride === null ? null : Number(v.salePriceOverride),
-      pricingMode: (v as any).pricingMode ?? "AUTO",
+
+      purchasePriceOverride: pOvNum,
+      salePriceOverride: sOvNum,
+
+      pricingMode: effectivePricingMode,
 
       suggestedPrice: Number(suggested),
       finalPurchasePrice: Number(finalPurchase),

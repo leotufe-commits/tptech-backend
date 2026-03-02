@@ -19,6 +19,11 @@ import storageRoutes from "../modules/storage/storage.routes.js";
 import catalogsRoutes from "../modules/catalogs/catalogs.routes.js";
 import permissionsRoutes from "../modules/permissions/permissions.routes.js";
 
+/* =====================
+   ✅ DASHBOARD
+===================== */
+import dashboardRoutes from "../modules/dashboard/dashboard.routes.js";
+
 const router = Router();
 
 /* =====================
@@ -53,5 +58,11 @@ router.use("/permissions", requireAuth, permissionsRoutes);
 
 // valuation ya aplica requireAuth internamente
 router.use("/valuation", valuationRoutes);
+
+/* =====================
+   ✅ DASHBOARD (privado)
+   Base: /dashboard
+===================== */
+router.use("/dashboard", requireAuth, dashboardRoutes);
 
 export default router;
