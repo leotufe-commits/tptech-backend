@@ -15,7 +15,6 @@ router.use(requireAuth);
 
 /* =========================
    PERMISSIONS (simple)
-   Ajustá si querés más fino después
 ========================= */
 const canView = requirePermission("CURRENCIES", "VIEW");
 const canEdit = requirePermission("CURRENCIES", "EDIT");
@@ -65,6 +64,9 @@ router.post("/variants/:variantId/set-favorite", canEdit, c.postSetFavoriteVaria
 router.post("/metals/:metalId/clear-favorite", canEdit, c.postClearFavoriteVariant);
 
 router.delete("/variants/:variantId", canEdit, c.deleteVariant);
+
+/* ✅ HISTORIAL PARA MODAL (OPCIÓN B) */
+router.get("/variants/:variantId/value-history", canView, c.getVariantValueHistory);
 
 /* =========================================================
    COTIZACIONES (QUOTES)

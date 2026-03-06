@@ -211,6 +211,9 @@ export async function me(req: Request, res: Response) {
 /* =========================
    REGISTER
 ========================= */
+/* =========================
+   REGISTER
+========================= */
 export async function register(req: Request, res: Response) {
   const data = req.body as any;
   const email = s(data.email).toLowerCase();
@@ -221,6 +224,8 @@ export async function register(req: Request, res: Response) {
 
   try {
     const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+
+      // 1️⃣ Crear Jewelry
       const jewelry = await tx.jewelry.create({
         data: {
           name: s(data.jewelryName),
@@ -237,14 +242,28 @@ export async function register(req: Request, res: Response) {
         },
       });
 
+      // 2️⃣ Crear almacén Principal automático
+      const principalWarehouse = await tx.warehouse.create({
+        data: {
+          jewelryId: jewelry.id,
+          name: "Principal",
+          code: "PRINCIPAL",
+          isActive: true,
+        },
+      });
+
+      // 3️⃣ Crear permisos base
       const permissionsData: { module: PermModule; action: PermAction }[] = [];
-      for (const module of ALL_MODULES) for (const action of ALL_ACTIONS) permissionsData.push({ module, action });
+      for (const module of ALL_MODULES)
+        for (const action of ALL_ACTIONS)
+          permissionsData.push({ module, action });
 
       await tx.permission.createMany({ data: permissionsData, skipDuplicates: true });
 
       const allPermissions: PermissionRow[] = await tx.permission.findMany();
       const permIdByKey = new Map<string, string>();
-      for (const p of allPermissions) permIdByKey.set(`${p.module}:${p.action}`, p.id);
+      for (const p of allPermissions)
+        permIdByKey.set(`${p.module}:${p.action}`, p.id);
 
       const pick = (modules: PermModule[], actions: PermAction[]) => {
         const ids: string[] = [];
@@ -262,22 +281,37 @@ export async function register(req: Request, res: Response) {
         {
           name: "STAFF",
           isSystem: true,
-          permIds: pick(ALL_MODULES as PermModule[], [PermAction.VIEW, PermAction.CREATE, PermAction.EDIT]),
+          permIds: pick(ALL_MODULES as PermModule[], [
+            PermAction.VIEW,
+            PermAction.CREATE,
+            PermAction.EDIT,
+          ]),
         },
         { name: "READONLY", isSystem: true, permIds: pick(ALL_MODULES as PermModule[], [PermAction.VIEW]) },
       ] as const;
 
       let ownerRoleId = "";
       for (const r of rolesToCreate) {
-        const role = await tx.role.create({ data: { name: r.name, jewelryId: jewelry.id, isSystem: r.isSystem } });
+        const role = await tx.role.create({
+          data: {
+            name: r.name,
+            jewelryId: jewelry.id,
+            isSystem: r.isSystem,
+          },
+        });
+
         if (r.name === "OWNER") ownerRoleId = role.id;
 
         await tx.rolePermission.createMany({
-          data: r.permIds.map((permissionId) => ({ roleId: role.id, permissionId })),
+          data: r.permIds.map((permissionId) => ({
+            roleId: role.id,
+            permissionId,
+          })),
           skipDuplicates: true,
         });
       }
 
+      // 4️⃣ Crear usuario OWNER con almacén favorito
       const user = await tx.user.create({
         data: {
           email,
@@ -286,16 +320,28 @@ export async function register(req: Request, res: Response) {
           status: UserStatus.ACTIVE,
           jewelryId: jewelry.id,
           tokenVersion: 0,
+          favoriteWarehouseId: principalWarehouse.id,
         },
       });
 
-      await tx.userRole.create({ data: { userId: user.id, roleId: ownerRoleId } });
+      await tx.userRole.create({
+        data: { userId: user.id, roleId: ownerRoleId },
+      });
 
-      const fullUser = await tx.user.findUniqueOrThrow({ where: { id: user.id }, include: AUTH_USER_INCLUDE });
+      const fullUser = await tx.user.findUniqueOrThrow({
+        where: { id: user.id },
+        include: AUTH_USER_INCLUDE,
+      });
+
       return { user: fullUser, jewelry };
     });
 
-    const token = signToken(result.user.id, result.user.jewelryId, result.user.tokenVersion);
+    const token = signToken(
+      result.user.id,
+      result.user.jewelryId,
+      result.user.tokenVersion
+    );
+
     setAuthCookie(req, res, token);
 
     auditLog(req, {
@@ -306,16 +352,32 @@ export async function register(req: Request, res: Response) {
       meta: { email },
     });
 
-    return res.status(201).json(buildAuthResponse({ user: { ...result.user, jewelry: result.jewelry }, token, includeToken: true }));
+    return res.status(201).json(
+      buildAuthResponse({
+        user: { ...result.user, jewelry: result.jewelry },
+        token,
+        includeToken: true,
+      })
+    );
   } catch (e: any) {
     if (isPrismaUniqueError(e)) {
       const targets = prismaUniqueTargets(e);
       if (targets.includes("email") || targets.join(",").includes("email")) {
-        auditLog(req, { action: "auth.register", success: false, meta: { email, reason: "unique_email_conflict" } });
+        auditLog(req, {
+          action: "auth.register",
+          success: false,
+          meta: { email, reason: "unique_email_conflict" },
+        });
         return res.status(409).json({ message: "El email ya está registrado." });
       }
     }
-    auditLog(req, { action: "auth.register", success: false, meta: { email, reason: "unknown_error" } });
+
+    auditLog(req, {
+      action: "auth.register",
+      success: false,
+      meta: { email, reason: "unknown_error" },
+    });
+
     return res.status(500).json({ message: "No se pudo registrar." });
   }
 }

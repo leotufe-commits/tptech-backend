@@ -93,11 +93,34 @@ export function computeSuggested(referenceValue: Prisma.Decimal, purity: Prisma.
 /**
  * ✅ override puede ser 0, así que NO usar truthy
  */
-export function computeFinal(suggested: Prisma.Decimal, factor: Prisma.Decimal, override: Prisma.Decimal | null) {
+export function computeFinal(
+  suggested: Prisma.Decimal,
+  factor: Prisma.Decimal,
+  override: Prisma.Decimal | null
+) {
   if (override !== null) return override;
   return suggested.mul(factor);
 }
 
 export function hasOverride(v: any) {
   return v !== null && v !== undefined;
+}
+
+/* =========================
+   ✅ Historial profesional (no duplicar)
+========================= */
+
+/** Redondeo “de almacenamiento” para Decimal(18,6) */
+export function round6(n: any) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return NaN;
+  return Math.round(x * 1_000_000) / 1_000_000;
+}
+
+/** Compara dos números redondeados a 6 decimales */
+export function same6(a: any, b: any) {
+  const ra = round6(a);
+  const rb = round6(b);
+  if (!Number.isFinite(ra) || !Number.isFinite(rb)) return false;
+  return ra === rb;
 }

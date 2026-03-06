@@ -2,11 +2,20 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
-import { dec, assertNonEmpty, toRefValue, clampTake } from "./valuation.helpers.js";
+import { dec, assertNonEmpty, toRefValue, clampTake, computeSuggested, computeFinal } from "./valuation.helpers.js";
+import { ensureBaseVariantQuoteSnapshot } from "./valuation.quotes.service.js";
 
 function freedName(name: string, id: string) {
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   return `deleted__${name}__${id}__${suffix}`;
+}
+
+function normalizeOverrideOut(v: any) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return null;
+  return n;
 }
 
 /* =========================
@@ -52,50 +61,72 @@ export async function createMetal(
   const refN = toRefValue(data.referenceValue);
   const ref = refN !== undefined ? dec(refN) : new Prisma.Decimal(0);
 
-  // sortOrder al final
-  const max = await prisma.metal.aggregate({
-    where: { jewelryId, deletedAt: null },
-    _max: { sortOrder: true },
-  });
-  const nextSort = Number(max._max.sortOrder ?? 0) + 1;
-
-  // unique name (solo no eliminados)
-  const dup = await prisma.metal.findFirst({
-    where: { jewelryId, name, deletedAt: null },
-    select: { id: true },
-  });
-  if (dup) {
-    const err: any = new Error("Ya existe un metal con ese nombre.");
-    err.status = 409;
-    throw err;
-  }
-
   const now = new Date();
 
   return prisma.$transaction(async (tx) => {
-    const row = await tx.metal.create({
-      data: {
-        jewelryId,
-        name,
-        symbol,
-        referenceValue: ref,
-        sortOrder: nextSort,
-        isActive: true,
-        deletedAt: null,
-      },
-      select: {
-        id: true,
-        name: true,
-        symbol: true,
-        referenceValue: true,
-        sortOrder: true,
-        isActive: true,
-        createdAt: true,
-        updatedAt: true,
-      },
+    // ✅ sortOrder al final (dentro de tx para evitar carreras)
+    const max = await tx.metal.aggregate({
+      where: { jewelryId, deletedAt: null },
+      _max: { sortOrder: true },
+    });
+    const nextSort = Number(max._max.sortOrder ?? 0) + 1;
+
+    // ✅ UNIQUE real en DB: (jewelryId, name) -> NO contempla deletedAt
+    // Entonces buscamos por name sin filtrar deletedAt.
+    const anyRow = await tx.metal.findFirst({
+      where: { jewelryId, name },
+      select: { id: true, deletedAt: true },
     });
 
-    // historial inicial
+    if (anyRow) {
+      // vive -> conflicto real
+      if (!anyRow.deletedAt) {
+        const err: any = new Error("Ya existe un metal con ese nombre.");
+        err.status = 409;
+        throw err;
+      }
+
+      // borrado -> liberar el unique renombrando el name del borrado
+      await tx.metal.update({
+        where: { id: anyRow.id },
+        data: { name: freedName(name, anyRow.id) },
+      });
+    }
+
+    let row;
+    try {
+      row = await tx.metal.create({
+        data: {
+          jewelryId,
+          name,
+          symbol,
+          referenceValue: ref,
+          sortOrder: nextSort,
+          isActive: true,
+          deletedAt: null,
+        },
+        select: {
+          id: true,
+          name: true,
+          symbol: true,
+          referenceValue: true,
+          sortOrder: true,
+          isActive: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+    } catch (e: any) {
+      // ✅ mensaje claro si igual hubo colisión
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+        const err: any = new Error("Ya existe un metal con ese nombre (o fue eliminado sin liberar el nombre).");
+        err.status = 409;
+        throw err;
+      }
+      throw e;
+    }
+
+    // historial inicial metal padre
     await tx.metalRefValueHistory.create({
       data: {
         jewelryId,
@@ -138,19 +169,6 @@ export async function updateMetal(
   const name = assertNonEmpty(data.name, "Nombre requerido.").trim();
   const symbol = String(data.symbol || "").trim();
 
-  // si cambia el name, validar duplicado
-  if (name !== metal.name) {
-    const dup = await prisma.metal.findFirst({
-      where: { jewelryId, name, deletedAt: null, id: { not: metalId } },
-      select: { id: true },
-    });
-    if (dup) {
-      const err: any = new Error("Ya existe un metal con ese nombre.");
-      err.status = 409;
-      throw err;
-    }
-  }
-
   const refN = toRefValue(data.referenceValue);
   const nextRef = refN !== undefined ? dec(refN) : undefined;
 
@@ -158,29 +176,64 @@ export async function updateMetal(
   const now = new Date();
 
   return prisma.$transaction(async (tx) => {
-    const updated = await tx.metal.update({
-      where: { id: metalId },
-      data: {
-        name,
-        symbol,
-        ...(nextRef !== undefined ? { referenceValue: nextRef } : {}),
-      },
-      select: {
-        id: true,
-        name: true,
-        symbol: true,
-        referenceValue: true,
-        sortOrder: true,
-        isActive: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    // ✅ Si cambia el name:
+    // - si existe vivo con ese name -> 409
+    // - si existe borrado con ese name -> liberar renombrándolo
+    if (name !== metal.name) {
+      const dupAny = await tx.metal.findFirst({
+        where: { jewelryId, name, id: { not: metalId } },
+        select: { id: true, deletedAt: true },
+      });
+
+      if (dupAny) {
+        if (!dupAny.deletedAt) {
+          const err: any = new Error("Ya existe un metal con ese nombre.");
+          err.status = 409;
+          throw err;
+        }
+
+        await tx.metal.update({
+          where: { id: dupAny.id },
+          data: { name: freedName(name, dupAny.id) },
+        });
+      }
+    }
+
+    let updated;
+    try {
+      updated = await tx.metal.update({
+        where: { id: metalId },
+        data: {
+          name,
+          symbol,
+          ...(nextRef !== undefined ? { referenceValue: nextRef } : {}),
+        },
+        select: {
+          id: true,
+          name: true,
+          symbol: true,
+          referenceValue: true,
+          sortOrder: true,
+          isActive: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+    } catch (e: any) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+        const err: any = new Error("Ya existe un metal con ese nombre.");
+        err.status = 409;
+        throw err;
+      }
+      throw e;
+    }
 
     const newRef = new Prisma.Decimal(updated.referenceValue ?? 0);
 
-    // guardar historial solo si cambió referenceValue
-    if (!newRef.equals(prevRef)) {
+    // guardar historial metal padre solo si cambió referenceValue
+    const refChanged = !newRef.equals(prevRef);
+
+    if (refChanged) {
       await tx.metalRefValueHistory.create({
         data: {
           jewelryId,
@@ -190,6 +243,41 @@ export async function updateMetal(
           createdById: createdById || null,
         },
       });
+
+      // ✅ HISTORIAL PROFESIONAL: al cambiar el valor del metal padre,
+      // guardamos snapshot para TODAS las variantes (sugerido/final).
+      const variants = await tx.metalVariant.findMany({
+        where: { metalId: updated.id, deletedAt: null },
+        select: {
+          id: true,
+          purity: true,
+          saleFactor: true,
+          salePriceOverride: true,
+        },
+      });
+
+      for (const v of variants) {
+        const purity = new Prisma.Decimal(v.purity ?? 0);
+        const suggested = computeSuggested(newRef, purity);
+
+        const sOvNum = normalizeOverrideOut(v.salePriceOverride);
+        const sOv = sOvNum !== null ? new Prisma.Decimal(sOvNum) : null;
+
+        const finalSale = computeFinal(
+          suggested,
+          new Prisma.Decimal(v.saleFactor ?? 1),
+          sOv
+        );
+
+        await ensureBaseVariantQuoteSnapshot({
+          jewelryId,
+          variantId: v.id,
+          suggestedPrice: Number(suggested),
+          finalPrice: Number(finalSale),
+          effectiveAt: now,
+          tx,
+        });
+      }
     }
 
     return {
@@ -359,7 +447,10 @@ export async function deleteMetal(jewelryId: string, metalId: string) {
     data: {
       deletedAt: now,
       isActive: false,
+
+      // ✅ FIX CLAVE: liberar UNIQUE (jewelryId, name)
       name: freedName(metal.name, metal.id),
+
       symbol: "",
       referenceValue: new Prisma.Decimal(0),
     },

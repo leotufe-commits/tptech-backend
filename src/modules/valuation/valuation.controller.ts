@@ -38,7 +38,7 @@ import {
   clearFavoriteVariant,
   toggleVariantActive,
   deleteMetalVariant as deleteVariantSvc,
-} from "./valuation.service.js";
+} from "./valuation.variants.service.js";
 
 // ✅ COTIZACIONES (service específico)
 import { addMetalQuote, listMetalQuotes } from "./valuation.quotes.service.js";
@@ -173,7 +173,6 @@ export async function deleteCurrencyCtrl(req: Request, res: Response) {
 export async function postSetBaseCurrency(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
-  // ✅ acá el service espera string (no null)
   const userId = requireUserId(req, res);
   if (!userId) return;
 
@@ -242,7 +241,6 @@ export async function patchCurrencyActive(req: Request, res: Response) {
 export async function postCurrencyRate(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
-  // ✅ acá el service espera string (no undefined)
   const userId = requireUserId(req, res);
   if (!userId) return;
 
@@ -334,7 +332,6 @@ export async function getMetals(req: Request, res: Response) {
 export async function postMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
-  // ✅ acá el service espera string (no undefined)
   const userId = requireUserId(req, res);
   if (!userId) return;
 
@@ -360,7 +357,6 @@ export async function postMetal(req: Request, res: Response) {
 export async function patchMetal(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
-  // ✅ acá el service espera string (no undefined)
   const userId = requireUserId(req, res);
   if (!userId) return;
 
@@ -502,12 +498,16 @@ export async function getMetalRefHistory(req: Request, res: Response) {
 
 export async function postMetalVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ Opción B: necesitamos actor para snapshot
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const parsed = createMetalVariantSchema.parse(req.body);
 
   try {
-    const row = await createMetalVariant(jewelryId, parsed);
+    // ✅ pasamos actorUserId al service (debe soportarlo)
+    const row = await createMetalVariant(jewelryId, { ...parsed, actorUserId: userId } as any);
 
     await auditLog(req, {
       action: "valuation.variant.create",
@@ -544,7 +544,10 @@ export async function getMetalVariants(req: Request, res: Response) {
 
 export async function patchVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ Opción B: necesitamos actor para snapshot
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const variantId = String(req.params.variantId || "").trim();
   if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
@@ -552,7 +555,8 @@ export async function patchVariant(req: Request, res: Response) {
   const parsed = updateMetalVariantSchema.parse(req.body);
 
   try {
-    const row = await updateMetalVariant(jewelryId, variantId, parsed as any);
+    // ✅ pasamos actorUserId al service (debe soportarlo)
+    const row = await updateMetalVariant(jewelryId, variantId, { ...(parsed as any), actorUserId: userId } as any);
 
     await auditLog(req, {
       action: "valuation.variant.update",
@@ -570,7 +574,10 @@ export async function patchVariant(req: Request, res: Response) {
 
 export async function patchVariantPricing(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ Opción B: necesitamos actor para snapshot
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const variantId = String(req.params.variantId || "").trim();
   if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
@@ -578,7 +585,8 @@ export async function patchVariantPricing(req: Request, res: Response) {
   const parsed = updateMetalVariantPricingSchema.parse(req.body);
 
   try {
-    const row = await updateMetalVariantPricing(jewelryId, variantId, parsed);
+    // ✅ pasamos actorUserId al service (debe soportarlo)
+    const row = await updateMetalVariantPricing(jewelryId, variantId, { ...parsed, actorUserId: userId } as any);
 
     await auditLog(req, {
       action: "valuation.variant.pricing.update",
@@ -696,18 +704,21 @@ export async function deleteVariantCtrl(req: Request, res: Response) {
 
 export async function postMetalQuote(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
-  const userId: string | undefined = (req as any).user?.id;
+
+  // ✅ Opción B: guardar quién creó el quote
+  const userId = requireUserId(req, res);
+  if (!userId) return;
 
   const parsed = createMetalQuoteSchema.parse(req.body);
 
   try {
-    const row = await addMetalQuote(jewelryId, parsed);
+    const row = await addMetalQuote(jewelryId, { ...parsed, createdById: userId });
 
     await auditLog(req, {
       action: "valuation.quote.create",
       success: true,
       userId,
-      meta: parsed,
+      meta: { ...parsed, createdById: userId },
     });
 
     res.json({ ok: true, row });
@@ -734,11 +745,98 @@ export async function getMetalQuotes(req: Request, res: Response) {
 }
 
 /* =========================================================
+   ✅ HISTORIAL VALOR VARIANTE (para el modal)
+   - Por ahora lo resolvemos con "quotes" si existen.
+========================================================= */
+
+export async function getVariantValueHistory(req: Request, res: Response) {
+  const jewelryId = requireTenantId(req);
+
+  const variantId = String(req.params.variantId || "").trim();
+  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
+
+  const take = getTake(req, 200);
+
+  const fromRaw = String(req.query.from || "").trim();
+  const toRaw = String(req.query.to || "").trim();
+
+  const from = fromRaw ? new Date(fromRaw) : null;
+  const to = toRaw ? new Date(toRaw) : null;
+
+  try {
+    const variant = await prisma.metalVariant.findFirst({
+      where: { id: variantId, deletedAt: null, metal: { jewelryId, deletedAt: null } },
+      select: {
+        id: true,
+        metalId: true,
+        name: true,
+        sku: true,
+        isActive: true,
+        metal: { select: { id: true, name: true, symbol: true, isActive: true } },
+      },
+    });
+    if (!variant) return res.status(404).json({ ok: false, error: "Variante no encontrada." });
+
+    const where: any = {
+      variantId,
+      variant: { deletedAt: null, metal: { jewelryId, deletedAt: null } },
+      currency: { deletedAt: null },
+    };
+
+    if (from || to) {
+      where.effectiveAt = {};
+      if (from) where.effectiveAt.gte = from;
+      if (to) where.effectiveAt.lte = to;
+    }
+
+    const rows = await prisma.metalQuote.findMany({
+      where,
+      orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
+      take,
+      select: {
+        id: true,
+        effectiveAt: true,
+        createdAt: true,
+        purchasePrice: true,
+        salePrice: true,
+        currency: { select: { id: true, code: true, symbol: true, isBase: true, isActive: true } },
+        createdBy: { select: { id: true, name: true, email: true } },
+      },
+    });
+
+    const history = rows.map((r) => ({
+      id: r.id,
+      effectiveAt: r.effectiveAt,
+      createdAt: r.createdAt,
+
+      // - suggestedPrice: usamos purchasePrice como sugerido/base
+      // - finalSalePrice: salePrice
+      // - finalPurchasePrice: purchasePrice
+      suggestedPrice: Number(r.purchasePrice),
+      finalSalePrice: Number(r.salePrice),
+      finalPurchasePrice: Number(r.purchasePrice),
+
+      reason: r.currency?.isBase ? "Snapshot automático" : "Cotización manual",
+      currency: r.currency,
+      user: r.createdBy ? { id: r.createdBy.id, name: r.createdBy.name, email: r.createdBy.email } : null,
+    }));
+
+    res.json({ ok: true, variant, current: history[0] ?? null, history });
+  } catch (e: any) {
+    const status = Number(e?.status) || 500;
+    res.status(status).json({ ok: false, error: String(e?.message || "Error obteniendo historial de variante.") });
+  }
+}
+
+/* =========================================================
    Aliases para routes con import * as c
 ========================================================= */
 export const deleteCurrency = deleteCurrencyCtrl;
 export const deleteMetal = deleteMetalCtrl;
 export const deleteVariant = deleteVariantCtrl;
+
+// ✅ alias explícito (por si querés router.get(..., c.getVariantValueHistory))
+export const variantValueHistory = getVariantValueHistory;
 
 export default {
   getCurrencies,
@@ -771,4 +869,6 @@ export default {
 
   postMetalQuote,
   getMetalQuotes,
+
+  getVariantValueHistory,
 };

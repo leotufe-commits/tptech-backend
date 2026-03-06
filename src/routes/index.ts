@@ -18,6 +18,7 @@ import rolesRoutes from "../modules/roles/roles.routes.js";
 import storageRoutes from "../modules/storage/storage.routes.js";
 import catalogsRoutes from "../modules/catalogs/catalogs.routes.js";
 import permissionsRoutes from "../modules/permissions/permissions.routes.js";
+import warehousesRoutes from "../modules/warehouses/warehouses.routes.js";
 
 /* =====================
    ✅ DASHBOARD
@@ -43,6 +44,7 @@ router.use("/movimientos", requireAuth, movimientosRoutes);
 router.use("/users", requireAuth, usersRoutes);
 router.use("/company", requireAuth, companyRoutes);
 router.use("/roles", requireAuth, rolesRoutes);
+router.use("/warehouses", requireAuth, warehousesRoutes);
 
 /**
  * Catalogs

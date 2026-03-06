@@ -11,6 +11,8 @@ import {
   computeFinal,
 } from "./valuation.helpers.js";
 
+import { ensureBaseVariantQuoteSnapshot } from "./valuation.quotes.service.js";
+
 function freedSku(sku: string, id: string) {
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   return `deleted__${sku}__${id}__${suffix}`;
@@ -35,6 +37,36 @@ function normalizeOverrideOut(v: any) {
   return n;
 }
 
+/** ✅ crea snapshot profesional: purchase=sugerido, sale=final */
+async function snapshotVariantAutoHistory(args: {
+  jewelryId: string;
+  variantId: string;
+  referenceValue: Prisma.Decimal;
+  purity: Prisma.Decimal;
+  saleFactor: Prisma.Decimal;
+  saleOverride: Prisma.Decimal | null;
+  effectiveAt?: Date;
+  tx?: Prisma.TransactionClient;
+
+  /** ✅ Opción B: quién hizo el cambio (queda en createdById del quote) */
+  actorUserId?: string;
+}) {
+  const suggested = computeSuggested(args.referenceValue, args.purity);
+  const finalSale = computeFinal(suggested, args.saleFactor, args.saleOverride);
+
+  await ensureBaseVariantQuoteSnapshot({
+    jewelryId: args.jewelryId,
+    variantId: args.variantId,
+    suggestedPrice: Number(suggested),
+    finalPrice: Number(finalSale),
+    effectiveAt: args.effectiveAt,
+    tx: args.tx,
+    createdById: args.actorUserId,
+  });
+
+  return { suggested, finalSale };
+}
+
 /* =========================
    Variantes
 ========================= */
@@ -50,6 +82,9 @@ export async function createMetalVariant(
     saleFactor?: number;
     purchasePriceOverride?: number | null;
     salePriceOverride?: number | null;
+
+    /** ✅ Opción B: actor */
+    actorUserId?: string;
   }
 ) {
   const metal = await prisma.metal.findFirst({
@@ -107,89 +142,105 @@ export async function createMetalVariant(
       ? null
       : dec(sOverrideIn);
 
-  const v = await prisma.metalVariant.create({
-    data: {
-      metalId: data.metalId,
-      name,
-      sku,
+  const now = new Date();
 
-      // ✅ FIX: guardamos pureza con 4 decimales (schema: Decimal(6,4))
-      purity: dec(purityN, 4),
+  const out = await prisma.$transaction(async (tx) => {
+    const v = await tx.metalVariant.create({
+      data: {
+        metalId: data.metalId,
+        name,
+        sku,
 
-      isActive: true,
-      isFavorite: false,
-      deletedAt: null,
+        // ✅ FIX: guardamos pureza con 4 decimales (schema: Decimal(6,4))
+        purity: dec(purityN, 4),
 
-      buyFactor,
-      saleFactor,
-      ...(pOverride !== undefined ? { purchasePriceOverride: pOverride } : {}),
-      ...(sOverride !== undefined ? { salePriceOverride: sOverride } : {}),
-      pricingMode,
-    },
-    select: {
-      id: true,
-      metalId: true,
-      name: true,
-      sku: true,
-      purity: true,
-      isFavorite: true,
-      isActive: true,
-      createdAt: true,
-      updatedAt: true,
-      buyFactor: true,
-      saleFactor: true,
-      purchasePriceOverride: true,
-      salePriceOverride: true,
-      pricingMode: true,
-    },
+        isActive: true,
+        isFavorite: false,
+        deletedAt: null,
+
+        buyFactor,
+        saleFactor,
+        ...(pOverride !== undefined ? { purchasePriceOverride: pOverride } : {}),
+        ...(sOverride !== undefined ? { salePriceOverride: sOverride } : {}),
+        pricingMode,
+      },
+      select: {
+        id: true,
+        metalId: true,
+        name: true,
+        sku: true,
+        purity: true,
+        isFavorite: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+        buyFactor: true,
+        saleFactor: true,
+        purchasePriceOverride: true,
+        salePriceOverride: true,
+        pricingMode: true,
+      },
+    });
+
+    const ref = new Prisma.Decimal(metal.referenceValue ?? 0);
+    const purity = new Prisma.Decimal(v.purity ?? 0);
+    const sOvNum = normalizeOverrideOut(v.salePriceOverride);
+    const sOv =
+      sOvNum !== null ? new Prisma.Decimal(v.salePriceOverride as any) : null;
+
+    const { suggested, finalSale } = await snapshotVariantAutoHistory({
+      jewelryId,
+      variantId: v.id,
+      referenceValue: ref,
+      purity,
+      saleFactor: new Prisma.Decimal(v.saleFactor ?? 1),
+      saleOverride: sOv,
+      effectiveAt: now,
+      tx,
+      actorUserId: data.actorUserId,
+    });
+
+    return {
+      v,
+      ref,
+      suggested,
+      finalSale,
+      sOvNum,
+      pOvNum: normalizeOverrideOut(v.purchasePriceOverride),
+      finalPurchase: computeFinal(
+        suggested,
+        new Prisma.Decimal(v.buyFactor ?? 1),
+        normalizeOverrideOut(v.purchasePriceOverride) !== null
+          ? new Prisma.Decimal(v.purchasePriceOverride as any)
+          : null
+      ),
+    };
   });
 
-  const ref = new Prisma.Decimal(metal.referenceValue ?? 0);
-  const purity = new Prisma.Decimal(v.purity ?? 0);
-  const suggested = computeSuggested(ref, purity);
-
-  // ✅ si override es 0/negativo => lo tratamos como null
-  const pOvNum = normalizeOverrideOut(v.purchasePriceOverride);
-  const sOvNum = normalizeOverrideOut(v.salePriceOverride);
-
-  const pOv = pOvNum !== null ? new Prisma.Decimal(v.purchasePriceOverride as any) : null;
-  const sOv = sOvNum !== null ? new Prisma.Decimal(v.salePriceOverride as any) : null;
-
-  const finalPurchase = computeFinal(
-    suggested,
-    new Prisma.Decimal(v.buyFactor ?? 1),
-    pOv
-  );
-  const finalSale = computeFinal(
-    suggested,
-    new Prisma.Decimal(v.saleFactor ?? 1),
-    sOv
-  );
-
   return {
-    id: v.id,
-    metalId: v.metalId,
-    name: v.name,
-    sku: v.sku,
-    purity: Number(v.purity),
+    id: out.v.id,
+    metalId: out.v.metalId,
+    name: out.v.name,
+    sku: out.v.sku,
+    purity: Number(out.v.purity),
 
-    isFavorite: v.isFavorite,
-    isActive: v.isActive,
-    createdAt: v.createdAt,
-    updatedAt: v.updatedAt,
+    isFavorite: out.v.isFavorite,
+    isActive: out.v.isActive,
+    createdAt: out.v.createdAt,
+    updatedAt: out.v.updatedAt,
 
-    buyFactor: Number(v.buyFactor ?? 1),
-    saleFactor: Number(v.saleFactor ?? 1),
+    buyFactor: Number(out.v.buyFactor ?? 1),
+    saleFactor: Number(out.v.saleFactor ?? 1),
 
-    purchasePriceOverride: pOvNum,
-    salePriceOverride: sOvNum,
+    purchasePriceOverride: out.pOvNum,
+    salePriceOverride: out.sOvNum,
 
-    pricingMode: (v as any).pricingMode ?? "AUTO",
+    pricingMode: (out.v as any).pricingMode ?? "AUTO",
 
-    suggestedPrice: Number(suggested),
-    finalPurchasePrice: Number(finalPurchase),
-    finalSalePrice: Number(finalSale),
-    referenceValue: Number(ref),
+    suggestedPrice: Number(out.suggested),
+    finalPurchasePrice: Number(out.finalPurchase),
+    finalSalePrice: Number(out.finalSale),
+    referenceValue: Number(out.ref),
   };
 }
 
@@ -202,6 +253,9 @@ export async function updateMetalVariant(
     purity: number;
     saleFactor?: number;
     salePriceOverride?: number | null;
+
+    /** ✅ Opción B: actor */
+    actorUserId?: string;
   }
 ) {
   const existing = await prisma.metalVariant.findFirst({
@@ -255,8 +309,7 @@ export async function updateMetalVariant(
   const purityDec = dec(purityN, 4);
 
   const saleFactorN = assertFactor(data.saleFactor, "Ajuste venta (factor)");
-  const saleFactorDec =
-    saleFactorN !== undefined ? dec(saleFactorN, 1) : undefined;
+  const saleFactorDec = saleFactorN !== undefined ? dec(saleFactorN, 1) : undefined;
 
   // ✅ normalizamos override: 0 => null
   const saleOverrideN = normalizeOverrideIn(data.salePriceOverride);
@@ -274,83 +327,95 @@ export async function updateMetalVariant(
       ? ("AUTO" as any)
       : ("OVERRIDE" as any);
 
-  const updated = await prisma.metalVariant.update({
-    where: { id: variantId },
-    data: {
-      name: nextName,
-      sku: nextSku,
-      purity: purityDec,
-      ...(saleFactorDec !== undefined ? { saleFactor: saleFactorDec } : {}),
-      ...(saleOverrideDec !== undefined
-        ? { salePriceOverride: saleOverrideDec }
-        : {}),
-      ...(pricingMode !== undefined ? { pricingMode } : {}),
-    },
-    select: {
-      id: true,
-      metalId: true,
-      name: true,
-      sku: true,
-      purity: true,
-      isFavorite: true,
-      isActive: true,
-      buyFactor: true,
-      saleFactor: true,
-      purchasePriceOverride: true,
-      salePriceOverride: true,
-      pricingMode: true,
-      createdAt: true,
-      updatedAt: true,
-      metal: { select: { referenceValue: true } },
-    },
+  const now = new Date();
+
+  const out = await prisma.$transaction(async (tx) => {
+    const updated = await tx.metalVariant.update({
+      where: { id: variantId },
+      data: {
+        name: nextName,
+        sku: nextSku,
+        purity: purityDec,
+        ...(saleFactorDec !== undefined ? { saleFactor: saleFactorDec } : {}),
+        ...(saleOverrideDec !== undefined ? { salePriceOverride: saleOverrideDec } : {}),
+        ...(pricingMode !== undefined ? { pricingMode } : {}),
+      },
+      select: {
+        id: true,
+        metalId: true,
+        name: true,
+        sku: true,
+        purity: true,
+        isFavorite: true,
+        isActive: true,
+        buyFactor: true,
+        saleFactor: true,
+        purchasePriceOverride: true,
+        salePriceOverride: true,
+        pricingMode: true,
+        createdAt: true,
+        updatedAt: true,
+        metal: { select: { referenceValue: true } },
+      },
+    });
+
+    const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
+    const suggested = computeSuggested(ref, new Prisma.Decimal(updated.purity ?? 0));
+
+    const pOvNum = normalizeOverrideOut(updated.purchasePriceOverride);
+    const sOvNum = normalizeOverrideOut(updated.salePriceOverride);
+
+    const finalPurchase = computeFinal(
+      suggested,
+      new Prisma.Decimal(updated.buyFactor ?? 1),
+      pOvNum !== null ? new Prisma.Decimal(updated.purchasePriceOverride as any) : null
+    );
+
+    const sOv = sOvNum !== null ? new Prisma.Decimal(updated.salePriceOverride as any) : null;
+    const finalSale = computeFinal(
+      suggested,
+      new Prisma.Decimal(updated.saleFactor ?? 1),
+      sOv
+    );
+
+    // ✅ HISTORIAL AUTOMÁTICO (profesional) + createdById
+    await ensureBaseVariantQuoteSnapshot({
+      jewelryId,
+      variantId: updated.id,
+      suggestedPrice: Number(suggested),
+      finalPrice: Number(finalSale),
+      effectiveAt: now,
+      tx,
+      createdById: data.actorUserId,
+    });
+
+    return { updated, ref, suggested, finalPurchase, finalSale, pOvNum, sOvNum };
   });
 
-  const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
-  const suggested = computeSuggested(ref, new Prisma.Decimal(updated.purity ?? 0));
-
-  const pOvNum = normalizeOverrideOut(updated.purchasePriceOverride);
-  const sOvNum = normalizeOverrideOut(updated.salePriceOverride);
-
-  const finalPurchase = computeFinal(
-    suggested,
-    new Prisma.Decimal(updated.buyFactor ?? 1),
-    pOvNum !== null
-      ? new Prisma.Decimal(updated.purchasePriceOverride as any)
-      : null
-  );
-
-  const finalSale = computeFinal(
-    suggested,
-    new Prisma.Decimal(updated.saleFactor ?? 1),
-    sOvNum !== null
-      ? new Prisma.Decimal(updated.salePriceOverride as any)
-      : null
-  );
-
   return {
-    id: updated.id,
-    metalId: updated.metalId,
-    name: updated.name,
-    sku: updated.sku,
-    purity: Number(updated.purity),
+    id: out.updated.id,
+    metalId: out.updated.metalId,
+    name: out.updated.name,
+    sku: out.updated.sku,
+    purity: Number(out.updated.purity),
 
-    isFavorite: updated.isFavorite,
-    isActive: updated.isActive,
-    createdAt: updated.createdAt,
-    updatedAt: updated.updatedAt,
+    isFavorite: out.updated.isFavorite,
+    isActive: out.updated.isActive,
+    createdAt: out.updated.createdAt,
+    updatedAt: out.updated.updatedAt,
 
-    buyFactor: Number(updated.buyFactor ?? 1),
-    saleFactor: Number(updated.saleFactor ?? 1),
+    buyFactor: Number(out.updated.buyFactor ?? 1),
+    saleFactor: Number(out.updated.saleFactor ?? 1),
 
-    purchasePriceOverride: pOvNum,
-    salePriceOverride: sOvNum,
+    purchasePriceOverride: out.pOvNum,
+    salePriceOverride: out.sOvNum,
 
-    pricingMode: (updated as any).pricingMode ?? "AUTO",
+    pricingMode: (out.updated as any).pricingMode ?? "AUTO",
 
-    suggestedPrice: Number(suggested),
-    finalPurchasePrice: Number(finalPurchase),
-    finalSalePrice: Number(finalSale),
-    referenceValue: Number(ref),
+    suggestedPrice: Number(out.suggested),
+    finalPurchasePrice: Number(out.finalPurchase),
+    finalSalePrice: Number(out.finalSale),
+    referenceValue: Number(out.ref),
   };
 }
 
@@ -364,6 +429,9 @@ export async function updateMetalVariantPricing(
     salePriceOverride?: number | null;
     clearPurchaseOverride?: boolean;
     clearSaleOverride?: boolean;
+
+    /** ✅ Opción B: actor */
+    actorUserId?: string;
   }
 ) {
   const v = await prisma.metalVariant.findFirst({
@@ -372,6 +440,9 @@ export async function updateMetalVariantPricing(
       id: true,
       metalId: true,
       metal: { select: { referenceValue: true } },
+      purity: true,
+      buyFactor: true,
+      saleFactor: true,
       purchasePriceOverride: true,
       salePriceOverride: true,
     },
@@ -404,77 +475,96 @@ export async function updateMetalVariantPricing(
 
   const nextPurchase =
     patch.purchasePriceOverride !== undefined ? patch.purchasePriceOverride : v.purchasePriceOverride;
-  const nextSale = patch.salePriceOverride !== undefined ? patch.salePriceOverride : v.salePriceOverride;
+  const nextSale =
+    patch.salePriceOverride !== undefined ? patch.salePriceOverride : v.salePriceOverride;
 
   patch.pricingMode =
     (nextPurchase !== null && nextPurchase !== undefined) || (nextSale !== null && nextSale !== undefined)
       ? ("OVERRIDE" as any)
       : ("AUTO" as any);
 
-  const updated = await prisma.metalVariant.update({
-    where: { id: variantId },
-    data: patch,
-    select: {
-      id: true,
-      metalId: true,
-      name: true,
-      sku: true,
-      purity: true,
-      isFavorite: true,
-      isActive: true,
-      createdAt: true,
-      updatedAt: true,
-      buyFactor: true,
-      saleFactor: true,
-      purchasePriceOverride: true,
-      salePriceOverride: true,
-      pricingMode: true,
-      metal: { select: { referenceValue: true } },
-    },
+  const now = new Date();
+
+  const out = await prisma.$transaction(async (tx) => {
+    const updated = await tx.metalVariant.update({
+      where: { id: variantId },
+      data: patch,
+      select: {
+        id: true,
+        metalId: true,
+        name: true,
+        sku: true,
+        purity: true,
+        isFavorite: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+        buyFactor: true,
+        saleFactor: true,
+        purchasePriceOverride: true,
+        salePriceOverride: true,
+        pricingMode: true,
+        metal: { select: { referenceValue: true } },
+      },
+    });
+
+    const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
+    const suggested = computeSuggested(ref, new Prisma.Decimal(updated.purity ?? 0));
+
+    const pOvNum = normalizeOverrideOut(updated.purchasePriceOverride);
+    const sOvNum = normalizeOverrideOut(updated.salePriceOverride);
+
+    const finalPurchase = computeFinal(
+      suggested,
+      new Prisma.Decimal(updated.buyFactor ?? 1),
+      pOvNum !== null ? new Prisma.Decimal(updated.purchasePriceOverride as any) : null
+    );
+
+    const sOv = sOvNum !== null ? new Prisma.Decimal(updated.salePriceOverride as any) : null;
+    const finalSale = computeFinal(
+      suggested,
+      new Prisma.Decimal(updated.saleFactor ?? 1),
+      sOv
+    );
+
+    // ✅ HISTORIAL AUTOMÁTICO (profesional) + createdById
+    await ensureBaseVariantQuoteSnapshot({
+      jewelryId,
+      variantId: updated.id,
+      suggestedPrice: Number(suggested),
+      finalPrice: Number(finalSale),
+      effectiveAt: now,
+      tx,
+      createdById: data.actorUserId,
+    });
+
+    return { updated, ref, suggested, finalPurchase, finalSale, pOvNum, sOvNum };
   });
 
-  const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
-  const suggested = computeSuggested(ref, new Prisma.Decimal(updated.purity ?? 0));
-
-  const pOvNum = normalizeOverrideOut(updated.purchasePriceOverride);
-  const sOvNum = normalizeOverrideOut(updated.salePriceOverride);
-
-  const finalPurchase = computeFinal(
-    suggested,
-    new Prisma.Decimal(updated.buyFactor ?? 1),
-    pOvNum !== null ? new Prisma.Decimal(updated.purchasePriceOverride as any) : null
-  );
-
-  const finalSale = computeFinal(
-    suggested,
-    new Prisma.Decimal(updated.saleFactor ?? 1),
-    sOvNum !== null ? new Prisma.Decimal(updated.salePriceOverride as any) : null
-  );
-
   return {
-    id: updated.id,
-    metalId: updated.metalId,
-    name: updated.name,
-    sku: updated.sku,
-    purity: Number(updated.purity),
+    id: out.updated.id,
+    metalId: out.updated.metalId,
+    name: out.updated.name,
+    sku: out.updated.sku,
+    purity: Number(out.updated.purity),
 
-    isFavorite: updated.isFavorite,
-    isActive: updated.isActive,
-    createdAt: updated.createdAt,
-    updatedAt: updated.updatedAt,
+    isFavorite: out.updated.isFavorite,
+    isActive: out.updated.isActive,
+    createdAt: out.updated.createdAt,
+    updatedAt: out.updated.updatedAt,
 
-    buyFactor: Number(updated.buyFactor ?? 1),
-    saleFactor: Number(updated.saleFactor ?? 1),
+    buyFactor: Number(out.updated.buyFactor ?? 1),
+    saleFactor: Number(out.updated.saleFactor ?? 1),
 
-    purchasePriceOverride: pOvNum,
-    salePriceOverride: sOvNum,
+    purchasePriceOverride: out.pOvNum,
+    salePriceOverride: out.sOvNum,
 
-    pricingMode: (updated as any).pricingMode ?? "AUTO",
+    pricingMode: (out.updated as any).pricingMode ?? "AUTO",
 
-    suggestedPrice: Number(suggested),
-    finalPurchasePrice: Number(finalPurchase),
-    finalSalePrice: Number(finalSale),
-    referenceValue: Number(ref),
+    suggestedPrice: Number(out.suggested),
+    finalPurchasePrice: Number(out.finalPurchase),
+    finalSalePrice: Number(out.finalSale),
+    referenceValue: Number(out.ref),
   };
 }
 
@@ -509,7 +599,10 @@ export async function listMetalVariants(
 
   const q = String(params?.q || "").trim();
   if (q) {
-    where.OR = [{ name: { contains: q, mode: "insensitive" } }, { sku: { contains: q, mode: "insensitive" } }];
+    where.OR = [
+      { name: { contains: q, mode: "insensitive" } },
+      { sku: { contains: q, mode: "insensitive" } },
+    ];
   }
 
   const rows = await prisma.metalVariant.findMany({
@@ -553,7 +646,7 @@ export async function listMetalVariants(
     const finalSale = computeFinal(suggested, saleFactor, sOverride);
 
     const effectivePricingMode =
-      (pOvNum !== null || sOvNum !== null) ? ((v as any).pricingMode ?? "OVERRIDE") : "AUTO";
+      pOvNum !== null || sOvNum !== null ? ((v as any).pricingMode ?? "OVERRIDE") : "AUTO";
 
     return {
       id: v.id,

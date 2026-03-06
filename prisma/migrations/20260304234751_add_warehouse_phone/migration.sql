@@ -1,0 +1,11 @@
+-- AlterTable
+ALTER TABLE "Warehouse" ADD COLUMN     "attn" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "city" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "country" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "location" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "number" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "phoneCountry" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "phoneNumber" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "postalCode" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "province" TEXT NOT NULL DEFAULT '',
+ADD COLUMN     "street" TEXT NOT NULL DEFAULT '';
