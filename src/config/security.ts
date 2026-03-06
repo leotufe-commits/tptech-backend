@@ -7,14 +7,32 @@ const isProd = process.env.NODE_ENV === "production";
 
 export function buildHelmetMiddleware(): RequestHandler {
   return helmet({
-    contentSecurityPolicy: false,
+    // API pura: bloquear todo por defecto en prod; en dev/staging se relaja para el mail preview
+    contentSecurityPolicy: {
+      directives: isProd
+        ? {
+            defaultSrc: ["'none'"],
+            frameAncestors: ["'none'"],
+            formAction: ["'none'"],
+            baseUri: ["'none'"],
+          }
+        : {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:", "https:"],
+            frameAncestors: ["'none'"],
+            formAction: ["'self'"],
+            baseUri: ["'self'"],
+          },
+    },
     frameguard: { action: "deny" },
     referrerPolicy: { policy: "no-referrer" },
     hsts: isProd
       ? { maxAge: 15552000, includeSubDomains: true, preload: true } // ~180 días
       : false,
 
-    // ✅ permite servir imágenes/recursos en cross-origin (frontend separado)
+    // permite servir imágenes/recursos en cross-origin (frontend separado)
     crossOriginResourcePolicy: { policy: "cross-origin" },
   });
 }
