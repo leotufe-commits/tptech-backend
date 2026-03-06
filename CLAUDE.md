@@ -7,6 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Always respond in Spanish.
 - The user is not a developer. Keep all explanations clear and simple.
 
+## Deployment
+
+- **Hosting**: [Render](https://render.com) — backend como Web Service, frontend como Static Site
+- **Repositorios**: GitHub (`leotufe-commits/tptech-backend` y `leotufe-commits/tptech-frontend`)
+- **Email en producción**: [Postmark](https://postmarkapp.com) — configurar `MAIL_MODE=production` y `POSTMARK_API_TOKEN` en las env vars de Render
+- **Almacenamiento de archivos**: Cloudflare R2 en producción (configurar las vars `R2_*` en Render)
+
 ## Commands
 
 ```bash
