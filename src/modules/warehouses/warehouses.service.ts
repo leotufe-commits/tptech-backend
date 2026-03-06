@@ -14,6 +14,27 @@ function assert(cond: any, msg: string) {
 }
 
 /* =========================
+   CÓDIGO AUTO DE ALMACÉN
+   Formato: ALM01, BOD02, CEN03, etc.
+   - 3 letras del nombre (sin tildes) + número de orden (2 dígitos)
+   - Solo se usa si el usuario deja el campo code vacío.
+   - Cuenta TODOS los almacenes del tenant (incluso borrados)
+     para que el número nunca se reutilice.
+========================= */
+async function generateWarehouseCode(jewelryId: string, name: string): Promise<string> {
+  const prefix = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // quitar tildes
+    .replace(/[^a-zA-Z]/g, "")       // solo letras
+    .toUpperCase()
+    .substring(0, 3)
+    .padEnd(3, "X");
+
+  const count = await prisma.warehouse.count({ where: { jewelryId } });
+  return `${prefix}${String(count + 1).padStart(2, "0")}`;
+}
+
+/* =========================
    INTERNAL: LIST BASE
 ========================= */
 async function listWarehousesBase(jewelryId: string) {
@@ -110,11 +131,14 @@ export async function createWarehouse(jewelryId: string, userId: string, data: a
   const name = s(data?.name);
   assert(name, "Nombre requerido.");
 
+  const codeRaw = s(data?.code ?? "");
+  const code = codeRaw || (await generateWarehouseCode(jewelryId, name));
+
   const created = await prisma.warehouse.create({
     data: {
       jewelryId,
       name,
-      code: s(data?.code ?? ""),
+      code,
 
       phoneCountry: s(data?.phoneCountry ?? ""),
       phoneNumber: s(data?.phoneNumber ?? ""),

@@ -41,6 +41,28 @@ function clampTake(v: any, fallback = 50) {
   return Math.max(1, Math.min(200, Math.floor(n)));
 }
 
+/* =========================
+   CÓDIGO CORRELATIVO
+   Formato: E-0001 | S-0001 | T-0001 | A-0001
+   - Cuenta TODOS los movimientos del tenant+kind (incluso anulados)
+     para que el número nunca se reutilice.
+   - Riesgo de colisión es mínimo (baja concurrencia en joyería).
+========================= */
+const KIND_PREFIX: Record<Kind, string> = {
+  IN: "E",
+  OUT: "S",
+  TRANSFER: "T",
+  ADJUST: "A",
+};
+
+async function generateMovementCode(jewelryId: string, kind: Kind): Promise<string> {
+  const prefix = KIND_PREFIX[kind] ?? "M";
+  const count = await prisma.inventoryMovement.count({
+    where: { jewelryId, kind },
+  });
+  return `${prefix}-${String(count + 1).padStart(4, "0")}`;
+}
+
 export async function listMovements(opts: {
   jewelryId: string;
   userId: string;
@@ -158,12 +180,14 @@ export async function createMovement(opts: {
   assert(!!wh, "Almacén no encontrado.");
   assert(wh!.isActive, "El almacén está inactivo.");
 
+  const code = await generateMovementCode(jewelryId, opts.kind);
+
   // crea movimiento + líneas
   const created = await prisma.inventoryMovement.create({
     data: {
       jewelryId,
       kind: opts.kind,
-      code: "", // si querés, luego lo generamos con un correlativo
+      code,
       note: s(opts.note || ""),
       effectiveAt: opts.effectiveAt ?? new Date(),
 
@@ -233,11 +257,13 @@ export async function transferMovement(opts: {
   assert(fromWh!.isActive, "El almacén origen está inactivo.");
   assert(toWh!.isActive, "El almacén destino está inactivo.");
 
+  const transferCode = await generateMovementCode(jewelryId, "TRANSFER");
+
   const created = await prisma.inventoryMovement.create({
     data: {
       jewelryId,
       kind: "TRANSFER",
-      code: "",
+      code: transferCode,
       note: s(opts.note || ""),
       effectiveAt: opts.effectiveAt ?? new Date(),
 
