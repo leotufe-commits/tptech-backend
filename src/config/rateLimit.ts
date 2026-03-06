@@ -33,3 +33,14 @@ export const authResetLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: "Demasiados intentos. Intentá más tarde." },
 });
+
+/**
+ * Register: evitar creación masiva de cuentas
+ */
+export const authRegisterLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Demasiados registros desde esta IP. Intentá más tarde." },
+});

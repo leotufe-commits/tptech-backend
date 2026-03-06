@@ -136,7 +136,7 @@ export async function patchCurrency(req: Request, res: Response) {
       action: "valuation.currency.update",
       success: true,
       userId,
-      meta: { id: row.id, code: row.code },
+      meta: { id: row?.id, code: row?.code },
     });
 
     res.json({ ok: true, row });
@@ -184,7 +184,6 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
       jewelryId,
       newBaseCurrencyId: currencyId,
       actorUserId: userId,
-      effectiveAt: new Date(),
     });
 
     await auditLog(req, {

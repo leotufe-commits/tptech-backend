@@ -5,7 +5,7 @@ function s(v: any) {
   return String(v ?? "").trim();
 }
 
-function assert(cond: any, msg: string) {
+function assert(cond: any, msg: string): asserts cond {
   if (!cond) {
     const err: any = new Error(msg);
     err.status = 400;

@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { r2, R2_BUCKET, R2_ENABLED } from "../lib/storage/r2.js";
+import { buildObjectKey } from "../lib/storage/keys.js";
 
 type MulterFile = Express.Multer.File & { _tpFolder?: string };
 
@@ -26,31 +27,83 @@ function randomName(originalname: string) {
   return `${Date.now()}-${rnd}${ext}`;
 }
 
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+
+function getTenantId(req: Request) {
+  return s((req as any).tenantId || (req as any).jewelryId);
+}
+
 /**
- * Field => folder
- * (tus controllers siguen usando toPublicUploadUrl(req, folder, file.filename))
+ * Field => kind para buildObjectKey()
  */
-function folderForField(field: string) {
-  if (field === "logo") return "jewelry/logos";
-  if (field === "attachments" || field === "attachments[]") return "jewelry/attachments";
-  return "jewelry/attachments";
+function kindForField(field: string) {
+  if (field === "logo") return "jewelry_logo" as const;
+  if (field === "attachments" || field === "attachments[]") return "attachment" as const;
+  return "attachment" as const;
+}
+
+/**
+ * Genera un key PRO (por tenant) y devuelve:
+ * - key completo (tptech/tenants/.../archivo.ext)
+ * - folder (dirname del key)
+ * - filename (basename del key)
+ */
+function buildKeyFor(req: Request, file: Express.Multer.File) {
+  const tenantId = getTenantId(req);
+  const kind = kindForField(file.fieldname);
+
+  const originalName = s(file.originalname || "file");
+  const ext = extFromOriginal(originalName).replace(/^\./, ""); // sin punto
+
+  const key = buildObjectKey({
+    tenantId,
+    kind,
+    originalName,
+    ext,
+  });
+
+  const folder = path.posix.dirname(key);
+  const filename = path.posix.basename(key);
+
+  return { key, folder, filename };
 }
 
 /* =========================
    Multer base
 ========================= */
 
-// LOCAL (disco)
+// LOCAL (disco): guardamos en uploads/<folder>
 const diskStorage = multer.diskStorage({
-  destination: (_req, file, cb) => {
-    const folder = folderForField(file.fieldname);
-    const dest = path.join(process.cwd(), "uploads", folder);
-    ensureDir(dest);
-    (file as MulterFile)._tpFolder = folder;
-    cb(null, dest);
+  destination: (req, file, cb) => {
+    try {
+      const tenantId = getTenantId(req);
+      if (!tenantId) return cb(new Error("Tenant no definido"), "");
+
+      const { folder } = buildKeyFor(req, file);
+      const dest = path.join(process.cwd(), "uploads", folder);
+
+      ensureDir(dest);
+      (file as MulterFile)._tpFolder = folder;
+
+      cb(null, dest);
+    } catch (e: any) {
+      cb(e, "");
+    }
   },
-  filename: (_req, file, cb) => {
-    cb(null, randomName(file.originalname));
+  filename: (req, file, cb) => {
+    try {
+      const tenantId = getTenantId(req);
+      if (!tenantId) return cb(new Error("Tenant no definido"), "");
+
+      const { filename } = buildKeyFor(req, file);
+
+      // IMPORTANTE: en local, usamos el mismo nombre final que en R2 (basename del key)
+      cb(null, filename);
+    } catch (e: any) {
+      cb(e, "");
+    }
   },
 });
 
@@ -92,12 +145,17 @@ export const uploadJewelryFiles = [
 
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // Si no hay R2, ya quedó guardado en disco
+      // Si no hay R2, ya quedó guardado en disco (diskStorage)
       if (!R2_ENABLED) return next();
 
-      // R2 habilitado, pero igual chequeamos por seguridad
+      // R2 habilitado, pero chequeamos por seguridad
       if (!r2 || !R2_BUCKET) {
         return res.status(500).json({ message: "Storage R2 no configurado." });
+      }
+
+      const tenantId = getTenantId(req);
+      if (!tenantId) {
+        return res.status(400).json({ message: "Tenant no definido." });
       }
 
       const filesByField = (req as any).files as Record<string, MulterFile[]> | undefined;
@@ -106,9 +164,7 @@ export const uploadJewelryFiles = [
       const allFiles: MulterFile[] = Object.values(filesByField).flat();
 
       for (const f of allFiles) {
-        const folder = folderForField(f.fieldname);
-        const filename = randomName(f.originalname);
-        const key = `${folder}/${filename}`;
+        const { key, folder, filename } = buildKeyFor(req, f);
 
         await r2.send(
           new PutObjectCommand({
@@ -116,14 +172,17 @@ export const uploadJewelryFiles = [
             Key: key,
             Body: (f as any).buffer,
             ContentType: f.mimetype || "application/octet-stream",
+            CacheControl: (f.mimetype || "").startsWith("image/")
+              ? "public, max-age=31536000, immutable"
+              : "public, max-age=3600",
           })
         );
 
-        // dejamos como si fuera disco: filename listo para toPublicUploadUrl(folder, filename)
+        // Dejamos el file “como si fuera disco”, pero con folder PRO:
         f.filename = filename;
         f._tpFolder = folder;
 
-        // limpieza
+        // Limpieza
         delete (f as any).buffer;
       }
 

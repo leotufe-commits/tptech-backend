@@ -2,7 +2,7 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { requireAuth } from "../../middlewares/requireAuth.js";
 import { validateBody } from "../../middlewares/validate.js";
-import { authLoginLimiter, authForgotLimiter, authResetLimiter } from "../../config/rateLimit.js";
+import { authLoginLimiter, authForgotLimiter, authResetLimiter, authRegisterLimiter } from "../../config/rateLimit.js";
 
 // ✅ AHORA desde modules (no controllers)
 import * as Auth from "./auth.controller.js";
@@ -99,7 +99,7 @@ router.delete(
    AUTH PÚBLICO
 ========================= */
 
-router.post("/register", validateBody(registerSchema), safeMw((Auth as any).register));
+router.post("/register", safeMw(authRegisterLimiter), validateBody(registerSchema), safeMw((Auth as any).register));
 
 /**
  * ✅ POST (oficial)

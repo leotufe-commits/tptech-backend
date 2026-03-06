@@ -1163,5 +1163,5 @@ export async function sendUserInvite(req: Request, res: Response) {
   });
 
   const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
-  return res.json(isDev ? { ok: true, devLink: resetLink } : { ok: true });
+  return res.json(isDev ? { ok: true, devLink: inviteLink } : { ok: true });
 }

@@ -3,17 +3,15 @@ import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { UserStatus, OverrideEffect } from "@prisma/client";
 
-import { prisma, setContextTenantId, setContextUserId } from "../lib/prisma.js";
+import { prisma } from "../lib/prisma.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("❌ JWT_SECRET no está configurado");
 const JWT_SECRET_SAFE: string = JWT_SECRET;
 
-// ✅ defaults seguros (y no dependen del tipado de getEnv)
 const JWT_ISSUER = process.env.JWT_ISSUER || "tptech";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "tptech-web";
 
-// mismo nombre que en auth.base.controller.ts
 const AUTH_COOKIE = "tptech_session";
 
 function isProd() {
@@ -38,7 +36,12 @@ function unauthorized(res: Response, message = "Unauthorized") {
   return res.status(401).json({ message });
 }
 
-/** Devuelve Bearer si existe (sin validar) */
+function forbidden(res: Response, message = "Forbidden") {
+  // ✅ también limpiamos cookie para que el navegador no siga insistiendo con la misma sesión
+  clearAuthCookie(res);
+  return res.status(403).json({ message });
+}
+
 function readBearer(req: Request): string | null {
   const h = req.headers.authorization;
   if (h && typeof h === "string") {
@@ -48,7 +51,6 @@ function readBearer(req: Request): string | null {
   return null;
 }
 
-/** Devuelve cookie si existe (sin validar) */
 function readCookieToken(req: Request): string | null {
   const c = (req as any).cookies?.[AUTH_COOKIE];
   if (typeof c === "string" && c.trim().length > 0) return c.trim();
@@ -56,14 +58,13 @@ function readCookieToken(req: Request): string | null {
 }
 
 /**
- * ✅ Política correcta:
+ * ✅ Política:
  * - Si HAY cookie → SOLO cookie
- * - Si NO hay cookie → Bearer (útil para clients/API)
+ * - Si NO hay cookie → Bearer
  */
 function verifyAnyToken(req: Request): any | null {
   const cookie = readCookieToken(req);
 
-  // ✅ si existe cookie, NO hacemos fallback a bearer
   if (cookie) {
     try {
       return jwt.verify(cookie, JWT_SECRET_SAFE, {
@@ -116,7 +117,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       where: {
         id: userId,
         jewelryId: tenantId,
-        deletedAt: null,
+        deletedAt: null, // ✅ clave soft delete
       },
       select: {
         id: true,
@@ -150,25 +151,23 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
     if (!user) return unauthorized(res);
 
+    // ✅ Si está eliminado o bloqueado/pending => cortamos sesión prolijo
     if (user.status !== UserStatus.ACTIVE) {
-      return res.status(403).json({ message: "Usuario no habilitado." });
+      return forbidden(res, "Usuario no habilitado.");
     }
 
-    // ✅ SOLO validar tokenVersion si el JWT lo trae
+    // ✅ Solo validar tokenVersion si el JWT lo trae
     if (tokenVersion !== null && user.tokenVersion !== tokenVersion) {
       return unauthorized(res, "Sesión expirada");
     }
 
     // =========================
-    // ✅ CONTEXTO REQ (compat)
+    // CONTEXTO REQ (compat)
     // =========================
     (req as any).userId = user.id;
     (req as any).tenantId = user.jewelryId;
-
-    // ✅ Alias útiles
     (req as any).jewelryId = user.jewelryId;
 
-    // ✅ CLAVE: algunos handlers leen req.user
     (req as any).user = {
       id: user.id,
       jewelryId: user.jewelryId,
@@ -185,13 +184,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
     (req as any).roles = Array.from(new Set(roleNames));
     (req as any).isOwner = Boolean((req as any).roles?.includes?.("OWNER"));
-
-    try {
-      setContextUserId(user.id);
-      setContextTenantId(user.jewelryId);
-    } catch {
-      // no-op
-    }
 
     const base = new Set<string>();
 

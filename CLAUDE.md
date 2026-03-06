@@ -7,6 +7,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Always respond in Spanish.
 - The user is not a developer. Keep all explanations clear and simple.
 
+## Performance para dispositivos móviles (OBLIGATORIO)
+
+La app es usada desde celulares con conexión limitada. Las respuestas de la API deben ser lo más livianas posible:
+
+- **Paginación obligatoria** en todos los endpoints que devuelvan listas (`skip`/`take` con Prisma). Nunca devolver todos los registros sin límite.
+- **Seleccionar solo los campos necesarios** en cada query Prisma (`select: { ... }`). Nunca usar `findMany` sin `select` en modelos grandes.
+- **Evitar N+1 queries**: usar `include` o `select` anidado en vez de hacer queries dentro de loops.
+- Respuestas JSON sin campos innecesarios: no mandar campos que el frontend no use.
+- Comprimir respuestas: el middleware de compresión (si no está, agregarlo) debe estar activo en producción.
+
 ## Deployment
 
 - **Hosting**: [Render](https://render.com) — backend como Web Service, frontend como Static Site
@@ -165,3 +175,49 @@ Per-endpoint limiters on auth routes (applied in `auth.routes.ts`):
 - `authForgotLimiter` — forgot password
 - `authResetLimiter` — reset password
 - `authRegisterLimiter` — register (10/hour/IP)
+
+### PIN / Quick Switch (`src/modules/auth/auth.pin.controller.ts`)
+
+Users can set a 4-digit PIN for screen unlock and quick user switching within the same tenant.
+
+- **PIN lock**: after 5 failed attempts → account locked for 5 minutes (`quickPinLockedUntil`)
+- **Quick switch**: `Jewelry.quickSwitchEnabled` must be true. The switching user authenticates with the *target* user's PIN (if `pinLockRequireOnUserSwitch` is true). Issues a new JWT for the target user.
+- **Company PIN lock settings**: `pinLockEnabled`, `pinLockTimeoutSec`, `pinLockRequireOnUserSwitch` — configurable per tenant via `PATCH /api/auth/company/security/pin-lock`.
+- PIN hash stored as bcrypt in `User.quickPinHash`. Setting or disabling a PIN increments `tokenVersion` to invalidate existing sessions.
+
+### Valuation module (`src/modules/valuation/`)
+
+Manages metals, metal variants, currencies and price quotes. The controller imports exclusively from `valuation.service.ts` (barrel), which re-exports from four sub-services:
+
+| Sub-service | Responsibility |
+|---|---|
+| `valuation.currencies.service.ts` | Currencies, FX rates, base currency |
+| `valuation.metals.service.ts` | Metals catalog, reference value history |
+| `valuation.variants.service.ts` | Metal variants (purity, buy/sale factors, pricing mode) |
+| `valuation.quotes.service.ts` | Price snapshots per variant + currency |
+
+**Pricing modes** (`VariantPricingMode`): `AUTO` (derived from metal reference value × purity × factor) or `OVERRIDE` (manual price). Both modes generate `MetalQuote` snapshots and `MetalVariantValueHistory` records.
+
+### Inventory stock materialization
+
+`WarehouseStock` keeps a running total of grams per `(jewelryId, warehouseId, variantId)`. It is updated atomically whenever movements are created or voided. This allows fast stock lookups and prevents warehouse deletion when stock > 0.
+
+### Module file conventions
+
+Each feature module under `src/modules/` follows this structure:
+- `*.routes.ts` — Express router, applies middleware and calls controller
+- `*.controller.ts` — Request/response handling, no business logic
+- `*.service.ts` — Business logic and Prisma queries (or barrel re-export)
+- `*.schemas.ts` — Zod schemas for request validation
+
+**Validation**: use `validateBody(schema)` middleware (from `src/middlewares/validate.ts`) before controllers. It runs `schema.safeParse(req.body)` and replies 400 with `{ message, issues }` on failure; replaces `req.body` with the parsed/sanitized value on success.
+
+**Multipart + JSON**: for endpoints that accept both file uploads and JSON data, use `parseJsonBodyField("data")` after Multer to parse a JSON-encoded field named `data` into `req.body`.
+
+### Audit logger (`src/lib/auditLogger.ts`)
+
+`auditLog(req, event)` or `auditLog(event)` — currently logs to console only (structured JSON). The `AuditLog` Prisma model exists for future DB persistence but is not written to yet.
+
+### Login flow
+
+`POST /api/auth/login/options` (also `GET` for legacy) — accepts `{ email }` and returns whether the user exists and what auth methods are available (password, PIN). The frontend calls this first to decide which login UI to show.
