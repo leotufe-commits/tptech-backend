@@ -7,8 +7,8 @@ import crypto from "node:crypto";
 import path from "node:path";
 import fs from "node:fs/promises";
 
-import { signResetToken, buildResetLink } from "../../lib/authTokens.js";
-import { sendResetEmail } from "../../lib/mailer.js";
+import { signResetToken, buildResetLink, buildInviteLink } from "../../lib/authTokens.js";
+import { sendResetEmail, sendInviteEmail } from "../../lib/mailer.js";
 import { createAuthTokenRecord } from "../../lib/authTokenStore.js";
 
 import { prisma } from "../../lib/prisma.js";
@@ -1110,8 +1110,8 @@ export async function sendUserInvite(req: Request, res: Response) {
   }
 
   const jti = crypto.randomUUID();
-  const resetToken = signResetToken(user.id, jti, "7d");
-  const resetLink = buildResetLink(resetToken);
+  const inviteToken = signResetToken(user.id, jti, "7d");
+  const inviteLink = buildInviteLink(inviteToken);
 
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
@@ -1142,7 +1142,7 @@ export async function sendUserInvite(req: Request, res: Response) {
   }
 
   try {
-    await sendResetEmail(user.email, resetLink);
+    await sendInviteEmail(user.email, inviteLink);
   } catch (e: any) {
     auditLog(req, {
       action: "users.invite_send",

@@ -34,6 +34,10 @@ export function buildResetLink(resetToken: string) {
   return `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
 }
 
+export function buildInviteLink(inviteToken: string) {
+  return `${APP_URL}/accept-invite?token=${encodeURIComponent(inviteToken)}`;
+}
+
 /** ✅ Verifica token reset y devuelve payload normalizado */
 export function verifyResetToken(token: string): { userId: string; jti: string } {
   const raw = jwt.verify(token, JWT_SECRET_SAFE, {
