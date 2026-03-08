@@ -2,12 +2,16 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { clampTake, same6 } from "./valuation.helpers.js";
+import { roundMoney, moneyMul, moneyDiv } from "../../lib/money.js";
 
 /* =========================
    Base currency
 ========================= */
 
-export async function getBaseCurrencyOrThrow(jewelryId: string, tx?: Prisma.TransactionClient) {
+export async function getBaseCurrencyOrThrow(
+  jewelryId: string,
+  tx?: Prisma.TransactionClient
+) {
   const db = tx ?? prisma;
 
   const base = await db.currency.findFirst({
@@ -33,8 +37,7 @@ export async function getBaseCurrencyOrThrow(jewelryId: string, tx?: Prisma.Tran
 export async function ensureBaseVariantQuoteSnapshot(args: {
   jewelryId: string;
   variantId: string;
-  suggestedPrice: number;
-  finalPrice: number;
+  price: number;
   effectiveAt?: Date;
   createdById?: string | null;
   tx?: Prisma.TransactionClient;
@@ -61,27 +64,20 @@ export async function ensureBaseVariantQuoteSnapshot(args: {
   const last = await db.metalQuote.findFirst({
     where: { variantId: args.variantId, currencyId: base.id },
     orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
-    select: { id: true, purchasePrice: true, salePrice: true },
+    select: { id: true, price: true },
   });
 
-  const nextSuggested = Number(args.suggestedPrice);
-  const nextFinal = Number(args.finalPrice);
+  const nextPrice = roundMoney(args.price);
 
-  if (last) {
-    const sameSuggested = same6(last.purchasePrice, nextSuggested);
-    const sameFinal = same6(last.salePrice, nextFinal);
-
-    if (sameSuggested && sameFinal) {
-      return { created: false, quoteId: last.id };
-    }
+  if (last && same6(last.price, nextPrice)) {
+    return { created: false, quoteId: last.id };
   }
 
   const row = await db.metalQuote.create({
     data: {
       variantId: args.variantId,
       currencyId: base.id,
-      purchasePrice: nextSuggested,
-      salePrice: nextFinal,
+      price: nextPrice,
       effectiveAt: args.effectiveAt ?? new Date(),
       createdById: args.createdById ?? null,
     },
@@ -100,8 +96,7 @@ export async function addMetalQuote(
   data: {
     variantId: string;
     currencyId: string;
-    purchasePrice: number;
-    salePrice: number;
+    price: number;
     effectiveAt?: Date;
     createdById?: string | null;
   }
@@ -136,8 +131,7 @@ export async function addMetalQuote(
     data: {
       variantId: data.variantId,
       currencyId: data.currencyId,
-      purchasePrice: data.purchasePrice,
-      salePrice: data.salePrice,
+      price: roundMoney(data.price),
       effectiveAt: data.effectiveAt ?? new Date(),
       createdById: data.createdById ?? null,
     },
@@ -148,7 +142,7 @@ export async function addMetalQuote(
    Conversión FX
 ========================= */
 
-async function getRateAt(currencyId: string, at: Date) {
+export async function getRateAt(currencyId: string, at: Date) {
   const r = await prisma.currencyRate.findFirst({
     where: {
       currencyId,
@@ -161,16 +155,96 @@ async function getRateAt(currencyId: string, at: Date) {
   if (!r) return null;
 
   return {
-    rate: Number(r.rate),
+    rate: roundMoney(r.rate),
     effectiveAt: r.effectiveAt,
   };
 }
 
+export async function convertPriceAt(args: {
+  jewelryId: string;
+  amount: number;
+  fromCurrencyId: string;
+  toCurrencyId: string;
+  at: Date;
+}) {
+  const amount = roundMoney(args.amount);
+  if (!Number.isFinite(amount)) return null;
+
+  if (args.fromCurrencyId === args.toCurrencyId) {
+    return roundMoney(amount);
+  }
+
+  const [fromCurrency, toCurrency] = await Promise.all([
+    prisma.currency.findFirst({
+      where: {
+        id: args.fromCurrencyId,
+        jewelryId: args.jewelryId,
+        deletedAt: null,
+      },
+      select: { id: true, isBase: true, code: true, symbol: true },
+    }),
+    prisma.currency.findFirst({
+      where: {
+        id: args.toCurrencyId,
+        jewelryId: args.jewelryId,
+        deletedAt: null,
+      },
+      select: { id: true, isBase: true, code: true, symbol: true },
+    }),
+  ]);
+
+  if (!fromCurrency || !toCurrency) return null;
+
+  // Convención actual del sistema:
+  // rate = valor de 1 unidad de la moneda en moneda base
+  // Ejemplo: USD rate 1200 => 1 USD = 1200 ARS(base)
+  if (fromCurrency.isBase) {
+    const toRate = await getRateAt(toCurrency.id, args.at);
+    if (!toRate || !Number.isFinite(toRate.rate) || toRate.rate <= 0) {
+      return null;
+    }
+    return roundMoney(moneyDiv(amount, toRate.rate));
+  }
+
+  if (toCurrency.isBase) {
+    const fromRate = await getRateAt(fromCurrency.id, args.at);
+    if (!fromRate || !Number.isFinite(fromRate.rate) || fromRate.rate <= 0) {
+      return null;
+    }
+    return roundMoney(moneyMul(amount, fromRate.rate));
+  }
+
+  const [fromRate, toRate] = await Promise.all([
+    getRateAt(fromCurrency.id, args.at),
+    getRateAt(toCurrency.id, args.at),
+  ]);
+
+  if (
+    !fromRate ||
+    !toRate ||
+    !Number.isFinite(fromRate.rate) ||
+    !Number.isFinite(toRate.rate) ||
+    fromRate.rate <= 0 ||
+    toRate.rate <= 0
+  ) {
+    return null;
+  }
+
+  const inBase = moneyMul(amount, fromRate.rate);
+  const out = moneyDiv(inBase, toRate.rate);
+
+  return roundMoney(out);
+}
+
 /* =========================
-   List quotes (conversión a base)
+   List quotes
 ========================= */
 
-export async function listMetalQuotes(jewelryId: string, variantId: string, take = 50) {
+export async function listMetalQuotes(
+  jewelryId: string,
+  variantId: string,
+  take = 50
+) {
   const v = await prisma.metalVariant.findFirst({
     where: {
       id: variantId,
@@ -186,8 +260,6 @@ export async function listMetalQuotes(jewelryId: string, variantId: string, take
     throw err;
   }
 
-  const base = await getBaseCurrencyOrThrow(jewelryId);
-
   const rows = await prisma.metalQuote.findMany({
     where: {
       variantId,
@@ -196,9 +268,21 @@ export async function listMetalQuotes(jewelryId: string, variantId: string, take
     },
     orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
     take: clampTake(take, 50),
-    include: {
+    select: {
+      id: true,
+      variantId: true,
+      currencyId: true,
+      price: true,
+      effectiveAt: true,
+      createdAt: true,
       currency: {
-        select: { id: true, code: true, symbol: true, isBase: true, isActive: true },
+        select: {
+          id: true,
+          code: true,
+          symbol: true,
+          isBase: true,
+          isActive: true,
+        },
       },
       createdBy: {
         select: { id: true, name: true, email: true },
@@ -206,36 +290,20 @@ export async function listMetalQuotes(jewelryId: string, variantId: string, take
     },
   });
 
-  const out: any[] = [];
-
-  for (const r of rows) {
-    const buy = Number(r.purchasePrice);
-    const sell = Number(r.salePrice);
-
-    if (r.currencyId === base.id) {
-      out.push({
-        ...r,
-        baseCurrency: base,
-        basePurchasePrice: buy,
-        baseSalePrice: sell,
-        fxRateUsed: 1,
-      });
-      continue;
-    }
-
-    const rateInfo = await getRateAt(r.currencyId, r.effectiveAt ?? r.createdAt);
-
-    const rate = rateInfo?.rate ?? null;
-
-    out.push({
-      ...r,
-      baseCurrency: base,
-      basePurchasePrice: rate ? buy * rate : null,
-      baseSalePrice: rate ? sell * rate : null,
-      fxRateUsed: rate,
-      fxRateEffectiveAt: rateInfo?.effectiveAt ?? null,
-    });
-  }
-
-  return out;
+  return rows.map((r) => ({
+    id: r.id,
+    variantId: r.variantId,
+    currencyId: r.currencyId,
+    price: roundMoney(r.price),
+    effectiveAt: r.effectiveAt,
+    createdAt: r.createdAt,
+    currency: r.currency,
+    user: r.createdBy
+      ? {
+          id: r.createdBy.id,
+          name: r.createdBy.name,
+          email: r.createdBy.email,
+        }
+      : null,
+  }));
 }

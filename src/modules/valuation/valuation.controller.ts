@@ -33,7 +33,6 @@ import {
   createMetalVariant,
   listMetalVariants,
   updateMetalVariant,
-  updateMetalVariantPricing,
   setFavoriteVariant,
   clearFavoriteVariant,
   toggleVariantActive,
@@ -41,7 +40,12 @@ import {
 } from "./valuation.variants.service.js";
 
 // ✅ COTIZACIONES (service específico)
-import { addMetalQuote, listMetalQuotes } from "./valuation.quotes.service.js";
+import {
+  addMetalQuote,
+  listMetalQuotes,
+  getBaseCurrencyOrThrow,
+  convertPriceAt,
+} from "./valuation.quotes.service.js";
 
 import {
   createCurrencySchema,
@@ -52,7 +56,6 @@ import {
   updateMetalSchema,
 
   createMetalVariantSchema,
-  updateMetalVariantPricingSchema,
   updateMetalVariantSchema,
   createMetalQuoteSchema,
 } from "./valuation.schemas.js";
@@ -125,7 +128,9 @@ export async function patchCurrency(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
-  if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  if (!currencyId) {
+    return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  }
 
   const parsed = updateCurrencySchema.parse(req.body);
 
@@ -142,7 +147,9 @@ export async function patchCurrency(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando moneda.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error actualizando moneda.") });
   }
 }
 
@@ -151,7 +158,9 @@ export async function deleteCurrencyCtrl(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const currencyId = String(req.params.currencyId || "").trim();
-  if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  if (!currencyId) {
+    return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  }
 
   try {
     await deleteCurrencySvc(jewelryId, currencyId);
@@ -166,7 +175,9 @@ export async function deleteCurrencyCtrl(req: Request, res: Response) {
     res.json({ ok: true });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error eliminando moneda.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error eliminando moneda.") });
   }
 }
 
@@ -177,7 +188,9 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
   if (!userId) return;
 
   const currencyId = String(req.params.currencyId || "").trim();
-  if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  if (!currencyId) {
+    return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  }
 
   try {
     const result = await setBaseCurrencyAndRecalc({
@@ -201,15 +214,26 @@ export async function postSetBaseCurrency(req: Request, res: Response) {
 
     const row = await prisma.currency.findFirst({
       where: { id: currencyId, jewelryId, deletedAt: null },
-      select: { id: true, code: true, name: true, symbol: true, isBase: true, isActive: true },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        symbol: true,
+        isBase: true,
+        isActive: true,
+      },
     });
 
-    if (!row) return res.status(404).json({ ok: false, error: "Moneda no encontrada." });
+    if (!row) {
+      return res.status(404).json({ ok: false, error: "Moneda no encontrada." });
+    }
 
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error cambiando moneda base.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error cambiando moneda base.") });
   }
 }
 
@@ -233,7 +257,9 @@ export async function patchCurrencyActive(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando estado de moneda.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error actualizando estado de moneda.") });
   }
 }
 
@@ -244,7 +270,9 @@ export async function postCurrencyRate(req: Request, res: Response) {
   if (!userId) return;
 
   const currencyId = String(req.params.currencyId || "").trim();
-  if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  if (!currencyId) {
+    return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  }
 
   const parsed = createCurrencyRateSchema.parse(req.body);
 
@@ -255,20 +283,29 @@ export async function postCurrencyRate(req: Request, res: Response) {
       action: "valuation.currency.rate.create",
       success: true,
       userId,
-      meta: { currencyId, currencyRateId: row.id, rate: parsed.rate, effectiveAt: parsed.effectiveAt },
+      meta: {
+        currencyId,
+        currencyRateId: row.id,
+        rate: parsed.rate,
+        effectiveAt: parsed.effectiveAt,
+      },
     });
 
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error creando tipo de cambio.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error creando tipo de cambio.") });
   }
 }
 
 export async function getCurrencyRates(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
   const currencyId = String(req.params.currencyId || "").trim();
-  if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  if (!currencyId) {
+    return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  }
 
   const take = getTake(req, 50);
 
@@ -277,22 +314,35 @@ export async function getCurrencyRates(req: Request, res: Response) {
     res.json({ ok: true, rows });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error obteniendo rates.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error obteniendo rates.") });
   }
 }
 
 export async function getCurrencyRateHistory(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
   const currencyId = String(req.params.currencyId || "").trim();
-  if (!currencyId) return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  if (!currencyId) {
+    return res.status(400).json({ ok: false, error: "currencyId requerido." });
+  }
 
   const take = getTake(req, 80);
 
   const currency = await prisma.currency.findFirst({
     where: { id: currencyId, jewelryId, deletedAt: null },
-    select: { id: true, code: true, name: true, symbol: true, isBase: true, isActive: true },
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      symbol: true,
+      isBase: true,
+      isActive: true,
+    },
   });
-  if (!currency) return res.status(404).json({ ok: false, error: "Moneda no encontrada." });
+  if (!currency) {
+    return res.status(404).json({ ok: false, error: "Moneda no encontrada." });
+  }
 
   const rates = await prisma.currencyRate.findMany({
     where: { currencyId },
@@ -312,7 +362,9 @@ export async function getCurrencyRateHistory(req: Request, res: Response) {
     rate: Number(r.rate),
     effectiveAt: r.effectiveAt,
     createdAt: r.createdAt,
-    user: r.createdBy ? { id: r.createdBy.id, name: r.createdBy.name, email: r.createdBy.email } : null,
+    user: r.createdBy
+      ? { id: r.createdBy.id, name: r.createdBy.name, email: r.createdBy.email }
+      : null,
   }));
 
   res.json({ ok: true, currency, current: history[0] ?? null, history });
@@ -349,7 +401,9 @@ export async function postMetal(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error creando metal.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error creando metal.") });
   }
 }
 
@@ -360,7 +414,9 @@ export async function patchMetal(req: Request, res: Response) {
   if (!userId) return;
 
   const metalId = String(req.params.metalId || "").trim();
-  if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
+  if (!metalId) {
+    return res.status(400).json({ ok: false, error: "metalId requerido." });
+  }
 
   const parsed = updateMetalSchema.parse(req.body);
 
@@ -377,7 +433,9 @@ export async function patchMetal(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando metal.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error actualizando metal.") });
   }
 }
 
@@ -386,7 +444,9 @@ export async function deleteMetalCtrl(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
-  if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
+  if (!metalId) {
+    return res.status(400).json({ ok: false, error: "metalId requerido." });
+  }
 
   try {
     await deleteMetalSvc(jewelryId, metalId);
@@ -401,7 +461,9 @@ export async function deleteMetalCtrl(req: Request, res: Response) {
     res.json({ ok: true });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error eliminando metal.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error eliminando metal.") });
   }
 }
 
@@ -425,7 +487,10 @@ export async function patchMetalActive(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando estado del metal.") });
+    res.status(status).json({
+      ok: false,
+      error: String(e?.message || "Error actualizando estado del metal."),
+    });
   }
 }
 
@@ -438,11 +503,15 @@ export async function postMoveMetal(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
-  if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
+  if (!metalId) {
+    return res.status(400).json({ ok: false, error: "metalId requerido." });
+  }
 
   const dir = String(req.body?.dir || "").trim().toUpperCase();
   if (dir !== "UP" && dir !== "DOWN") {
-    return res.status(400).json({ ok: false, error: 'dir inválido. Usá "UP" o "DOWN".' });
+    return res
+      .status(400)
+      .json({ ok: false, error: 'dir inválido. Usá "UP" o "DOWN".' });
   }
 
   try {
@@ -458,7 +527,9 @@ export async function postMoveMetal(req: Request, res: Response) {
     res.json({ ok: true, ...out });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error moviendo metal.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error moviendo metal.") });
   }
 }
 
@@ -470,24 +541,37 @@ export async function getMetalRefHistory(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
   const metalId = String(req.params.metalId || "").trim();
-  if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
+  if (!metalId) {
+    return res.status(400).json({ ok: false, error: "metalId requerido." });
+  }
 
   const take = getTake(req, 120);
 
   try {
     const metal = await prisma.metal.findFirst({
       where: { id: metalId, jewelryId, deletedAt: null },
-      select: { id: true, name: true, symbol: true, referenceValue: true, isActive: true, sortOrder: true },
+      select: {
+        id: true,
+        name: true,
+        symbol: true,
+        referenceValue: true,
+        isActive: true,
+        sortOrder: true,
+      },
     });
 
-    if (!metal) return res.status(404).json({ ok: false, error: "Metal no encontrado." });
+    if (!metal) {
+      return res.status(404).json({ ok: false, error: "Metal no encontrado." });
+    }
 
     const history = await listMetalRefHistory(jewelryId, metalId, take);
 
     res.json({ ok: true, metal, current: history[0] ?? null, history });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error obteniendo historial.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error obteniendo historial.") });
   }
 }
 
@@ -505,8 +589,10 @@ export async function postMetalVariant(req: Request, res: Response) {
   const parsed = createMetalVariantSchema.parse(req.body);
 
   try {
-    // ✅ pasamos actorUserId al service (debe soportarlo)
-    const row = await createMetalVariant(jewelryId, { ...parsed, actorUserId: userId } as any);
+    const row = await createMetalVariant(
+      jewelryId,
+      { ...parsed, actorUserId: userId } as any
+    );
 
     await auditLog(req, {
       action: "valuation.variant.create",
@@ -518,24 +604,25 @@ export async function postMetalVariant(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error creando variante.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error creando variante.") });
   }
 }
 
 export async function getMetalVariants(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
   const metalId = String(req.params.metalId || "").trim();
-  if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
+  if (!metalId) {
+    return res.status(400).json({ ok: false, error: "metalId requerido." });
+  }
 
   const rows = await listMetalVariants(jewelryId, metalId, {
     q: String(req.query.q || "").trim() || undefined,
     isActive: boolQ(req.query.isActive),
     onlyFavorites: req.query.onlyFavorites === "true",
-    minPurchase: numQ(req.query.minPurchase),
-    maxPurchase: numQ(req.query.maxPurchase),
     minSale: numQ(req.query.minSale),
     maxSale: numQ(req.query.maxSale),
-    currencyId: String(req.query.currencyId || "").trim() || undefined,
   });
 
   res.json({ ok: true, rows });
@@ -544,18 +631,22 @@ export async function getMetalVariants(req: Request, res: Response) {
 export async function patchVariant(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
-  // ✅ Opción B: necesitamos actor para snapshot
   const userId = requireUserId(req, res);
   if (!userId) return;
 
   const variantId = String(req.params.variantId || "").trim();
-  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
+  if (!variantId) {
+    return res.status(400).json({ ok: false, error: "variantId requerido." });
+  }
 
   const parsed = updateMetalVariantSchema.parse(req.body);
 
   try {
-    // ✅ pasamos actorUserId al service (debe soportarlo)
-    const row = await updateMetalVariant(jewelryId, variantId, { ...(parsed as any), actorUserId: userId } as any);
+    const row = await updateMetalVariant(
+      jewelryId,
+      variantId,
+      { ...(parsed as any), actorUserId: userId } as any
+    );
 
     await auditLog(req, {
       action: "valuation.variant.update",
@@ -567,37 +658,10 @@ export async function patchVariant(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando variante.") });
-  }
-}
-
-export async function patchVariantPricing(req: Request, res: Response) {
-  const jewelryId = requireTenantId(req);
-
-  // ✅ Opción B: necesitamos actor para snapshot
-  const userId = requireUserId(req, res);
-  if (!userId) return;
-
-  const variantId = String(req.params.variantId || "").trim();
-  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
-
-  const parsed = updateMetalVariantPricingSchema.parse(req.body);
-
-  try {
-    // ✅ pasamos actorUserId al service (debe soportarlo)
-    const row = await updateMetalVariantPricing(jewelryId, variantId, { ...parsed, actorUserId: userId } as any);
-
-    await auditLog(req, {
-      action: "valuation.variant.pricing.update",
-      success: true,
-      userId,
-      meta: { variantId, ...parsed },
+    res.status(status).json({
+      ok: false,
+      error: String(e?.message || "Error actualizando variante."),
     });
-
-    res.json({ ok: true, row });
-  } catch (e: any) {
-    const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando pricing de variante.") });
   }
 }
 
@@ -621,7 +685,10 @@ export async function patchVariantActive(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error actualizando estado de variante.") });
+    res.status(status).json({
+      ok: false,
+      error: String(e?.message || "Error actualizando estado de variante."),
+    });
   }
 }
 
@@ -630,7 +697,9 @@ export async function postSetFavoriteVariant(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
-  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
+  if (!variantId) {
+    return res.status(400).json({ ok: false, error: "variantId requerido." });
+  }
 
   try {
     const row = await setFavoriteVariant(jewelryId, variantId);
@@ -645,7 +714,9 @@ export async function postSetFavoriteVariant(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error seteando favorito.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error seteando favorito.") });
   }
 }
 
@@ -654,7 +725,9 @@ export async function postClearFavoriteVariant(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const metalId = String(req.params.metalId || "").trim();
-  if (!metalId) return res.status(400).json({ ok: false, error: "metalId requerido." });
+  if (!metalId) {
+    return res.status(400).json({ ok: false, error: "metalId requerido." });
+  }
 
   try {
     await clearFavoriteVariant(jewelryId, metalId);
@@ -669,7 +742,9 @@ export async function postClearFavoriteVariant(req: Request, res: Response) {
     res.json({ ok: true });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error limpiando favorito.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error limpiando favorito.") });
   }
 }
 
@@ -678,7 +753,9 @@ export async function deleteVariantCtrl(req: Request, res: Response) {
   const userId: string | undefined = (req as any).user?.id;
 
   const variantId = String(req.params.variantId || "").trim();
-  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
+  if (!variantId) {
+    return res.status(400).json({ ok: false, error: "variantId requerido." });
+  }
 
   try {
     await deleteVariantSvc(jewelryId, variantId);
@@ -693,7 +770,9 @@ export async function deleteVariantCtrl(req: Request, res: Response) {
     res.json({ ok: true });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error eliminando variante.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error eliminando variante.") });
   }
 }
 
@@ -704,14 +783,16 @@ export async function deleteVariantCtrl(req: Request, res: Response) {
 export async function postMetalQuote(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
-  // ✅ Opción B: guardar quién creó el quote
   const userId = requireUserId(req, res);
   if (!userId) return;
 
   const parsed = createMetalQuoteSchema.parse(req.body);
 
   try {
-    const row = await addMetalQuote(jewelryId, { ...parsed, createdById: userId });
+    const row = await addMetalQuote(jewelryId, {
+      ...parsed,
+      createdById: userId,
+    });
 
     await auditLog(req, {
       action: "valuation.quote.create",
@@ -723,14 +804,18 @@ export async function postMetalQuote(req: Request, res: Response) {
     res.json({ ok: true, row });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error creando quote.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error creando quote.") });
   }
 }
 
 export async function getMetalQuotes(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
   const variantId = String(req.params.variantId || "").trim();
-  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
+  if (!variantId) {
+    return res.status(400).json({ ok: false, error: "variantId requerido." });
+  }
 
   const take = getTake(req, 50);
 
@@ -739,20 +824,24 @@ export async function getMetalQuotes(req: Request, res: Response) {
     res.json({ ok: true, rows });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error obteniendo quotes.") });
+    res
+      .status(status)
+      .json({ ok: false, error: String(e?.message || "Error obteniendo quotes.") });
   }
 }
 
 /* =========================================================
    ✅ HISTORIAL VALOR VARIANTE (para el modal)
-   - Por ahora lo resolvemos con "quotes" si existen.
+   - Se devuelve normalizado a la moneda base actual
 ========================================================= */
 
 export async function getVariantValueHistory(req: Request, res: Response) {
   const jewelryId = requireTenantId(req);
 
   const variantId = String(req.params.variantId || "").trim();
-  if (!variantId) return res.status(400).json({ ok: false, error: "variantId requerido." });
+  if (!variantId) {
+    return res.status(400).json({ ok: false, error: "variantId requerido." });
+  }
 
   const take = getTake(req, 200);
 
@@ -764,17 +853,36 @@ export async function getVariantValueHistory(req: Request, res: Response) {
 
   try {
     const variant = await prisma.metalVariant.findFirst({
-      where: { id: variantId, deletedAt: null, metal: { jewelryId, deletedAt: null } },
+      where: {
+        id: variantId,
+        deletedAt: null,
+        metal: { jewelryId, deletedAt: null },
+      },
       select: {
         id: true,
         metalId: true,
         name: true,
         sku: true,
+        purity: true,
+        saleFactor: true,
         isActive: true,
-        metal: { select: { id: true, name: true, symbol: true, isActive: true } },
+        metal: {
+          select: {
+            id: true,
+            name: true,
+            symbol: true,
+            referenceValue: true,
+            isActive: true,
+          },
+        },
       },
     });
-    if (!variant) return res.status(404).json({ ok: false, error: "Variante no encontrada." });
+
+    if (!variant) {
+      return res.status(404).json({ ok: false, error: "Variante no encontrada." });
+    }
+
+    const baseCurrency = await getBaseCurrencyOrThrow(jewelryId);
 
     const where: any = {
       variantId,
@@ -796,34 +904,98 @@ export async function getVariantValueHistory(req: Request, res: Response) {
         id: true,
         effectiveAt: true,
         createdAt: true,
-        purchasePrice: true,
-        salePrice: true,
-        currency: { select: { id: true, code: true, symbol: true, isBase: true, isActive: true } },
-        createdBy: { select: { id: true, name: true, email: true } },
+        price: true,
+        currencyId: true,
+        currency: {
+          select: {
+            id: true,
+            code: true,
+            symbol: true,
+            isBase: true,
+            isActive: true,
+          },
+        },
+        createdBy: {
+          select: { id: true, name: true, email: true },
+        },
       },
     });
 
-    const history = rows.map((r) => ({
-      id: r.id,
-      effectiveAt: r.effectiveAt,
-      createdAt: r.createdAt,
+    const history = await Promise.all(
+      rows.map(async (r) => {
+        const at = r.effectiveAt ?? r.createdAt ?? new Date();
 
-      // - suggestedPrice: usamos purchasePrice como sugerido/base
-      // - finalSalePrice: salePrice
-      // - finalPurchasePrice: purchasePrice
-      suggestedPrice: Number(r.purchasePrice),
-      finalSalePrice: Number(r.salePrice),
-      finalPurchasePrice: Number(r.purchasePrice),
+        const converted = await convertPriceAt({
+          jewelryId,
+          amount: Number(r.price),
+          fromCurrencyId: r.currencyId,
+          toCurrencyId: baseCurrency.id,
+          at,
+        });
 
-      reason: r.currency?.isBase ? "Snapshot automático" : "Cotización manual",
-      currency: r.currency,
-      user: r.createdBy ? { id: r.createdBy.id, name: r.createdBy.name, email: r.createdBy.email } : null,
-    }));
+        const normalizedPrice =
+          converted != null && Number.isFinite(converted)
+            ? Number(converted)
+            : Number(r.price);
 
-    res.json({ ok: true, variant, current: history[0] ?? null, history });
+        const originalCode = String(r.currency?.code || "").trim();
+        const originalSym = String(r.currency?.symbol || "").trim();
+        const originalLabel = originalCode
+          ? `${originalCode}${originalSym ? ` (${originalSym})` : ""}`
+          : originalSym || "—";
+
+        return {
+          id: r.id,
+          effectiveAt: r.effectiveAt,
+          createdAt: r.createdAt,
+
+          finalSalePrice: normalizedPrice,
+          salePrice: normalizedPrice,
+
+          finalPurchasePrice: null,
+          purchasePrice: null,
+          baseSalePrice: normalizedPrice,
+          basePurchasePrice: null,
+
+          currency: {
+            id: baseCurrency.id,
+            code: baseCurrency.code,
+            symbol: baseCurrency.symbol,
+            isBase: true,
+            isActive: true,
+          },
+
+          originalPrice: Number(r.price),
+          originalCurrency: r.currency,
+          originalCurrencyLabel: originalLabel,
+
+          reason: r.currency?.isBase
+            ? "Snapshot automático"
+            : `Cotización manual convertida desde ${originalLabel}`,
+
+          user: r.createdBy
+            ? {
+                id: r.createdBy.id,
+                name: r.createdBy.name,
+                email: r.createdBy.email,
+              }
+            : null,
+        };
+      })
+    );
+
+    res.json({
+      ok: true,
+      variant,
+      current: history[0] ?? null,
+      history,
+    });
   } catch (e: any) {
     const status = Number(e?.status) || 500;
-    res.status(status).json({ ok: false, error: String(e?.message || "Error obteniendo historial de variante.") });
+    res.status(status).json({
+      ok: false,
+      error: String(e?.message || "Error obteniendo historial de variante."),
+    });
   }
 }
 
@@ -834,7 +1006,6 @@ export const deleteCurrency = deleteCurrencyCtrl;
 export const deleteMetal = deleteMetalCtrl;
 export const deleteVariant = deleteVariantCtrl;
 
-// ✅ alias explícito (por si querés router.get(..., c.getVariantValueHistory))
 export const variantValueHistory = getVariantValueHistory;
 
 export default {
@@ -860,7 +1031,6 @@ export default {
   postMetalVariant,
   getMetalVariants,
   patchVariant,
-  patchVariantPricing,
   patchVariantActive,
   postSetFavoriteVariant,
   postClearFavoriteVariant,

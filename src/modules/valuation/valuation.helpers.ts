@@ -85,13 +85,17 @@ export function assertFactor(v: any, name: string) {
   return n;
 }
 
+/**
+ * suggested price
+ * referenceValue (base currency per gram) * purity
+ */
 export function computeSuggested(referenceValue: Prisma.Decimal, purity: Prisma.Decimal) {
-  // referenceValue (base currency per gram) * purity
   return referenceValue.mul(purity);
 }
 
 /**
- * ✅ override puede ser 0, así que NO usar truthy
+ * final price
+ * suggested * factor
  */
 export function computeFinal(
   suggested: Prisma.Decimal,
@@ -107,7 +111,7 @@ export function hasOverride(v: any) {
 }
 
 /* =========================
-   ✅ Historial profesional (no duplicar)
+   Historial profesional
 ========================= */
 
 /** Redondeo “de almacenamiento” para Decimal(18,6) */
@@ -123,4 +127,18 @@ export function same6(a: any, b: any) {
   const rb = round6(b);
   if (!Number.isFinite(ra) || !Number.isFinite(rb)) return false;
   return ra === rb;
+}
+
+/* =========================
+   Conversión FX
+========================= */
+
+export function convertPrice(price: number, rate: number | null | undefined) {
+  const p = Number(price);
+  const r = Number(rate);
+
+  if (!Number.isFinite(p)) return null;
+  if (!Number.isFinite(r) || r <= 0) return null;
+
+  return round6(p * r);
 }

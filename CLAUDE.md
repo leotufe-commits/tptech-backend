@@ -221,3 +221,41 @@ Each feature module under `src/modules/` follows this structure:
 ### Login flow
 
 `POST /api/auth/login/options` (also `GET` for legacy) — accepts `{ email }` and returns whether the user exists and what auth methods are available (password, PIN). The frontend calls this first to decide which login UI to show.
+
+### Error handling pattern
+
+Controllers wrap async functions with `asyncHandler` (from `src/middlewares/asyncHandlers.ts`), which forwards thrown errors to the global `errorHandler` middleware (`src/middlewares/errorHandler.ts`).
+
+To return an error with a specific HTTP status from a service, throw an error with `.status`:
+
+```ts
+const err: any = new Error("Mensaje de error");
+err.status = 400;
+throw err;
+```
+
+The `errorHandler` reads `err.status` (or `err.statusCode`) and responds with `{ ok: false, message }`.
+
+### ESM import convention
+
+This project uses `"type": "module"`. All local imports **must** use the `.js` extension, even when importing `.ts` source files:
+
+```ts
+import { prisma } from "../../lib/prisma.js";   // ✅ correct
+import { prisma } from "../../lib/prisma";       // ❌ will break at runtime
+```
+
+### Catalogs module (`src/modules/catalogs/`)
+
+Manages lookup lists per tenant. `CatalogItem` supports these types (enum `CatalogType`):
+
+| Type | Description |
+|---|---|
+| `IVA_CONDITION` | IVA tax condition options |
+| `PHONE_PREFIX` | Country phone prefixes |
+| `DOCUMENT_TYPE` | ID document types |
+| `CITY` | City list |
+| `PROVINCE` | Province/state list |
+| `COUNTRY` | Country list |
+
+Each item has `label`, `isActive`, `sortOrder`, `isFavorite`, and `deletedAt` (soft delete). Unique constraint: `(jewelryId, type, label)`.

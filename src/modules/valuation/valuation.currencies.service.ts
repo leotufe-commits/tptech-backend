@@ -322,44 +322,11 @@ export async function setBaseCurrency(jewelryId: string, newBaseCurrencyId: stri
     }
 
     /* =========================
-       ✅ FIX: Convertir overrides VIVOS (metalVariant)
-       Esto arregla el "modo manual" cuando cambia la base.
-    ========================= */
-    const liveVariants = await tx.metalVariant.findMany({
-      where: {
-        deletedAt: null,
-        metal: { jewelryId, deletedAt: null },
-      },
-      select: {
-        id: true,
-        purchasePriceOverride: true,
-        salePriceOverride: true,
-      },
-    });
-
-    for (const v of liveVariants) {
-      const patch: any = {};
-
-      if (v.purchasePriceOverride !== null && v.purchasePriceOverride !== undefined) {
-        patch.purchasePriceOverride = new Prisma.Decimal(v.purchasePriceOverride).div(k);
-      }
-      if (v.salePriceOverride !== null && v.salePriceOverride !== undefined) {
-        patch.salePriceOverride = new Prisma.Decimal(v.salePriceOverride).div(k);
-      }
-
-      if (Object.keys(patch).length > 0) {
-        await tx.metalVariant.update({
-          where: { id: v.id },
-          data: patch,
-        });
-      }
-    }
-
-    /* =========================
        Convertir historial variantes
     ========================= */
     const variantHistory = await tx.metalVariantValueHistory.findMany({
       where: { jewelryId },
+      select: { id: true, referenceValue: true, suggestedPrice: true, finalSalePrice: true },
     });
 
     for (const v of variantHistory) {
@@ -368,10 +335,30 @@ export async function setBaseCurrency(jewelryId: string, newBaseCurrencyId: stri
         data: {
           referenceValue: new Prisma.Decimal(v.referenceValue).div(k),
           suggestedPrice: new Prisma.Decimal(v.suggestedPrice).div(k),
-          finalPurchasePrice: new Prisma.Decimal(v.finalPurchasePrice).div(k),
           finalSalePrice: new Prisma.Decimal(v.finalSalePrice).div(k),
-          purchasePriceOverride: v.purchasePriceOverride ? new Prisma.Decimal(v.purchasePriceOverride).div(k) : null,
-          salePriceOverride: v.salePriceOverride ? new Prisma.Decimal(v.salePriceOverride).div(k) : null,
+        },
+      });
+    }
+
+    /* =========================
+       Convertir cotizaciones de variantes (MetalQuote)
+       Solo las que estaban en la vieja base — se re-expresan en la nueva base.
+       Las cotizaciones en otras monedas no se tocan.
+    ========================= */
+    const quotesInOldBase = await tx.metalQuote.findMany({
+      where: {
+        currencyId: oldBase.id,
+        variant: { metal: { jewelryId } },
+      },
+      select: { id: true, price: true },
+    });
+
+    for (const q of quotesInOldBase) {
+      await tx.metalQuote.update({
+        where: { id: q.id },
+        data: {
+          price: new Prisma.Decimal(q.price).div(k),
+          currencyId: newBase.id,
         },
       });
     }
@@ -390,6 +377,28 @@ export async function setBaseCurrency(jewelryId: string, newBaseCurrencyId: stri
     for (const r of allRates) {
       if (!rateMap.has(r.currencyId)) {
         rateMap.set(r.currencyId, Number(r.rate));
+      }
+    }
+
+    /* =========================
+       Convertir historial de tipos de cambio
+       (monedas que no son old ni new base)
+    ========================= */
+    const otherCurrencyIds = currencies
+      .filter((c) => c.id !== newBase.id && c.id !== oldBase.id)
+      .map((c) => c.id);
+
+    if (otherCurrencyIds.length > 0) {
+      const historicalCurrencyRates = await tx.currencyRate.findMany({
+        where: { currencyId: { in: otherCurrencyIds } },
+        select: { id: true, rate: true },
+      });
+
+      for (const r of historicalCurrencyRates) {
+        await tx.currencyRate.update({
+          where: { id: r.id },
+          data: { rate: new Prisma.Decimal(r.rate).div(k) },
+        });
       }
     }
 

@@ -34,7 +34,6 @@ export {
   createMetalVariant,
   listMetalVariants,
   updateMetalVariant,
-  updateMetalVariantPricing,
   setFavoriteVariant,
   clearFavoriteVariant,
   toggleVariantActive,

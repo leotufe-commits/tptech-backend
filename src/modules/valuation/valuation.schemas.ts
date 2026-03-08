@@ -82,47 +82,20 @@ export const createMetalVariantSchema = z.object({
   metalId: z.string().trim().min(1),
   name: z.string().trim().min(1, "Nombre requerido.").max(60, "Nombre muy largo."),
   sku: zSku,
-
   purity: zPurity,
-
-  buyFactor: zFactorPos.optional(),
   saleFactor: zFactorPos.optional(),
-
-  purchasePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
-  salePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
 });
 
-// ✅ actualizar pricing de variante (PATCH /valuation/variants/:id/pricing)
-export const updateMetalVariantPricingSchema = z.object({
-  buyFactor: zFactorPos.optional(),
-  saleFactor: zFactorPos.optional(),
-
-  purchasePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
-  salePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
-
-  // helpers
-  clearPurchaseOverride: z.coerce.boolean().optional(),
-  clearSaleOverride: z.coerce.boolean().optional(),
-});
-
-/**
- * ✅ editar variante (PATCH /valuation/variants/:variantId)
- * IMPORTANTE: tu service updateMetalVariant() requiere name + sku + purity (no opcional)
- */
 export const updateMetalVariantSchema = z.object({
   name: z.string().trim().min(1, "Nombre requerido.").max(60, "Nombre muy largo."),
   sku: zSku,
   purity: zPurity,
-
-  // (por ahora solo editamos venta desde este endpoint)
   saleFactor: zFactorPos.optional(),
-  salePriceOverride: z.union([z.coerce.number().min(0), z.null()]).optional(),
 });
 
 export const createMetalQuoteSchema = z.object({
   variantId: z.string().trim().min(1),
   currencyId: z.string().trim().min(1),
-  purchasePrice: z.coerce.number().min(0),
-  salePrice: z.coerce.number().min(0),
+  price: z.coerce.number().min(0),
   effectiveAt: z.coerce.date().optional(),
 });

@@ -1,7 +1,5 @@
 // tptech-backend/src/modules/company/company.controller.ts
 import type { Request, Response } from "express";
-import fs from "node:fs";
-import path from "node:path";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 
 import { prisma } from "../../lib/prisma.js";
@@ -41,7 +39,6 @@ async function deleteStoredFileByUrl(url: string | null | undefined, prefixFolde
   const u = s(url);
   if (!u) return;
 
-  // 1) Si es R2: borramos objeto por key
   if (R2_ENABLED && r2 && R2_BUCKET) {
     const key = extractR2KeyFromUrl(u);
     if (key) {
@@ -49,13 +46,22 @@ async function deleteStoredFileByUrl(url: string | null | undefined, prefixFolde
         await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
         return;
       } catch {
-        // si falla, no rompemos (igual seguiremos con borrado local si aplica)
+        // ignore and try local delete if applicable
       }
     }
   }
 
-  // 2) Si es local: borrado seguro por URL
   await safeDeleteLocalUploadByUrl(u, prefixFolder);
+}
+
+function requirePublicStoredUrl(req: Request, folder: string, filename: string) {
+  const url = toPublicUploadUrl(req, folder, filename);
+  if (!url) {
+    throw new Error(
+      "No se pudo generar una URL pública para el archivo. Revisá la configuración de storage (R2_PUBLIC_BASE_URL)."
+    );
+  }
+  return url;
 }
 
 async function getMyJewelry(req: Request) {
@@ -155,9 +161,18 @@ export async function uploadMyJewelryLogo(req: Request, res: Response) {
   }
 
   const folder = s((file as any)._tpFolder);
-  if (!folder) return res.status(400).json({ message: "Upload inválido (folder faltante)." });
+  if (!folder) {
+    return res.status(400).json({ message: "Upload inválido (folder faltante)." });
+  }
 
-  const newUrl = toPublicUploadUrl(req, folder, file.filename);
+  let newUrl = "";
+  try {
+    newUrl = requirePublicStoredUrl(req, folder, file.filename);
+  } catch (e: any) {
+    return res.status(500).json({
+      message: e?.message || "No se pudo generar la URL pública del logo.",
+    });
+  }
 
   const prev = await prisma.jewelry.findUnique({
     where: { id: me.jewelryId },
@@ -169,9 +184,7 @@ export async function uploadMyJewelryLogo(req: Request, res: Response) {
     data: { logoUrl: newUrl },
   });
 
-  // borramos anterior (local o R2)
   if (prev?.logoUrl) {
-    // prefixFolder: carpeta del logo actual (misma base por tenant)
     await deleteStoredFileByUrl(prev.logoUrl, folder);
   }
 
@@ -182,6 +195,7 @@ export async function uploadMyJewelryLogo(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: me.jewelryId,
+    meta: { url: newUrl },
   });
 
   return res.json({ jewelry: { ...fresh?.jewelry, attachments: fresh?.attachments } });
@@ -212,8 +226,6 @@ export async function deleteMyJewelryLogo(req: Request, res: Response) {
     data: { logoUrl: "" },
   });
 
-  // El folder no lo sabemos directo, pero podemos borrar por R2_PUBLIC_BASE_URL
-  // y para local usamos un prefix amplio por tenant (seguro)
   const tenantPrefix = `tptech/tenants/${me.jewelryId}/jewelry`;
   await deleteStoredFileByUrl(prev?.logoUrl, tenantPrefix);
 
@@ -244,26 +256,55 @@ export async function uploadMyJewelryAttachments(req: Request, res: Response) {
     return res.status(400).json({ message: "Jewelry no configurada." });
   }
 
-  const files = (req as any).files as { attachments?: MulterFile[]; "attachments[]"?: MulterFile[] };
+  const files = (req as any).files as {
+    attachments?: MulterFile[];
+    "attachments[]"?: MulterFile[];
+  };
+
   const list = [...(files?.attachments ?? []), ...(files?.["attachments[]"] ?? [])];
 
   if (!list.length) {
     return res.status(400).json({ message: "No se recibieron archivos." });
   }
 
-  await prisma.jewelryAttachment.createMany({
-    data: list.map((f) => {
-      const folder = s((f as any)._tpFolder);
-      const url = folder ? toPublicUploadUrl(req, folder, f.filename) : "";
+  const rows: Array<{
+    jewelryId: string;
+    url: string;
+    filename: string;
+    mimeType: string;
+    size: number;
+  }> = [];
 
-      return {
-        jewelryId: me.jewelryId,
-        url,
-        filename: f.originalname,
-        mimeType: f.mimetype,
-        size: f.size,
-      };
-    }),
+  for (const f of list) {
+    const folder = s((f as any)._tpFolder);
+    if (!folder) {
+      return res.status(400).json({
+        message: `Upload inválido para "${f.originalname}" (folder faltante).`,
+      });
+    }
+
+    let url = "";
+    try {
+      url = requirePublicStoredUrl(req, folder, f.filename);
+    } catch (e: any) {
+      return res.status(500).json({
+        message:
+          e?.message ||
+          `No se pudo generar la URL pública del archivo "${f.originalname}".`,
+      });
+    }
+
+    rows.push({
+      jewelryId: me.jewelryId,
+      url,
+      filename: f.originalname,
+      mimeType: f.mimetype,
+      size: f.size,
+    });
+  }
+
+  await prisma.jewelryAttachment.createMany({
+    data: rows,
   });
 
   const fresh = await getMyJewelry(req);
@@ -273,7 +314,7 @@ export async function uploadMyJewelryAttachments(req: Request, res: Response) {
     success: true,
     userId,
     tenantId: me.jewelryId,
-    meta: { count: list.length },
+    meta: { count: rows.length },
   });
 
   return res.json({ jewelry: { ...fresh?.jewelry, attachments: fresh?.attachments } });

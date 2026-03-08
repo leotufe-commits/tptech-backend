@@ -2,7 +2,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
-import { dec, assertNonEmpty, toRefValue, clampTake, computeSuggested, computeFinal } from "./valuation.helpers.js";
+import { dec, assertNonEmpty, toRefValue, clampTake, computeSuggested } from "./valuation.helpers.js";
 import { ensureBaseVariantQuoteSnapshot } from "./valuation.quotes.service.js";
 
 function freedName(name: string, id: string) {
@@ -10,13 +10,6 @@ function freedName(name: string, id: string) {
   return `deleted__${name}__${id}__${suffix}`;
 }
 
-function normalizeOverrideOut(v: any) {
-  if (v === null || v === undefined) return null;
-  const n = Number(v);
-  if (!Number.isFinite(n)) return null;
-  if (n <= 0) return null;
-  return n;
-}
 
 /* =========================
    Metales
@@ -248,32 +241,18 @@ export async function updateMetal(
       // guardamos snapshot para TODAS las variantes (sugerido/final).
       const variants = await tx.metalVariant.findMany({
         where: { metalId: updated.id, deletedAt: null },
-        select: {
-          id: true,
-          purity: true,
-          saleFactor: true,
-          salePriceOverride: true,
-        },
+        select: { id: true, purity: true, saleFactor: true },
       });
 
       for (const v of variants) {
         const purity = new Prisma.Decimal(v.purity ?? 0);
         const suggested = computeSuggested(newRef, purity);
-
-        const sOvNum = normalizeOverrideOut(v.salePriceOverride);
-        const sOv = sOvNum !== null ? new Prisma.Decimal(sOvNum) : null;
-
-        const finalSale = computeFinal(
-          suggested,
-          new Prisma.Decimal(v.saleFactor ?? 1),
-          sOv
-        );
+        const finalSale = suggested.mul(new Prisma.Decimal(v.saleFactor ?? 1));
 
         await ensureBaseVariantQuoteSnapshot({
           jewelryId,
           variantId: v.id,
-          suggestedPrice: Number(suggested),
-          finalPrice: Number(finalSale),
+          price: Number(finalSale),
           effectiveAt: now,
           tx,
         });

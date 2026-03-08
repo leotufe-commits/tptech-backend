@@ -34,7 +34,6 @@ export function buildObjectKey(args: {
     }
 
     case "jewelry_logo": {
-      // ✅ Cache-busting profesional (evita problemas de CDN / browser cache)
       return `tptech/tenants/${t}/jewelry/logo_${Date.now()}${suffix}`;
     }
 

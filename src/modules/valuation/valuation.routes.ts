@@ -57,7 +57,6 @@ router.post("/variants", canEdit, c.postMetalVariant);
 router.get("/metals/:metalId/variants", canView, c.getMetalVariants);
 
 router.patch("/variants/:variantId", canEdit, c.patchVariant);
-router.patch("/variants/:variantId/pricing", canEdit, c.patchVariantPricing);
 router.patch("/variants/:variantId/active", canEdit, c.patchVariantActive);
 
 router.post("/variants/:variantId/set-favorite", canEdit, c.postSetFavoriteVariant);
