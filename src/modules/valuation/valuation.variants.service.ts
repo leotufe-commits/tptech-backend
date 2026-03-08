@@ -59,6 +59,20 @@ async function snapshotVariantHistory(args: {
     !same6(lastHist.finalSalePrice, roundedFinal);
 
   if (histChanged) {
+    // [DEBUG] — eliminar después de identificar el error
+    const debugPayload = {
+      jewelryId: args.jewelryId ?? "NULL",
+      metalId: args.metalId ?? "NULL",
+      variantId: args.variantId ?? "NULL",
+      referenceValue: String(args.referenceValue ?? "NULL"),
+      purity: String(args.purity ?? "NULL"),
+      saleFactor: String(args.saleFactor ?? "NULL"),
+      finalSalePrice: String(roundedFinal),
+      effectiveAt: effectiveAt?.toISOString() ?? "NULL",
+      createdById: args.actorUserId ?? null,
+    };
+    console.log("[DEBUG MetalVariantValueHistory.create]", JSON.stringify(debugPayload));
+
     await db.metalVariantValueHistory.create({
       data: {
         jewelryId: args.jewelryId,
