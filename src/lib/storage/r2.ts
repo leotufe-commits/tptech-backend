@@ -137,6 +137,7 @@ export const r2: S3Client | null = R2_ENABLED
   ? new S3Client({
       region: R2_REGION,
       endpoint: R2_ENDPOINT,
+      forcePathStyle: true,
       credentials: {
         accessKeyId: R2_ACCESS_KEY_ID!,
         secretAccessKey: R2_SECRET_ACCESS_KEY!,
