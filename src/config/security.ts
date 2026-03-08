@@ -12,22 +12,58 @@ export function buildHelmetMiddleware(): RequestHandler {
       directives: isProd
         ? {
             defaultSrc: ["'none'"],
+
+            // permitir imágenes desde tu CDN
+            imgSrc: [
+              "'self'",
+              "data:",
+              "blob:",
+              "https://media.tptechsoftware.com",
+              "https:"
+            ],
+
+            // permitir conexiones al backend y CDN
+            connectSrc: [
+              "'self'",
+              "https://media.tptechsoftware.com"
+            ],
+
             frameAncestors: ["'none'"],
             formAction: ["'none'"],
             baseUri: ["'none'"],
           }
         : {
             defaultSrc: ["'self'"],
+
             scriptSrc: ["'self'", "'unsafe-inline'"],
+
             styleSrc: ["'self'", "'unsafe-inline'"],
-            imgSrc: ["'self'", "data:", "https:"],
+
+            imgSrc: [
+              "'self'",
+              "data:",
+              "blob:",
+              "https:",
+              "https://media.tptechsoftware.com"
+            ],
+
+            connectSrc: [
+              "'self'",
+              "http://localhost:5173",
+              "http://localhost:3001",
+              "https://media.tptechsoftware.com"
+            ],
+
             frameAncestors: ["'none'"],
             formAction: ["'self'"],
             baseUri: ["'self'"],
           },
     },
+
     frameguard: { action: "deny" },
+
     referrerPolicy: { policy: "no-referrer" },
+
     hsts: isProd
       ? { maxAge: 15552000, includeSubDomains: true, preload: true } // ~180 días
       : false,

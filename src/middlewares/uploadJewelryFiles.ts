@@ -3,7 +3,6 @@ import type { Request, Response, NextFunction } from "express";
 import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
-import crypto from "node:crypto";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { r2, R2_BUCKET, R2_ENABLED } from "../lib/storage/r2.js";
@@ -21,18 +20,21 @@ function extFromOriginal(name: string) {
   return "";
 }
 
-function randomName(originalname: string) {
-  const ext = extFromOriginal(originalname);
-  const rnd = crypto.randomBytes(8).toString("hex");
-  return `${Date.now()}-${rnd}${ext}`;
-}
-
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
 function getTenantId(req: Request) {
-  return s((req as any).tenantId || (req as any).jewelryId);
+  const anyReq = req as any;
+
+  return s(
+    anyReq.tenantId ||
+      anyReq.jewelryId ||
+      anyReq.user?.jewelryId ||
+      anyReq.user?.tenantId ||
+      anyReq.auth?.jewelryId ||
+      anyReq.auth?.tenantId
+  );
 }
 
 /**
@@ -46,16 +48,19 @@ function kindForField(field: string) {
 
 /**
  * Genera un key PRO (por tenant) y devuelve:
- * - key completo (tptech/tenants/.../archivo.ext)
- * - folder (dirname del key)
- * - filename (basename del key)
+ * - key completo
+ * - folder
+ * - filename
  */
 function buildKeyFor(req: Request, file: Express.Multer.File) {
   const tenantId = getTenantId(req);
-  const kind = kindForField(file.fieldname);
+  if (!tenantId) {
+    throw new Error("Tenant no definido");
+  }
 
+  const kind = kindForField(file.fieldname);
   const originalName = s(file.originalname || "file");
-  const ext = extFromOriginal(originalName).replace(/^\./, ""); // sin punto
+  const ext = extFromOriginal(originalName).replace(/^\./, "");
 
   const key = buildObjectKey({
     tenantId,
@@ -74,13 +79,10 @@ function buildKeyFor(req: Request, file: Express.Multer.File) {
    Multer base
 ========================= */
 
-// LOCAL (disco): guardamos en uploads/<folder>
+// LOCAL (disco)
 const diskStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     try {
-      const tenantId = getTenantId(req);
-      if (!tenantId) return cb(new Error("Tenant no definido"), "");
-
       const { folder } = buildKeyFor(req, file);
       const dest = path.join(process.cwd(), "uploads", folder);
 
@@ -94,12 +96,7 @@ const diskStorage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     try {
-      const tenantId = getTenantId(req);
-      if (!tenantId) return cb(new Error("Tenant no definido"), "");
-
       const { filename } = buildKeyFor(req, file);
-
-      // IMPORTANTE: en local, usamos el mismo nombre final que en R2 (basename del key)
       cb(null, filename);
     } catch (e: any) {
       cb(e, "");
@@ -145,10 +142,8 @@ export const uploadJewelryFiles = [
 
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // Si no hay R2, ya quedó guardado en disco (diskStorage)
       if (!R2_ENABLED) return next();
 
-      // R2 habilitado, pero chequeamos por seguridad
       if (!r2 || !R2_BUCKET) {
         return res.status(500).json({ message: "Storage R2 no configurado." });
       }
@@ -158,6 +153,15 @@ export const uploadJewelryFiles = [
         return res.status(400).json({ message: "Tenant no definido." });
       }
 
+      console.log("[UPLOAD] R2_ENABLED =", R2_ENABLED);
+      console.log("[UPLOAD] tenantId =", tenantId);
+      console.log("[UPLOAD] req ids =", {
+        userId: (req as any).userId,
+        tenantId: (req as any).tenantId,
+        jewelryId: (req as any).jewelryId,
+        user: (req as any).user,
+      });
+
       const filesByField = (req as any).files as Record<string, MulterFile[]> | undefined;
       if (!filesByField) return next();
 
@@ -165,6 +169,10 @@ export const uploadJewelryFiles = [
 
       for (const f of allFiles) {
         const { key, folder, filename } = buildKeyFor(req, f);
+
+        console.log("[UPLOAD] key =", key);
+        console.log("[UPLOAD] folder =", folder);
+        console.log("[UPLOAD] filename =", filename);
 
         await r2.send(
           new PutObjectCommand({
@@ -178,17 +186,17 @@ export const uploadJewelryFiles = [
           })
         );
 
-        // Dejamos el file “como si fuera disco”, pero con folder PRO:
         f.filename = filename;
         f._tpFolder = folder;
 
-        // Limpieza
         delete (f as any).buffer;
       }
 
       return next();
     } catch (e: any) {
-      return res.status(400).json({ message: e?.message || "Error subiendo archivos." });
+      return res.status(400).json({
+        message: e?.message || "Error subiendo archivos.",
+      });
     }
   },
 ] as any;

@@ -9,19 +9,14 @@ function stripSlashes(s: string) {
   return String(s || "").replace(/^\/+|\/+$/g, "");
 }
 
-function publicBaseUrl(req: Request) {
-  const envBase = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "");
-  return envBase || `${req.protocol}://${req.get("host")}`;
-}
-
 function normalizeBaseUrl(s: string) {
   return String(s || "").trim().replace(/\/+$/g, "");
 }
 
 /**
- * ✅ Regla “PRO”:
- * - Si R2_ENABLED => los archivos NO son locales, por lo tanto NO inventamos /uploads
- * - Si NO => usamos /uploads local
+ * ✅ Regla:
+ * - Si R2_ENABLED => guardamos URL pública absoluta (CDN / custom domain)
+ * - Si NO => guardamos ruta relativa /uploads/... para que el frontend la resuelva
  */
 function isR2Enabled() {
   return Boolean(R2_ENABLED);
@@ -29,54 +24,52 @@ function isR2Enabled() {
 
 /**
  * Base público de R2:
- * - Solo R2_PUBLIC_BASE_URL (dominio/CDN)
- * - Si no existe => "" (y el caller NO debe guardar una URL falsa)
+ * - Solo R2_PUBLIC_BASE_URL
+ * - Si no existe => ""
  */
 function r2PublicBase() {
   return normalizeBaseUrl(getR2PublicBaseUrl() || "");
 }
 
 /**
- * Convierte (folder + filename) a URL pública.
- * - Si R2 está habilitado => requiere R2_PUBLIC_BASE_URL
- * - Si no => /uploads local
+ * Convierte (folder + filename) a valor persistible en DB.
+ * - R2 => URL absoluta
+ * - Local => ruta relativa /uploads/...
  */
-export function toPublicUploadUrl(req: Request, folder: string, filename: string) {
+export function toPublicUploadUrl(_req: Request, folder: string, filename: string) {
   const f = stripSlashes(folder);
   const name = String(filename || "").trim();
   if (!name) return "";
 
-  // ✅ R2: solo si tenemos base pública
   if (isR2Enabled()) {
     const base = r2PublicBase();
-    if (!base) {
-      // IMPORTANTE: no devolvemos /uploads porque el archivo NO está local.
-      // Devolvemos "" para que NO guardes URLs incorrectas.
-      return "";
-    }
+    if (!base) return "";
     return `${base}/${encodeURI(f)}/${encodeURIComponent(name)}`;
   }
 
-  // ✅ Local
-  return `${publicBaseUrl(req)}/uploads/${encodeURI(f)}/${encodeURIComponent(name)}`;
+  return `/uploads/${encodeURI(f)}/${encodeURIComponent(name)}`;
 }
 
 /**
- * Solo para modo local: intenta traducir una URL /uploads/... a path absoluto.
- * Si R2 está habilitado => devolvemos null siempre (no es local).
+ * Solo para modo local: traduce una URL/ruta /uploads/... a path absoluto.
+ * Si R2 está habilitado => devolvemos null.
  */
 export function absLocalUploadFromUrl(url: string) {
   const u = String(url || "").trim();
   if (!u) return null;
 
-  // ✅ Si R2 está habilitado, no es local
   if (isR2Enabled()) return null;
 
-  // buscamos "/uploads/..."
-  const idx = u.indexOf("/uploads/");
-  if (idx === -1) return null;
+  let rel = "";
 
-  const rel = u.slice(idx + "/uploads/".length);
+  if (u.startsWith("/uploads/")) {
+    rel = u.slice("/uploads/".length);
+  } else {
+    const idx = u.indexOf("/uploads/");
+    if (idx === -1) return null;
+    rel = u.slice(idx + "/uploads/".length);
+  }
+
   const safeRel = rel.split("?")[0].split("#")[0];
   const abs = path.join(process.cwd(), "uploads", safeRel);
   return abs;
@@ -84,9 +77,9 @@ export function absLocalUploadFromUrl(url: string) {
 
 /**
  * Borra un archivo local si:
- * - estamos en modo local (no R2)
- * - la URL matchea /uploads
- * - y matchea el prefixFolder esperado (evitar borrar cualquier cosa)
+ * - estamos en modo local
+ * - la URL/ruta matchea /uploads
+ * - y matchea el prefixFolder esperado
  */
 export async function safeDeleteLocalUploadByUrl(
   url: string | null | undefined,

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(npx prisma:*)",
+      "Bash(PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION=\"si\" npx prisma:*)",
+      "Bash(npm run:*)",
+      "Bash(node:*)",
+      "Bash(npx tsx:*)",
+      "Bash(npx dotenv:*)",
+      "Bash(git:*)"
+    ]
+  }
+}
