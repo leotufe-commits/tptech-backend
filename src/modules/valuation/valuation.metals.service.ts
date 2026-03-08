@@ -252,6 +252,8 @@ export async function updateMetal(
         const finalSale = suggested.mul(saleFactor);
         const finalSaleNum = roundMoney(Number(finalSale));
 
+        if (!Number.isFinite(finalSaleNum)) continue;
+
         await ensureBaseVariantQuoteSnapshot({
           jewelryId,
           variantId: v.id,

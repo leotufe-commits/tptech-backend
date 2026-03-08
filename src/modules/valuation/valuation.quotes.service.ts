@@ -161,11 +161,12 @@ export async function addMetalQuote(
    Conversión FX
 ========================= */
 
-export async function getRateAt(currencyId: string, at: Date) {
+export async function getRateAt(currencyId: string, jewelryId: string, at: Date) {
   const r = await prisma.currencyRate.findFirst({
     where: {
       currencyId,
       effectiveAt: { lte: at },
+      currency: { jewelryId, deletedAt: null },
     },
     orderBy: { effectiveAt: "desc" },
     select: { rate: true, effectiveAt: true },
@@ -218,7 +219,7 @@ export async function convertPriceAt(args: {
   // rate = valor de 1 unidad de la moneda en moneda base
   // Ejemplo: USD rate 1200 => 1 USD = 1200 ARS(base)
   if (fromCurrency.isBase) {
-    const toRate = await getRateAt(toCurrency.id, args.at);
+    const toRate = await getRateAt(toCurrency.id, args.jewelryId, args.at);
     if (!toRate || !Number.isFinite(toRate.rate) || toRate.rate <= 0) {
       return null;
     }
@@ -226,7 +227,7 @@ export async function convertPriceAt(args: {
   }
 
   if (toCurrency.isBase) {
-    const fromRate = await getRateAt(fromCurrency.id, args.at);
+    const fromRate = await getRateAt(fromCurrency.id, args.jewelryId, args.at);
     if (!fromRate || !Number.isFinite(fromRate.rate) || fromRate.rate <= 0) {
       return null;
     }
@@ -234,8 +235,8 @@ export async function convertPriceAt(args: {
   }
 
   const [fromRate, toRate] = await Promise.all([
-    getRateAt(fromCurrency.id, args.at),
-    getRateAt(toCurrency.id, args.at),
+    getRateAt(fromCurrency.id, args.jewelryId, args.at),
+    getRateAt(toCurrency.id, args.jewelryId, args.at),
   ]);
 
   if (

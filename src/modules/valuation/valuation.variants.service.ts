@@ -34,6 +34,15 @@ async function snapshotVariantHistory(args: {
   const suggested = computeSuggested(args.referenceValue, args.purity);
   const finalPrice = moneyMul(suggested, args.saleFactor);
   const roundedFinal = roundMoney(finalPrice);
+
+  if (!Number.isFinite(roundedFinal)) {
+    const err: any = new Error(
+      "Error calculando precio final de la variante: resultado inválido (NaN). Verificá los valores de referencia, pureza y factor."
+    );
+    err.status = 422;
+    throw err;
+  }
+
   const effectiveAt = args.effectiveAt ?? new Date();
 
   const lastHist = await db.metalVariantValueHistory.findFirst({
