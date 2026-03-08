@@ -612,6 +612,7 @@ model MetalQuote {
   currency Currency     @relation(fields: [currencyId], references: [id], onDelete: Restrict)
 
   @@index([variantId, effectiveAt])
+  @@index([variantId, currencyId, effectiveAt])
   @@index([currencyId])
   @@index([createdById])
 }

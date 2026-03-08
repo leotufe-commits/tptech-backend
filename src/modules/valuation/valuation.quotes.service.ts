@@ -5,6 +5,23 @@ import { clampTake, same6 } from "./valuation.helpers.js";
 import { roundMoney, moneyMul, moneyDiv } from "../../lib/money.js";
 
 /* =========================
+   Latest quote helper
+========================= */
+
+export async function getLatestQuote(
+  variantId: string,
+  currencyId: string,
+  tx?: Prisma.TransactionClient
+) {
+  const db = tx ?? prisma;
+  return db.metalQuote.findFirst({
+    where: { variantId, currencyId },
+    orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
+    select: { id: true, price: true, effectiveAt: true, createdAt: true },
+  });
+}
+
+/* =========================
    Base currency
 ========================= */
 
@@ -61,13 +78,8 @@ export async function ensureBaseVariantQuoteSnapshot(args: {
 
   const base = await getBaseCurrencyOrThrow(args.jewelryId, args.tx);
 
-  const last = await db.metalQuote.findFirst({
-    where: { variantId: args.variantId, currencyId: base.id },
-    orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
-    select: { id: true, price: true },
-  });
-
   const nextPrice = roundMoney(args.price);
+  const last = await getLatestQuote(args.variantId, base.id, args.tx);
 
   if (last && same6(last.price, nextPrice)) {
     return { created: false, quoteId: last.id };
@@ -127,11 +139,18 @@ export async function addMetalQuote(
     throw err;
   }
 
+  const nextPrice = roundMoney(data.price);
+  const last = await getLatestQuote(data.variantId, data.currencyId);
+
+  if (last && same6(last.price, nextPrice)) {
+    return prisma.metalQuote.findUniqueOrThrow({ where: { id: last.id } });
+  }
+
   return prisma.metalQuote.create({
     data: {
       variantId: data.variantId,
       currencyId: data.currencyId,
-      price: roundMoney(data.price),
+      price: nextPrice,
       effectiveAt: data.effectiveAt ?? new Date(),
       createdById: data.createdById ?? null,
     },
