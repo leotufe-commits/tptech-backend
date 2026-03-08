@@ -8,6 +8,7 @@ import {
   assertPurity,
   assertFactor,
   computeSuggested,
+  same6,
 } from "./valuation.helpers.js";
 
 import { ensureBaseVariantQuoteSnapshot } from "./valuation.quotes.service.js";
@@ -20,6 +21,7 @@ function freedSku(sku: string, id: string) {
 
 async function snapshotVariantHistory(args: {
   jewelryId: string;
+  metalId: string;
   variantId: string;
   referenceValue: Prisma.Decimal;
   purity: Prisma.Decimal;
@@ -28,21 +30,53 @@ async function snapshotVariantHistory(args: {
   tx?: Prisma.TransactionClient;
   actorUserId?: string;
 }) {
+  const db = args.tx ?? prisma;
   const suggested = computeSuggested(args.referenceValue, args.purity);
   const finalPrice = moneyMul(suggested, args.saleFactor);
+  const roundedFinal = roundMoney(finalPrice);
+  const effectiveAt = args.effectiveAt ?? new Date();
+
+  const lastHist = await db.metalVariantValueHistory.findFirst({
+    where: { variantId: args.variantId },
+    orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
+    select: { referenceValue: true, purity: true, saleFactor: true, finalSalePrice: true },
+  });
+
+  const histChanged =
+    !lastHist ||
+    !same6(lastHist.referenceValue, args.referenceValue) ||
+    !same6(lastHist.purity, args.purity) ||
+    !same6(lastHist.saleFactor, args.saleFactor) ||
+    !same6(lastHist.finalSalePrice, roundedFinal);
+
+  if (histChanged) {
+    await db.metalVariantValueHistory.create({
+      data: {
+        jewelryId: args.jewelryId,
+        metalId: args.metalId,
+        variantId: args.variantId,
+        referenceValue: args.referenceValue,
+        purity: args.purity,
+        saleFactor: args.saleFactor,
+        finalSalePrice: new Prisma.Decimal(roundedFinal),
+        effectiveAt,
+        createdById: args.actorUserId ?? null,
+      },
+    });
+  }
 
   await ensureBaseVariantQuoteSnapshot({
     jewelryId: args.jewelryId,
     variantId: args.variantId,
-    price: roundMoney(finalPrice),
-    effectiveAt: args.effectiveAt,
+    price: roundedFinal,
+    effectiveAt,
     tx: args.tx,
     createdById: args.actorUserId,
   });
 
   return {
     suggested: roundMoney(suggested),
-    finalPrice: roundMoney(finalPrice),
+    finalPrice: roundedFinal,
   };
 }
 
@@ -119,6 +153,7 @@ export async function createMetalVariant(
     const ref = new Prisma.Decimal(metal.referenceValue ?? 0);
     const { suggested, finalPrice } = await snapshotVariantHistory({
       jewelryId,
+      metalId: data.metalId,
       variantId: v.id,
       referenceValue: ref,
       purity: new Prisma.Decimal(v.purity ?? 0),
@@ -231,6 +266,7 @@ export async function updateMetalVariant(
     const ref = new Prisma.Decimal(updated.metal.referenceValue ?? 0);
     const { suggested, finalPrice } = await snapshotVariantHistory({
       jewelryId,
+      metalId: updated.metalId,
       variantId: updated.id,
       referenceValue: ref,
       purity: new Prisma.Decimal(updated.purity ?? 0),

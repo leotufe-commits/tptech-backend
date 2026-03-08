@@ -2,7 +2,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
-import { toNum, assertFinitePositive } from "./valuation.helpers.js";
+import { toNum, assertFinitePositive, same6 } from "./valuation.helpers.js";
 
 function freedCode(code: string, id: string) {
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -326,7 +326,7 @@ export async function setBaseCurrency(jewelryId: string, newBaseCurrencyId: stri
     ========================= */
     const variantHistory = await tx.metalVariantValueHistory.findMany({
       where: { jewelryId },
-      select: { id: true, referenceValue: true, suggestedPrice: true, finalSalePrice: true },
+      select: { id: true, referenceValue: true, finalSalePrice: true },
     });
 
     for (const v of variantHistory) {
@@ -334,7 +334,6 @@ export async function setBaseCurrency(jewelryId: string, newBaseCurrencyId: stri
         where: { id: v.id },
         data: {
           referenceValue: new Prisma.Decimal(v.referenceValue).div(k),
-          suggestedPrice: new Prisma.Decimal(v.suggestedPrice).div(k),
           finalSalePrice: new Prisma.Decimal(v.finalSalePrice).div(k),
         },
       });
@@ -492,6 +491,16 @@ export async function addCurrencyRate(
   if (cur.isBase) throw new Error("La moneda base no necesita tipo de cambio.");
 
   assertFinitePositive(Number(data.rate), "Tipo de cambio inválido.");
+
+  const last = await prisma.currencyRate.findFirst({
+    where: { currencyId },
+    orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
+    select: { id: true, rate: true },
+  });
+
+  if (last && same6(last.rate, data.rate)) {
+    return prisma.currencyRate.findUniqueOrThrow({ where: { id: last.id } });
+  }
 
   return prisma.currencyRate.create({
     data: {

@@ -2,7 +2,8 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
-import { dec, assertNonEmpty, toRefValue, clampTake, computeSuggested } from "./valuation.helpers.js";
+import { dec, assertNonEmpty, toRefValue, clampTake, computeSuggested, same6 } from "./valuation.helpers.js";
+import { roundMoney } from "../../lib/money.js";
 import { ensureBaseVariantQuoteSnapshot } from "./valuation.quotes.service.js";
 
 function freedName(name: string, id: string) {
@@ -246,16 +247,47 @@ export async function updateMetal(
 
       for (const v of variants) {
         const purity = new Prisma.Decimal(v.purity ?? 0);
+        const saleFactor = new Prisma.Decimal(v.saleFactor ?? 1);
         const suggested = computeSuggested(newRef, purity);
-        const finalSale = suggested.mul(new Prisma.Decimal(v.saleFactor ?? 1));
+        const finalSale = suggested.mul(saleFactor);
+        const finalSaleNum = roundMoney(Number(finalSale));
 
         await ensureBaseVariantQuoteSnapshot({
           jewelryId,
           variantId: v.id,
-          price: Number(finalSale),
+          price: finalSaleNum,
           effectiveAt: now,
           tx,
         });
+
+        const lastHist = await tx.metalVariantValueHistory.findFirst({
+          where: { variantId: v.id },
+          orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
+          select: { referenceValue: true, purity: true, saleFactor: true, finalSalePrice: true },
+        });
+
+        const histChanged =
+          !lastHist ||
+          !same6(lastHist.referenceValue, newRef) ||
+          !same6(lastHist.purity, purity) ||
+          !same6(lastHist.saleFactor, saleFactor) ||
+          !same6(lastHist.finalSalePrice, finalSaleNum);
+
+        if (histChanged) {
+          await tx.metalVariantValueHistory.create({
+            data: {
+              jewelryId,
+              metalId: updated.id,
+              variantId: v.id,
+              referenceValue: newRef,
+              purity,
+              saleFactor,
+              finalSalePrice: new Prisma.Decimal(finalSaleNum),
+              effectiveAt: now,
+              createdById: createdById || null,
+            },
+          });
+        }
       }
     }
 
