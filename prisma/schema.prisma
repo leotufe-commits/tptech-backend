@@ -48,6 +48,12 @@ model Jewelry {
   users                      User[]
   warehouses                 Warehouse[]
   warehouseStocks            WarehouseStock[]
+  articleCategories          ArticleCategory[]
+  taxes                      Tax[]
+  paymentMethods             PaymentMethod[]
+  shippingCarriers           ShippingCarrier[]
+  sellers                    Seller[]
+  priceLists                 PriceList[]
 
   @@index([createdAt])
   @@index([deletedAt])
@@ -100,6 +106,7 @@ model Warehouse {
   favoriteUsers User[]              @relation("UserFavoriteWarehouse")
   jewelry       Jewelry             @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
   stocks        WarehouseStock[]
+  sellers       SellerWarehouse[]
 
   @@index([jewelryId])
   @@index([deletedAt])
@@ -529,6 +536,249 @@ model CatalogItem {
 
 /// ///////////////////////////
 /// ///////////////////////////
+model ArticleCategory {
+  id          String    @id @default(cuid())
+  jewelryId   String
+  parentId    String?
+  name        String
+  description String    @default("")
+  imageUrl    String    @default("")
+  sortOrder   Int       @default(0)
+  isActive    Boolean   @default(true)
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  jewelry  Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  parent   ArticleCategory?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children ArticleCategory[] @relation("CategoryTree")
+  priceLists PriceList[]
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([parentId])
+  @@index([jewelryId, deletedAt])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model Tax {
+  id              String             @id @default(cuid())
+  jewelryId       String
+  name            String
+  code            String             @default("")
+  taxType         TaxType            @default(OTHER)
+  calculationType TaxCalculationType @default(PERCENTAGE)
+  rate            Decimal?           @db.Decimal(10, 4)
+  fixedAmount     Decimal?           @db.Decimal(18, 2)
+  applyOn         TaxApplyOn         @default(TOTAL)
+  includedInPrice Boolean            @default(false)
+  validFrom       DateTime?
+  validTo         DateTime?
+  isActive        Boolean            @default(true)
+  sortOrder       Int                @default(0)
+  notes           String             @default("")
+  deletedAt       DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  jewelry Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([jewelryId, deletedAt])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model PaymentMethod {
+  id              String                 @id @default(cuid())
+  jewelryId       String
+  name            String
+  code            String                 @default("")
+  type            PaymentMethodType      @default(OTHER)
+  adjustmentType  PaymentAdjustmentType  @default(NONE)
+  adjustmentValue Decimal?               @db.Decimal(10, 4)
+  isFavorite      Boolean                @default(false)
+  isActive        Boolean                @default(true)
+  sortOrder       Int                    @default(0)
+  notes           String                 @default("")
+  deletedAt       DateTime?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  jewelry          Jewelry                  @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  installmentPlans PaymentInstallmentPlan[]
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([jewelryId, isFavorite])
+  @@index([jewelryId, deletedAt])
+  @@index([deletedAt])
+}
+
+model PaymentInstallmentPlan {
+  id              String   @id @default(cuid())
+  paymentMethodId String
+  jewelryId       String
+  installments    Int
+  interestRate    Decimal  @db.Decimal(10, 4)
+  isActive        Boolean  @default(true)
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  paymentMethod PaymentMethod @relation(fields: [paymentMethodId], references: [id], onDelete: Cascade)
+
+  @@index([paymentMethodId])
+  @@index([jewelryId])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model ShippingCarrier {
+  id                     String         @id @default(cuid())
+  jewelryId              String
+  name                   String
+  code                   String         @default("")
+  logoUrl                String         @default("")
+  trackingUrl            String         @default("")
+  freeShippingThreshold  Decimal?       @db.Decimal(18, 2)
+  isFavorite             Boolean        @default(false)
+  isActive               Boolean        @default(true)
+  sortOrder              Int            @default(0)
+  notes                  String         @default("")
+  deletedAt              DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  jewelry Jewelry        @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  rates   ShippingRate[]
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([jewelryId, isFavorite])
+  @@index([jewelryId, deletedAt])
+  @@index([deletedAt])
+}
+
+model ShippingRate {
+  id              String              @id @default(cuid())
+  carrierId       String
+  jewelryId       String
+  name            String
+  zone            String              @default("")
+  calculationMode ShippingCalcMode    @default(FIXED)
+  fixedPrice      Decimal?            @db.Decimal(18, 2)
+  pricePerKg      Decimal?            @db.Decimal(18, 4)
+  minWeight       Decimal?            @db.Decimal(10, 3)
+  maxWeight       Decimal?            @db.Decimal(10, 3)
+  isActive        Boolean             @default(true)
+  sortOrder       Int                 @default(0)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  carrier ShippingCarrier @relation(fields: [carrierId], references: [id], onDelete: Cascade)
+
+  @@index([carrierId])
+  @@index([jewelryId])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model Seller {
+  id               String         @id @default(cuid())
+  jewelryId        String
+  firstName        String
+  lastName         String
+  displayName      String         @default("")
+  documentType     String         @default("")
+  documentNumber   String         @default("")
+  email            String         @default("")
+  phone            String         @default("")
+  commissionType   CommissionType @default(NONE)
+  commissionValue  Decimal?       @db.Decimal(10, 4)
+  userId           String?
+  isFavorite       Boolean        @default(false)
+  isActive         Boolean        @default(true)
+  sortOrder        Int            @default(0)
+  notes            String         @default("")
+  deletedAt        DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  jewelry    Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  warehouses SellerWarehouse[]
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([jewelryId, isFavorite])
+  @@index([jewelryId, deletedAt])
+  @@index([deletedAt])
+}
+
+model SellerWarehouse {
+  sellerId    String
+  warehouseId String
+  jewelryId   String
+
+  seller    Seller    @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@id([sellerId, warehouseId])
+  @@index([sellerId])
+  @@index([warehouseId])
+  @@index([jewelryId])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model PriceList {
+  id              String          @id @default(cuid())
+  jewelryId       String
+  name            String
+  code            String          @default("")
+  description     String          @default("")
+  scope           PriceListScope  @default(GENERAL)
+  categoryId      String?
+  channelId       String?
+  clientId        String?
+  mode            PriceListMode   @default(MARGIN_TOTAL)
+  marginTotal     Decimal?        @db.Decimal(10, 4)
+  marginMetal     Decimal?        @db.Decimal(10, 4)
+  marginHechura   Decimal?        @db.Decimal(10, 4)
+  costPerGram     Decimal?        @db.Decimal(18, 6)
+  surcharge       Decimal?        @db.Decimal(10, 4)
+  minimumPrice    Decimal?        @db.Decimal(18, 2)
+  roundingTarget  RoundingTarget  @default(NONE)
+  roundingMode    RoundingMode    @default(NONE)
+  roundingDirection RoundingDirection @default(NEAREST)
+  validFrom       DateTime?
+  validTo         DateTime?
+  isFavorite      Boolean         @default(false)
+  isActive        Boolean         @default(true)
+  sortOrder       Int             @default(0)
+  notes           String          @default("")
+  deletedAt       DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  jewelry  Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  category ArticleCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([jewelryId, isFavorite])
+  @@index([jewelryId, scope])
+  @@index([categoryId])
+  @@index([jewelryId, deletedAt])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
 enum InventoryMovementKind {
   IN
   OUT
@@ -582,4 +832,88 @@ enum CatalogType {
   PROVINCE
   COUNTRY
   DOCUMENT_TYPE
+}
+
+enum TaxType {
+  IVA
+  INTERNAL
+  PERCEPTION
+  RETENTION
+  OTHER
+}
+
+enum TaxCalculationType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  PERCENTAGE_PLUS_FIXED
+}
+
+enum TaxApplyOn {
+  TOTAL
+  METAL
+  HECHURA
+  METAL_Y_HECHURA
+  SUBTOTAL_AFTER_DISCOUNT
+  SUBTOTAL_BEFORE_DISCOUNT
+}
+
+enum PaymentMethodType {
+  CASH
+  DEBIT_CARD
+  CREDIT_CARD
+  TRANSFER
+  QR
+  OTHER
+}
+
+enum PaymentAdjustmentType {
+  NONE
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum ShippingCalcMode {
+  FIXED
+  BY_WEIGHT
+  BY_ZONE
+}
+
+enum CommissionType {
+  NONE
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum PriceListScope {
+  GENERAL
+  CHANNEL
+  CATEGORY
+  CLIENT
+}
+
+enum PriceListMode {
+  MARGIN_TOTAL
+  METAL_HECHURA
+  COST_PER_GRAM
+}
+
+enum RoundingTarget {
+  NONE
+  METAL
+  FINAL_PRICE
+}
+
+enum RoundingMode {
+  NONE
+  INTEGER
+  DECIMAL_1
+  DECIMAL_2
+  TEN
+  HUNDRED
+}
+
+enum RoundingDirection {
+  NEAREST
+  UP
+  DOWN
 }
