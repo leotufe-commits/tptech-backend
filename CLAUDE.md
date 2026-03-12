@@ -105,6 +105,12 @@ All routes are prefixed with `/api`:
 | `/api/dashboard/*` | requireAuth | dashboard.routes.ts |
 | `/api/storage/*` | — | storage.routes.ts |
 | `/api/company/catalogs/*` | requireAuth | catalogs.routes.ts |
+| `/api/categories/*` | requireAuth | categories.routes.ts |
+| `/api/taxes/*` | requireAuth | taxes.routes.ts |
+| `/api/payments/*` | requireAuth | payments.routes.ts |
+| `/api/shipping/*` | requireAuth | shipping.routes.ts |
+| `/api/sellers/*` | requireAuth | sellers.routes.ts |
+| `/api/price-lists/*` | requireAuth | price-lists.routes.ts |
 
 Dev-only: `GET /dev/mail/:id` — email preview (active when `MAIL_MODE !== production`).
 
@@ -259,3 +265,40 @@ Manages lookup lists per tenant. `CatalogItem` supports these types (enum `Catal
 | `COUNTRY` | Country list |
 
 Each item has `label`, `isActive`, `sortOrder`, `isFavorite`, and `deletedAt` (soft delete). Unique constraint: `(jewelryId, type, label)`.
+
+### System configuration modules
+
+These modules all follow the same CRUD pattern (list / create / update / toggle / soft-delete):
+
+| Module | Path | Key model fields |
+|---|---|---|
+| **Taxes** | `src/modules/taxes/` | `TaxType`, `TaxCalculationType`, `TaxApplyOn`, `rate`, `fixedAmount`, `isDefault`, `isActive` |
+| **Payment methods** | `src/modules/payments/` | `PaymentMethodType`, `surchargePercent`, `isDefault`, `isActive` |
+| **Shipping** | `src/modules/shipping/` | `ShippingCalcMode` (FIXED/BY_WEIGHT/BY_ZONE), `fixedCost`, `costPerKg`, `isActive` |
+| **Price lists** | `src/modules/price-lists/` | `PriceListScope`, `PriceListMode`, `RoundingTarget/Mode/Direction`, `marginPercent`, `isActive` |
+
+### Categories module (`src/modules/categories/`)
+
+`ArticleCategory` supports a hierarchy (`parentId`). `defaultPriceListId` links to a `PriceList`.
+
+**Attribute system**: each category can have `ArticleCategoryAttribute` records with `CategoryAttributeInputType` (TEXT, TEXTAREA, NUMBER, DECIMAL, BOOLEAN, DATE, SELECT, MULTISELECT, COLOR). Attributes with `inheritToChild: true` propagate down the hierarchy.
+
+Key endpoints beyond basic CRUD:
+- `GET /categories/:id/attributes` — own attributes only
+- `GET /categories/:id/attributes/effective` — own + inherited (climbs ancestor chain, own attrs override inherited by matching `code||name`)
+- `POST /categories/attributes/:attributeId/options` — add option for SELECT/MULTISELECT/COLOR types
+- `DELETE /categories/attributes/options/:optionId` — remove option
+
+### Sellers module (`src/modules/sellers/`)
+
+`Seller` model fields: basic info (name, code, email, phone, documentType, documentNumber, commissionType, commissionRate, commissionBase), address fields (street, streetNumber, city, province, country, postalCode), `avatarUrl`, `isFavorite`, `isActive`, `deletedAt`.
+
+Additional relations:
+- `SellerWarehouse` — M2M with `Warehouse`
+- `SellerAttachment` — documents attached to a seller (filename, url, mimeType, size)
+
+File upload middlewares (dedicated, not generic):
+- `src/middlewares/uploadSellerAvatar.ts` — image only, max 5MB, field name `file` → `PATCH /sellers/:id/avatar`
+- `src/middlewares/uploadSellerAttachments.ts` — any file, max 20MB → `POST /sellers/:id/attachments`
+
+Both middlewares auto-route to R2 when `R2_ENABLED`, otherwise local disk under `uploads/sellers/`.

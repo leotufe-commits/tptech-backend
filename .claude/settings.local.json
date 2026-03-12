@@ -9,7 +9,11 @@
       "Bash(npx tsx:*)",
       "Bash(npx dotenv:*)",
       "Bash(git:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cmd:*)",
+      "Bash(npm install:*)",
+      "Bash(xargs grep:*)",
+      "Bash(do echo:*)"
     ]
   }
 }

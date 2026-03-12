@@ -25,6 +25,7 @@ import paymentsRoutes from "../modules/payments/payments.routes.js";
 import shippingRoutes from "../modules/shipping/shipping.routes.js";
 import sellersRoutes from "../modules/sellers/sellers.routes.js";
 import priceListsRoutes from "../modules/price-lists/price-lists.routes.js";
+import attributeDefsRoutes from "../modules/attribute-defs/attribute-defs.routes.js";
 
 /* =====================
    ✅ DASHBOARD
@@ -57,6 +58,7 @@ router.use("/payments", requireAuth, paymentsRoutes);
 router.use("/shipping", requireAuth, shippingRoutes);
 router.use("/sellers", requireAuth, sellersRoutes);
 router.use("/price-lists", requireAuth, priceListsRoutes);
+router.use("/attribute-defs", requireAuth, attributeDefsRoutes);
 
 /**
  * Catalogs

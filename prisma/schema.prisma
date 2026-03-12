@@ -54,6 +54,7 @@ model Jewelry {
   shippingCarriers           ShippingCarrier[]
   sellers                    Seller[]
   priceLists                 PriceList[]
+  attributeDefs              ArticleAttributeDef[]
 
   @@index([createdAt])
   @@index([deletedAt])
@@ -537,28 +538,104 @@ model CatalogItem {
 /// ///////////////////////////
 /// ///////////////////////////
 model ArticleCategory {
-  id          String    @id @default(cuid())
-  jewelryId   String
-  parentId    String?
-  name        String
-  description String    @default("")
-  imageUrl    String    @default("")
-  sortOrder   Int       @default(0)
-  isActive    Boolean   @default(true)
-  deletedAt   DateTime?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id                 String    @id @default(cuid())
+  jewelryId          String
+  parentId           String?
+  defaultPriceListId String?
+  name               String
+  description        String    @default("")
+  imageUrl           String    @default("")
+  sortOrder          Int       @default(0)
+  isActive           Boolean   @default(true)
+  deletedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 
-  jewelry  Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  parent   ArticleCategory?  @relation("CategoryTree", fields: [parentId], references: [id])
-  children ArticleCategory[] @relation("CategoryTree")
-  priceLists PriceList[]
+  jewelry          Jewelry                    @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  parent           ArticleCategory?           @relation("CategoryTree", fields: [parentId], references: [id])
+  children         ArticleCategory[]          @relation("CategoryTree")
+  priceLists       PriceList[]                @relation("CategoryPriceLists")
+  defaultPriceList PriceList?                 @relation("DefaultPriceList", fields: [defaultPriceListId], references: [id], onDelete: SetNull)
+  attributes       ArticleCategoryAttribute[]
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
   @@index([parentId])
+  @@index([defaultPriceListId])
   @@index([jewelryId, deletedAt])
   @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model ArticleCategoryAttribute {
+  id             String    @id @default(cuid())
+  jewelryId      String
+  categoryId     String
+  definitionId   String
+  isRequired     Boolean   @default(false)
+  isActive       Boolean   @default(true)
+  isFilterable   Boolean   @default(true)
+  isVariantAxis  Boolean   @default(false)
+  inheritToChild Boolean   @default(true)
+  sortOrder      Int       @default(0)
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  category   ArticleCategory     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  definition ArticleAttributeDef @relation(fields: [definitionId], references: [id], onDelete: Restrict)
+
+  @@index([jewelryId])
+  @@index([categoryId])
+  @@index([definitionId])
+  @@index([categoryId, isActive])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model ArticleAttributeDef {
+  id           String                     @id @default(cuid())
+  jewelryId    String
+  name         String
+  code         String                     @default("")
+  inputType    CategoryAttributeInputType
+  helpText     String                     @default("")
+  unit         String                     @default("")
+  defaultValue String                     @default("")
+  isActive     Boolean                    @default(true)
+  deletedAt    DateTime?
+  createdAt    DateTime                   @default(now())
+  updatedAt    DateTime                   @updatedAt
+
+  jewelry     Jewelry                    @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  options     ArticleAttributeDefOption[]
+  assignments ArticleCategoryAttribute[]
+
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([deletedAt])
+  @@index([jewelryId, deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model ArticleAttributeDefOption {
+  id           String   @id @default(cuid())
+  definitionId String
+  label        String
+  value        String
+  colorHex     String   @default("")
+  sortOrder    Int      @default(0)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  definition ArticleAttributeDef @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+
+  @@index([definitionId])
+  @@index([definitionId, isActive])
 }
 
 /// ///////////////////////////
@@ -698,25 +775,46 @@ model Seller {
   documentNumber   String         @default("")
   email            String         @default("")
   phone            String         @default("")
-  commissionType   CommissionType @default(NONE)
-  commissionValue  Decimal?       @db.Decimal(10, 4)
+  commissionType   CommissionType  @default(NONE)
+  commissionValue  Decimal?        @db.Decimal(10, 4)
+  commissionBase   CommissionBase  @default(NET)
   userId           String?
   isFavorite       Boolean        @default(false)
   isActive         Boolean        @default(true)
   sortOrder        Int            @default(0)
   notes            String         @default("")
+  avatarUrl        String         @default("")
+  street           String         @default("")
+  streetNumber     String         @default("")
+  city             String         @default("")
+  province         String         @default("")
+  country          String         @default("")
+  postalCode       String         @default("")
   deletedAt        DateTime?
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 
-  jewelry    Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  warehouses SellerWarehouse[]
+  jewelry     Jewelry            @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  warehouses  SellerWarehouse[]
+  attachments SellerAttachment[]
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
   @@index([jewelryId, isFavorite])
   @@index([jewelryId, deletedAt])
   @@index([deletedAt])
+}
+
+enum CommissionType {
+  NONE
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum CommissionBase {
+  GROSS
+  NET
+  MARGIN
 }
 
 model SellerWarehouse {
@@ -731,6 +829,24 @@ model SellerWarehouse {
   @@index([sellerId])
   @@index([warehouseId])
   @@index([jewelryId])
+}
+
+model SellerAttachment {
+  id         String    @id @default(cuid())
+  sellerId   String
+  jewelryId  String
+  filename   String
+  url        String
+  mimeType   String    @default("")
+  size       Int       @default(0)
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  seller Seller @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+
+  @@index([sellerId])
+  @@index([jewelryId])
+  @@index([deletedAt])
 }
 
 /// ///////////////////////////
@@ -754,7 +870,9 @@ model PriceList {
   minimumPrice    Decimal?        @db.Decimal(18, 2)
   roundingTarget  RoundingTarget  @default(NONE)
   roundingMode    RoundingMode    @default(NONE)
-  roundingDirection RoundingDirection @default(NEAREST)
+  roundingDirection    RoundingDirection @default(NEAREST)
+  roundingValueMetal   Decimal?          @db.Decimal(18, 4)
+  roundingValueHechura Decimal?          @db.Decimal(18, 4)
   validFrom       DateTime?
   validTo         DateTime?
   isFavorite      Boolean         @default(false)
@@ -765,8 +883,9 @@ model PriceList {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
-  jewelry  Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  category ArticleCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  jewelry          Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  category         ArticleCategory?  @relation("CategoryPriceLists", fields: [categoryId], references: [id], onDelete: SetNull)
+  categoriesDefault ArticleCategory[] @relation("DefaultPriceList")
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
@@ -784,6 +903,20 @@ enum InventoryMovementKind {
   OUT
   TRANSFER
   ADJUST
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+enum CategoryAttributeInputType {
+  TEXT
+  TEXTAREA
+  NUMBER
+  DECIMAL
+  BOOLEAN
+  DATE
+  SELECT
+  MULTISELECT
+  COLOR
 }
 
 /// ///////////////////////////
@@ -876,12 +1009,6 @@ enum ShippingCalcMode {
   FIXED
   BY_WEIGHT
   BY_ZONE
-}
-
-enum CommissionType {
-  NONE
-  PERCENTAGE
-  FIXED_AMOUNT
 }
 
 enum PriceListScope {
