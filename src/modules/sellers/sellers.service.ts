@@ -39,6 +39,9 @@ const SELLER_SELECT = {
   isFavorite: true,
   isActive: true,
   sortOrder: true,
+  contactName: true,
+  contactPhone: true,
+  contactEmail: true,
   notes: true,
   deletedAt: true,
   createdAt: true,
@@ -72,6 +75,33 @@ export async function listSellers(jewelryId: string) {
   });
 }
 
+async function resolveUserId(
+  rawUserId: any,
+  jewelryId: string,
+  excludeSellerId?: string
+): Promise<string | null> {
+  const uid = s(rawUserId) || null;
+  if (!uid) return null;
+
+  const user = await prisma.user.findFirst({
+    where: { id: uid, jewelryId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(user, "El usuario seleccionado no existe o no pertenece a esta joyería.");
+
+  const conflict = await prisma.seller.findFirst({
+    where: {
+      userId: uid,
+      deletedAt: null,
+      ...(excludeSellerId ? { id: { not: excludeSellerId } } : {}),
+    },
+    select: { id: true, displayName: true },
+  });
+  assert(!conflict, "Ese usuario ya está vinculado a otro vendedor.");
+
+  return uid;
+}
+
 export async function createSeller(jewelryId: string, data: any) {
   assert(jewelryId, "Tenant inválido.");
 
@@ -98,6 +128,8 @@ export async function createSeller(jewelryId: string, data: any) {
   if (commissionType !== "NONE") {
     assert(commissionValue !== null, "Valor de comisión requerido.");
   }
+
+  const userId = await resolveUserId(data?.userId, jewelryId);
 
   const isFavorite = data?.isFavorite === true;
   const warehouseIds: string[] = Array.isArray(data?.warehouseIds)
@@ -139,11 +171,14 @@ export async function createSeller(jewelryId: string, data: any) {
       commissionType,
       commissionValue: commissionValue ?? undefined,
       commissionBase,
-      userId: s(data?.userId) || null,
+      userId,
       isFavorite,
       isActive: true,
       sortOrder: Number(data?.sortOrder ?? 0) || 0,
       notes: s(data?.notes),
+      contactName: s(data?.contactName),
+      contactPhone: s(data?.contactPhone),
+      contactEmail: s(data?.contactEmail),
       warehouses:
         warehouseIds.length > 0
           ? { create: warehouseIds.map((wid) => ({ warehouseId: wid, jewelryId })) }
@@ -182,6 +217,8 @@ export async function updateSeller(id: string, jewelryId: string, data: any) {
     commissionType !== "NONE"
       ? String(parseFloat(String(data?.commissionValue ?? 0)) || 0)
       : null;
+
+  const userId = await resolveUserId(data?.userId, jewelryId, id);
 
   const isFavorite = data?.isFavorite === true;
   const isActive = data?.isActive === false ? false : true;
@@ -226,10 +263,14 @@ export async function updateSeller(id: string, jewelryId: string, data: any) {
       commissionType,
       commissionValue: commissionValue ?? undefined,
       commissionBase,
+      userId,
       isFavorite,
       isActive,
       sortOrder: Number(data?.sortOrder ?? 0) || 0,
       notes: s(data?.notes),
+      contactName: s(data?.contactName),
+      contactPhone: s(data?.contactPhone),
+      contactEmail: s(data?.contactEmail),
       warehouses:
         warehouseIds.length > 0
           ? { create: warehouseIds.map((wid) => ({ warehouseId: wid, jewelryId })) }
@@ -307,7 +348,8 @@ export async function deleteSeller(id: string, jewelryId: string) {
 
   return prisma.seller.update({
     where: { id },
-    data: { deletedAt: new Date(), isActive: false },
+    // userId se libera (null) para no bloquear la constraint @unique al reutilizar el usuario
+    data: { deletedAt: new Date(), isActive: false, userId: null },
     select: { id: true },
   });
 }

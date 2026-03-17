@@ -12,6 +12,7 @@ const VALID_ADJ: PaymentAdjustmentType[] = ["NONE", "PERCENTAGE", "FIXED_AMOUNT"
 
 const PM_SELECT = {
   id: true, jewelryId: true, name: true, code: true, type: true,
+  customTypeLabel: true,
   adjustmentType: true, adjustmentValue: true,
   isFavorite: true, isActive: true, sortOrder: true, notes: true,
   deletedAt: true, createdAt: true, updatedAt: true,
@@ -51,6 +52,7 @@ export async function createPaymentMethod(jewelryId: string, data: any) {
   assert(name, "Nombre requerido.");
 
   const type: PaymentMethodType = VALID_TYPES.includes(data?.type) ? data.type : "OTHER";
+  const customTypeLabel = s(data?.customTypeLabel);
   const adjustmentType: PaymentAdjustmentType = VALID_ADJ.includes(data?.adjustmentType) ? data.adjustmentType : "NONE";
   const adjustmentValue = adjustmentType !== "NONE" ? String(parseFloat(String(data?.adjustmentValue ?? 0)) || 0) : null;
   if (adjustmentType !== "NONE") assert(adjustmentValue !== null, "Valor de ajuste requerido.");
@@ -66,7 +68,7 @@ export async function createPaymentMethod(jewelryId: string, data: any) {
 
   return prisma.paymentMethod.create({
     data: {
-      jewelryId, name, code, type, adjustmentType,
+      jewelryId, name, code, type, customTypeLabel, adjustmentType,
       adjustmentValue: adjustmentValue ?? undefined,
       isFavorite, isActive: true, sortOrder,
       notes: s(data?.notes),
@@ -84,6 +86,7 @@ export async function updatePaymentMethod(id: string, jewelryId: string, data: a
   const name = s(data?.name);
   assert(name, "Nombre requerido.");
   const type: PaymentMethodType = VALID_TYPES.includes(data?.type) ? data.type : "OTHER";
+  const customTypeLabel = s(data?.customTypeLabel);
   const adjustmentType: PaymentAdjustmentType = VALID_ADJ.includes(data?.adjustmentType) ? data.adjustmentType : "NONE";
   const adjustmentValue = adjustmentType !== "NONE" ? String(parseFloat(String(data?.adjustmentValue ?? 0)) || 0) : null;
   const isFavorite = data?.isFavorite === true;
@@ -101,7 +104,7 @@ export async function updatePaymentMethod(id: string, jewelryId: string, data: a
   return prisma.paymentMethod.update({
     where: { id },
     data: {
-      name, code, type, adjustmentType,
+      name, code, type, customTypeLabel, adjustmentType,
       adjustmentValue: adjustmentValue ?? undefined,
       isFavorite, isActive, sortOrder: Number(data?.sortOrder ?? 0) || 0,
       notes: s(data?.notes),
@@ -125,7 +128,8 @@ export async function clonePaymentMethod(id: string, jewelryId: string) {
   return prisma.paymentMethod.create({
     data: {
       jewelryId, name: `${original.name} (copia)`, code: newCode,
-      type: original.type, adjustmentType: original.adjustmentType,
+      type: original.type, customTypeLabel: original.customTypeLabel,
+      adjustmentType: original.adjustmentType,
       adjustmentValue: original.adjustmentValue ?? undefined,
       isFavorite: false, isActive: false,
       sortOrder: original.sortOrder, notes: original.notes,

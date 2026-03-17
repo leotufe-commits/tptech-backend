@@ -45,3 +45,10 @@ export async function remove(req: any, res: Response) {
   assert(jewelryId, "Tenant inválido."); assert(id, "Id inválido.");
   return res.json(await service.deleteTax(id, jewelryId));
 }
+
+export async function setFavorite(req: any, res: Response) {
+  const jewelryId = req.user?.jewelryId;
+  const id = s(req.params?.id);
+  assert(jewelryId, "Tenant inválido."); assert(id, "Id inválido.");
+  return res.json(await service.setFavoriteTax(id, jewelryId));
+}

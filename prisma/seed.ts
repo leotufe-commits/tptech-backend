@@ -1,8 +1,11 @@
 // prisma/seed.ts
+import "dotenv/config";
 import { PrismaClient, PermModule, PermAction, UserStatus } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import bcrypt from "bcryptjs";
 
-const prisma = new PrismaClient();
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
+const prisma = new PrismaClient({ adapter });
 
 async function main() {
   const JEWELRY_NAME = "TPTech Demo";
@@ -224,7 +227,7 @@ async function main() {
   const passwordHash = await bcrypt.hash(OWNER_PASSWORD, 10);
 
   const ownerUser = await prisma.user.upsert({
-    where: { email: OWNER_EMAIL },
+    where: { jewelryId_email: { jewelryId: jewelry.id, email: OWNER_EMAIL } },
     create: {
       email: OWNER_EMAIL,
       password: passwordHash,
@@ -236,7 +239,6 @@ async function main() {
     update: {
       password: passwordHash,
       status: UserStatus.ACTIVE,
-      jewelryId: jewelry.id,
     },
   });
 

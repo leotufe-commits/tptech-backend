@@ -5,7 +5,8 @@ import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 
 import { prisma } from "../../lib/prisma.js";
-import { sendMail } from "../../lib/mail.service.js";
+import { sendResetEmail } from "../../lib/mailer.js";
+import { createAuthTokenRecord, consumeAuthToken } from "../../lib/authTokenStore.js";
 import { auditLog } from "../../lib/auditLogger.js";
 import { buildAuthResponse } from "../../lib/authResponse.js";
 import { UserStatus, PermModule, PermAction } from "@prisma/client";
@@ -72,64 +73,6 @@ export function prismaUniqueTargets(e: any): string[] {
   return [];
 }
 
-function getReqIp(req: Request) {
-  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0]?.trim();
-  return xf || (req.socket?.remoteAddress ? String(req.socket.remoteAddress) : undefined);
-}
-
-/** ✅ Crea registro single-use en DB */
-async function createResetAuthTokenRecord(opts: {
-  userId: string;
-  jti: string;
-  expiresAt: Date;
-  emailSnapshot?: string;
-  req?: Request;
-}) {
-  const { userId, jti, expiresAt, emailSnapshot, req } = opts;
-
-  // limpiamos tokens vencidos viejos (higiene)
-  try {
-    await prisma.authToken.deleteMany({
-      where: {
-        type: "reset",
-        OR: [{ expiresAt: { lt: new Date() } }, { usedAt: { not: null } }],
-      },
-    });
-  } catch {}
-
-  return prisma.authToken.create({
-    data: {
-      type: "reset",
-      jti,
-      userId,
-      expiresAt,
-      emailSnapshot: String(emailSnapshot || ""),
-      ip: req ? getReqIp(req) : undefined,
-      userAgent: req ? String(req.headers["user-agent"] || "") : undefined,
-    },
-    select: { id: true, jti: true, expiresAt: true },
-  });
-}
-
-/** ✅ Consume single-use: marca usedAt si está OK */
-async function consumeResetAuthToken(jti: string) {
-  const row = await prisma.authToken.findUnique({
-    where: { jti },
-    select: { jti: true, usedAt: true, expiresAt: true, userId: true, type: true },
-  });
-
-  if (!row || row.type !== "reset") throw new Error("Token inválido.");
-  if (row.usedAt) throw new Error("Token ya utilizado.");
-  if (new Date(row.expiresAt).getTime() < Date.now()) throw new Error("Token expirado.");
-
-  await prisma.authToken.update({
-    where: { jti },
-    data: { usedAt: new Date() },
-    select: { jti: true },
-  });
-
-  return { userId: row.userId, expiresAt: row.expiresAt };
-}
 
 /* =========================
    PRISMA INCLUDES
@@ -429,9 +372,13 @@ export async function login(req: Request, res: Response) {
       success: false,
       userId: user.id,
       tenantId: user.jewelryId,
-      meta: { email, reason: "user_blocked" },
+      meta: { email, reason: user.status === UserStatus.BLOCKED ? "user_blocked" : "user_pending" },
     });
-    return res.status(403).json({ message: "Usuario no habilitado." });
+    const loginBlockedMsg =
+      user.status === UserStatus.BLOCKED
+        ? "Tu cuenta está bloqueada. Contactá al administrador."
+        : "Tu cuenta está pendiente de activación. Revisá tu email para activarla.";
+    return res.status(403).json({ message: loginBlockedMsg });
   }
 
   const ok = await bcrypt.compare(password, user.password);
@@ -494,7 +441,8 @@ export async function forgotPassword(req: Request, res: Response) {
 
   // ✅ single-use: guardamos registro en DB con expiración (30m)
   const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-  await createResetAuthTokenRecord({
+  await createAuthTokenRecord({
+    type: "reset",
     userId: user.id,
     jti,
     expiresAt,
@@ -502,23 +450,7 @@ export async function forgotPassword(req: Request, res: Response) {
     req,
   });
 
-  await sendMail({
-    to: email,
-    subject: "TPTech - Restablecer contraseña",
-    text: `Abrí este link para restablecer tu contraseña: ${resetLink}`,
-    html: `
-      <div style="font-family: ui-sans-serif, system-ui; line-height: 1.4;">
-        <h2 style="margin:0 0 12px 0;">Restablecer contraseña</h2>
-        <p style="margin:0 0 12px 0;">Recibimos una solicitud para restablecer tu contraseña.</p>
-        <p style="margin:0 0 12px 0;">
-          <a href="${resetLink}" style="color:#F36A21; font-weight:600;">Hacé click acá para restablecerla</a>
-        </p>
-        <p style="margin:0; color:#6b7280; font-size:12px;">
-          Si vos no pediste este cambio, podés ignorar este email.
-        </p>
-      </div>
-    `,
-  });
+  await sendResetEmail(email, resetLink);
 
   auditLog(req, {
     action: "auth.forgot_password",
@@ -548,11 +480,20 @@ export async function resetPassword(req: Request, res: Response) {
     const { userId, jti } = verifyResetToken(token);
 
     // ✅ 2) Single-use (si ya se usó o no existe, falla)
-    const consumed = await consumeResetAuthToken(jti);
+    const result = await consumeAuthToken({ userId, jti });
 
-    if (String(consumed.userId) !== String(userId)) {
-      auditLog(req, { action: "auth.reset_password", success: false, meta: { reason: "jti_user_mismatch", jti } });
-      return res.status(401).json({ message: "Token inválido." });
+    if (!result.ok) {
+      const msgMap: Record<string, string> = {
+        not_found: "Token inválido.",
+        wrong_type: "Token inválido.",
+        user_mismatch: "Token inválido.",
+        already_used: "Este link ya fue usado.",
+        expired: "Este link expiró. Pedí uno nuevo.",
+        race: "Token inválido.",
+      };
+      const safeMsg = msgMap[result.reason] ?? "Token inválido.";
+      auditLog(req, { action: "auth.reset_password", success: false, meta: { reason: result.reason, jti } });
+      return res.status(401).json({ message: safeMsg });
     }
 
     const user = await prisma.user.findUnique({
@@ -587,17 +528,65 @@ export async function resetPassword(req: Request, res: Response) {
     });
 
     return res.json({ ok: true });
-  } catch (e: any) {
-    const msg = String(e?.message || "").toLowerCase();
-
-    const safeMsg =
-      msg.includes("ya utilizado") ? "Este link ya fue usado." :
-      msg.includes("expirado") ? "Este link expiró. Pedí uno nuevo." :
-      "Token inválido.";
-
-    auditLog(req, { action: "auth.reset_password", success: false, meta: { reason: "reset_failed", err: String(e?.message || "") } });
-    return res.status(401).json({ message: safeMsg });
+  } catch {
+    // verifyResetToken lanzó error (JWT inválido o expirado a nivel firma)
+    auditLog(req, { action: "auth.reset_password", success: false, meta: { reason: "jwt_invalid" } });
+    return res.status(401).json({ message: "Token inválido." });
   }
+}
+
+/* =========================
+   CHANGE PASSWORD (autenticado)
+========================= */
+export async function changePassword(req: Request, res: Response) {
+  const userId = (req as any).userId as string;
+  const { currentPassword, newPassword } = req.body as {
+    currentPassword: string;
+    newPassword: string;
+  };
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, password: true, jewelryId: true, tokenVersion: true },
+  });
+
+  if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
+
+  const ok = await bcrypt.compare(currentPassword, user.password);
+  if (!ok) {
+    auditLog(req, {
+      action: "auth.change_password",
+      success: false,
+      userId,
+      tenantId: user.jewelryId,
+      meta: { reason: "wrong_current_password" },
+    });
+    return res.status(400).json({ message: "La contraseña actual es incorrecta." });
+  }
+
+  const newHash = await bcrypt.hash(newPassword, 10);
+
+  const updated = await prisma.user.update({
+    where: { id: userId },
+    data: {
+      password: newHash,
+      tokenVersion: { increment: 1 },
+    },
+    select: { id: true, jewelryId: true, tokenVersion: true },
+  });
+
+  // ✅ Re-emitir cookie con tokenVersion actualizado para mantener la sesión activa
+  const newToken = signToken(updated.id, updated.jewelryId, updated.tokenVersion);
+  setAuthCookie(req, res, newToken);
+
+  auditLog(req, {
+    action: "auth.change_password",
+    success: true,
+    userId,
+    tenantId: user.jewelryId,
+  });
+
+  return res.json({ ok: true });
 }
 
 /* =========================
@@ -609,4 +598,35 @@ export async function loginOptions(req: Request, res: Response) {
 
   const tenants = await fetchUsersForLoginOptions(rawEmail);
   return res.json({ email: rawEmail, tenants });
+}
+
+/* =========================
+   VERIFY TOKEN (sin consumir)
+========================= */
+export async function verifyToken(req: Request, res: Response) {
+  const token = String((req.query as any)?.token ?? "").trim();
+  if (!token) return res.status(400).json({ ok: false, reason: "missing", message: "Token requerido." });
+
+  try {
+    const { userId, jti } = verifyResetToken(token);
+
+    const row = await prisma.authToken.findUnique({
+      where: { jti },
+      select: { usedAt: true, expiresAt: true, userId: true },
+    });
+
+    if (!row || String(row.userId) !== String(userId)) {
+      return res.status(401).json({ ok: false, reason: "invalid", message: "Token inválido." });
+    }
+    if (row.usedAt) {
+      return res.status(401).json({ ok: false, reason: "already_used", message: "Este link ya fue usado." });
+    }
+    if (row.expiresAt.getTime() < Date.now()) {
+      return res.status(401).json({ ok: false, reason: "expired", message: "Este link expiró." });
+    }
+
+    return res.json({ ok: true });
+  } catch {
+    return res.status(401).json({ ok: false, reason: "invalid", message: "Token inválido." });
+  }
 }

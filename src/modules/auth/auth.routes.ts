@@ -15,6 +15,7 @@ import {
   loginOptionsSchema,
   forgotSchema,
   resetSchema,
+  changePasswordSchema,
   updateJewelrySchema,
   pinSetSchema,
   pinDisableSchema,
@@ -126,6 +127,15 @@ router.post(
 );
 
 router.post("/reset-password", safeMw(authResetLimiter), validateBody(resetSchema), safeMw((Auth as any).resetPassword));
+
+router.get("/verify-token", safeMw((Auth as any).verifyToken));
+
+router.patch(
+  "/me/change-password",
+  requireAuth,
+  validateBody(changePasswordSchema),
+  safeMw((Auth as any).changePassword)
+);
 
 /* =========================
    🔐 PIN / LOCK / QUICK SWITCH

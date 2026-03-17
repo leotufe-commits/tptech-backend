@@ -52,6 +52,7 @@ const SELECT = {
   validFrom: true,
   validTo: true,
   isActive: true,
+  isFavorite: true,
   sortOrder: true,
   notes: true,
   deletedAt: true,
@@ -64,8 +65,20 @@ export async function listTaxes(jewelryId: string) {
   return prisma.tax.findMany({
     where: { jewelryId, deletedAt: null },
     select: SELECT,
-    orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
+    orderBy: [{ isFavorite: "desc" }, { sortOrder: "asc" }, { name: "asc" }],
   });
+}
+
+export async function setFavoriteTax(id: string, jewelryId: string) {
+  assert(id, "Id inválido.");
+  assert(jewelryId, "Tenant inválido.");
+  const tax = await prisma.tax.findFirst({ where: { id, jewelryId, deletedAt: null }, select: { id: true, isFavorite: true } });
+  assert(tax, "Impuesto no encontrado.");
+  const next = !tax.isFavorite;
+  if (next) {
+    await prisma.tax.updateMany({ where: { jewelryId, deletedAt: null }, data: { isFavorite: false } });
+  }
+  return prisma.tax.update({ where: { id }, data: { isFavorite: next }, select: SELECT });
 }
 
 export async function createTax(jewelryId: string, data: any) {

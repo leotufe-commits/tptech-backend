@@ -362,6 +362,25 @@ export async function updateCategory(id: string, jewelryId: string, data: any) {
 }
 
 /* =========================
+   HELPERS
+========================= */
+
+/** Recolecta todos los IDs de descendientes (BFS) */
+async function collectDescendantIds(rootId: string, jewelryId: string): Promise<string[]> {
+  const allIds: string[] = [];
+  let queue = [rootId];
+  while (queue.length > 0) {
+    const children = await prisma.articleCategory.findMany({
+      where: { parentId: { in: queue }, jewelryId, deletedAt: null },
+      select: { id: true },
+    });
+    queue = children.map((c) => c.id);
+    allIds.push(...queue);
+  }
+  return allIds;
+}
+
+/* =========================
    TOGGLE CATEGORY
 ========================= */
 export async function toggleCategory(id: string, jewelryId: string) {
@@ -374,9 +393,22 @@ export async function toggleCategory(id: string, jewelryId: string) {
   });
   assert(cat, "Categoría no encontrada.");
 
+  const nextActive = !cat.isActive;
+
+  // Al desactivar, cascadear a toda la descendencia
+  if (!nextActive) {
+    const descendantIds = await collectDescendantIds(id, jewelryId);
+    if (descendantIds.length > 0) {
+      await prisma.articleCategory.updateMany({
+        where: { id: { in: descendantIds }, jewelryId },
+        data: { isActive: false },
+      });
+    }
+  }
+
   const updated = await prisma.articleCategory.update({
     where: { id },
-    data: { isActive: !cat.isActive },
+    data: { isActive: nextActive },
     select: CAT_SELECT,
   });
 

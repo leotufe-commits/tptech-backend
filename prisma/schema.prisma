@@ -34,6 +34,29 @@ model Jewelry {
   pinLockEnabled             Boolean                    @default(false)
   pinLockRequireOnUserSwitch Boolean                    @default(false)
   pinLockTimeoutSec          Int                        @default(120)
+  defaultMermaPercent        Decimal?                   @db.Decimal(5, 2) // merma global del tenant
+
+  // ── Email branding (por joyería) ──────────────────────────────────────────
+  // Bloque 1 — Identidad del correo
+  emailEnabled               Boolean                    @default(true)
+  emailSenderName            String                     @default("") // "Joyería Pérez" — nombre visible del remitente
+  emailLogoUrl               String                     @default("") // URL del logo para correos (vacío = usa logoUrl)
+  emailSignature             String                     @default("") // Firma al pie del cuerpo
+
+  // Bloque 2 — Respuesta y contacto
+  emailReplyTo               String                     @default("") // Reply-To header
+  emailContact               String                     @default("") // email visible al cliente
+  emailPhone                 String                     @default("")
+  emailWhatsapp              String                     @default("")
+
+  // Bloque 3 — Pie e información comercial
+  emailAddressLine           String                     @default("")
+  emailBusinessHours         String                     @default("")
+  emailWebsite               String                     @default("")
+  emailInstagram             String                     @default("")
+  emailFooter                String                     @default("") // párrafo de pie del correo
+  // ── Fin Email branding ────────────────────────────────────────────────────
+
   deletedAt                  DateTime?
   auditLogs                  AuditLog[]
   catalogItems               CatalogItem[]
@@ -55,6 +78,8 @@ model Jewelry {
   sellers                    Seller[]
   priceLists                 PriceList[]
   attributeDefs              ArticleAttributeDef[]
+  commercialEntities         CommercialEntity[]
+  articles                   Article[]
 
   @@index([createdAt])
   @@index([deletedAt])
@@ -104,10 +129,12 @@ model Warehouse {
   fromMovements InventoryMovement[] @relation("MovementFromWarehouse")
   toMovements   InventoryMovement[] @relation("MovementToWarehouse")
   movements     InventoryMovement[] @relation("MovementWarehouse")
-  favoriteUsers User[]              @relation("UserFavoriteWarehouse")
-  jewelry       Jewelry             @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  stocks        WarehouseStock[]
-  sellers       SellerWarehouse[]
+  favoriteUsers    User[]              @relation("UserFavoriteWarehouse")
+  jewelry          Jewelry             @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  stocks           WarehouseStock[]
+  sellers          SellerWarehouse[]
+  shippingCarriers ShippingCarrier[]   @relation("WarehousePickups")
+  articleStock     ArticleStock[]
 
   @@index([jewelryId])
   @@index([deletedAt])
@@ -198,6 +225,8 @@ model User {
   favoriteWarehouseId        String?
   createdAt                  DateTime                   @default(now())
   updatedAt                  DateTime                   @updatedAt
+  firstName                  String                     @default("")
+  lastName                   String                     @default("")
   city                       String                     @default("")
   country                    String                     @default("")
   documentNumber             String                     @default("")
@@ -228,6 +257,7 @@ model User {
   attachments                UserAttachment[]
   permissionOverrides        UserPermissionOverride[]
   roles                      UserRole[]
+  seller                     Seller?
 
   @@unique([jewelryId, email])
   @@index([jewelryId])
@@ -378,9 +408,10 @@ model Currency {
   createdAt DateTime       @default(now())
   updatedAt DateTime       @updatedAt
   deletedAt DateTime?
-  jewelry   Jewelry        @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  rates     CurrencyRate[]
-  quotes    MetalQuote[]
+  jewelry        Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  rates          CurrencyRate[]
+  quotes         MetalQuote[]
+  entityDefaults CommercialEntity[] @relation("EntityCurrency")
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -447,6 +478,7 @@ model MetalVariant {
   metal         Metal                      @relation(fields: [metalId], references: [id], onDelete: Cascade)
   valueHistory  MetalVariantValueHistory[]
   stocks        WarehouseStock[]
+  compositions  ArticleMetalComposition[]
 
   @@unique([metalId, sku])
   @@index([metalId])
@@ -545,6 +577,7 @@ model ArticleCategory {
   name               String
   description        String    @default("")
   imageUrl           String    @default("")
+  mermaPercent       Decimal?  @db.Decimal(5, 2)  // merma % heredada por los artículos de esta categoría
   sortOrder          Int       @default(0)
   isActive           Boolean   @default(true)
   deletedAt          DateTime?
@@ -557,6 +590,7 @@ model ArticleCategory {
   priceLists       PriceList[]                @relation("CategoryPriceLists")
   defaultPriceList PriceList?                 @relation("DefaultPriceList", fields: [defaultPriceListId], references: [id], onDelete: SetNull)
   attributes       ArticleCategoryAttribute[]
+  articles         Article[]
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
@@ -583,8 +617,9 @@ model ArticleCategoryAttribute {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
-  category   ArticleCategory     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
-  definition ArticleAttributeDef @relation(fields: [definitionId], references: [id], onDelete: Restrict)
+  category        ArticleCategory       @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  definition      ArticleAttributeDef   @relation(fields: [definitionId], references: [id], onDelete: Restrict)
+  articleValues   ArticleAttributeValue[]
 
   @@index([jewelryId])
   @@index([categoryId])
@@ -654,11 +689,13 @@ model Tax {
   validFrom       DateTime?
   validTo         DateTime?
   isActive        Boolean            @default(true)
-  sortOrder       Int                @default(0)
-  notes           String             @default("")
-  deletedAt       DateTime?
-  createdAt       DateTime           @default(now())
-  updatedAt       DateTime           @updatedAt
+  allowDocumentOverride Boolean            @default(false) // si true, el comprobante puede excepcionarlo con auditoría
+  isFavorite            Boolean            @default(false)
+  sortOrder             Int                @default(0)
+  notes                 String             @default("")
+  deletedAt             DateTime?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
 
   jewelry Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
 
@@ -676,6 +713,7 @@ model PaymentMethod {
   name            String
   code            String                 @default("")
   type            PaymentMethodType      @default(OTHER)
+  customTypeLabel String                 @default("")
   adjustmentType  PaymentAdjustmentType  @default(NONE)
   adjustmentValue Decimal?               @db.Decimal(10, 4)
   isFavorite      Boolean                @default(false)
@@ -716,27 +754,37 @@ model PaymentInstallmentPlan {
 /// ///////////////////////////
 /// ///////////////////////////
 model ShippingCarrier {
-  id                     String         @id @default(cuid())
+  id                     String              @id @default(cuid())
   jewelryId              String
   name                   String
-  code                   String         @default("")
-  logoUrl                String         @default("")
-  trackingUrl            String         @default("")
-  freeShippingThreshold  Decimal?       @db.Decimal(18, 2)
-  isFavorite             Boolean        @default(false)
-  isActive               Boolean        @default(true)
-  sortOrder              Int            @default(0)
-  notes                  String         @default("")
+  code                   String              @default("")
+  logoUrl                String              @default("")
+  trackingUrl            String              @default("")
+  freeShippingThreshold  Decimal?            @db.Decimal(18, 2)
+  type                   ShippingCarrierType @default(DELIVERY)
+  warehouseId            String?
+  provider               String?
+  providerConfig         Json?
+  city                   String              @default("")
+  province               String              @default("")
+  country                String              @default("")
+  isFavorite             Boolean             @default(false)
+  isActive               Boolean             @default(true)
+  sortOrder              Int                 @default(0)
+  notes                  String              @default("")
   deletedAt              DateTime?
-  createdAt              DateTime       @default(now())
-  updatedAt              DateTime       @updatedAt
+  createdAt              DateTime            @default(now())
+  updatedAt              DateTime            @updatedAt
 
-  jewelry Jewelry        @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  rates   ShippingRate[]
+  jewelry   Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  warehouse Warehouse?       @relation("WarehousePickups", fields: [warehouseId], references: [id], onDelete: SetNull)
+  rates     ShippingRate[]
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
   @@index([jewelryId, isFavorite])
+  @@index([jewelryId, type])
+  @@index([warehouseId])
   @@index([jewelryId, deletedAt])
   @@index([deletedAt])
 }
@@ -746,7 +794,9 @@ model ShippingRate {
   carrierId       String
   jewelryId       String
   name            String
-  zone            String              @default("")
+  zones           Json                @default("[]")
+  province        String              @default("")
+  countries       Json                @default("[]")
   calculationMode ShippingCalcMode    @default(FIXED)
   fixedPrice      Decimal?            @db.Decimal(18, 2)
   pricePerKg      Decimal?            @db.Decimal(18, 4)
@@ -778,7 +828,7 @@ model Seller {
   commissionType   CommissionType  @default(NONE)
   commissionValue  Decimal?        @db.Decimal(10, 4)
   commissionBase   CommissionBase  @default(NET)
-  userId           String?
+  userId           String?         @unique
   isFavorite       Boolean        @default(false)
   isActive         Boolean        @default(true)
   sortOrder        Int            @default(0)
@@ -790,11 +840,15 @@ model Seller {
   province         String         @default("")
   country          String         @default("")
   postalCode       String         @default("")
+  contactName      String         @default("")
+  contactPhone     String         @default("")
+  contactEmail     String         @default("")
   deletedAt        DateTime?
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 
   jewelry     Jewelry            @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  user        User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
   warehouses  SellerWarehouse[]
   attachments SellerAttachment[]
 
@@ -883,16 +937,19 @@ model PriceList {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
-  jewelry          Jewelry           @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  category         ArticleCategory?  @relation("CategoryPriceLists", fields: [categoryId], references: [id], onDelete: SetNull)
-  categoriesDefault ArticleCategory[] @relation("DefaultPriceList")
+  jewelry           Jewelry            @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  category          ArticleCategory?   @relation("CategoryPriceLists", fields: [categoryId], references: [id], onDelete: SetNull)
+  categoriesDefault ArticleCategory[]  @relation("DefaultPriceList")
+  entityDefaults    CommercialEntity[] @relation("EntityPriceList")
 
-  @@index([jewelryId])
-  @@index([jewelryId, isActive])
-  @@index([jewelryId, isFavorite])
+  @@unique([jewelryId, code])
+  @@index([jewelryId, deletedAt])
+  @@index([jewelryId, deletedAt, isActive])
+  @@index([jewelryId, deletedAt, isFavorite])
   @@index([jewelryId, scope])
   @@index([categoryId])
-  @@index([jewelryId, deletedAt])
+  @@index([channelId])
+  @@index([clientId])
   @@index([deletedAt])
 }
 
@@ -1011,6 +1068,11 @@ enum ShippingCalcMode {
   BY_ZONE
 }
 
+enum ShippingCarrierType {
+  DELIVERY
+  PICKUP
+}
+
 enum PriceListScope {
   GENERAL
   CHANNEL
@@ -1043,4 +1105,459 @@ enum RoundingDirection {
   NEAREST
   UP
   DOWN
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+enum EntityType {
+  PERSON
+  COMPANY
+}
+
+enum BalanceType {
+  UNIFIED
+  BREAKDOWN
+}
+
+enum EntitySourceType {
+  MANUAL
+  IMPORT_CSV
+  MIGRATION
+  API
+}
+
+enum EntityRole {
+  CLIENT
+  SUPPLIER
+}
+
+enum AddressType {
+  BILLING
+  SHIPPING
+  FISCAL
+  COMMERCIAL
+  OTHER
+}
+
+enum BalanceEntryType {
+  INVOICE
+  PAYMENT
+  CREDIT_NOTE
+  DEBIT_NOTE
+  ADJUSTMENT
+}
+
+enum CommercialRuleScope {
+  GLOBAL
+  METAL
+  VARIANT
+  CATEGORY
+}
+
+enum CommercialRuleType {
+  DISCOUNT
+  BONUS
+  SURCHARGE
+}
+
+enum CommercialValueType {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum CommercialApplyOn {
+  TOTAL
+  METAL
+  HECHURA
+  METAL_Y_HECHURA
+}
+
+enum TaxOverrideMode {
+  INHERIT
+  EXEMPT
+  CUSTOM_RATE
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+/// NOTA ARQUITECTURAL: Los comprobantes futuros (facturas, remitos, etc.)
+/// guardarán un snapshot propio de la entidad, lista de precios, moneda,
+/// condiciones y reglas aplicadas en el momento de su creación.
+/// Nunca deben recalcularse leyendo la ficha actual de la entidad.
+/// ///////////////////////////
+model CommercialEntity {
+  id                  String           @id @default(cuid())
+  jewelryId           String
+  code                String           // CE-0001 — generado una sola vez al crear, nunca cambia
+  displayName         String           // calculado en backend: COMPANY=tradeName||companyName, PERSON="Apellido, Nombre"
+
+  entityType          EntityType       @default(PERSON)
+
+  // Roles — al menos uno debe ser true (validado en service)
+  isClient            Boolean          @default(false)
+  isSupplier          Boolean          @default(false)
+
+  // Datos persona física
+  firstName           String           @default("")
+  lastName            String           @default("")
+
+  // Datos empresa
+  companyName         String           @default("") // Razón social
+  tradeName           String           @default("") // Nombre de fantasía
+
+  // Contacto primario (acceso rápido en listados)
+  email               String           @default("")
+  phone               String           @default("")
+
+  // Fiscal
+  documentType        String           @default("")
+  documentNumber      String           @default("")
+  ivaCondition        String           @default("")
+
+  // Cuenta corriente
+  balanceType         BalanceType      @default(UNIFIED)
+  creditLimitClient   Decimal?         @db.Decimal(14, 2)
+  creditLimitSupplier Decimal?         @db.Decimal(14, 2)
+
+  // Defaults comerciales
+  priceListId         String?          // lista de precios habitual (FK a PriceList)
+  currencyId          String?          // moneda habitual de facturación (FK a Currency)
+
+  // Estado y trazabilidad
+  isActive            Boolean          @default(true)
+  deletedAt           DateTime?
+  sourceType          EntitySourceType @default(MANUAL)
+  mergedIntoEntityId  String?          // si fue fusionada, referencia al destino (nunca se borra la origen)
+  notes               String           @default("")
+  avatarUrl           String           @default("")
+
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  jewelry         Jewelry              @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  priceList       PriceList?           @relation("EntityPriceList", fields: [priceListId], references: [id], onDelete: SetNull)
+  currency        Currency?            @relation("EntityCurrency", fields: [currencyId], references: [id], onDelete: SetNull)
+  addresses       EntityAddress[]
+  contacts        EntityContact[]
+  commercialRules EntityCommercialRule[]
+  taxOverrides    EntityTaxOverride[]
+  balanceEntries  EntityBalanceEntry[]
+  attachments     EntityAttachment[]
+
+  @@unique([jewelryId, code])
+  @@index([jewelryId])
+  @@index([jewelryId, isActive])
+  @@index([jewelryId, isClient, isActive])
+  @@index([jewelryId, isSupplier, isActive])
+  @@index([jewelryId, displayName])
+  @@index([jewelryId, documentNumber])
+  @@index([priceListId])
+  @@index([currencyId])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model EntityAddress {
+  id           String      @id @default(cuid())
+  entityId     String
+  jewelryId    String
+  type         AddressType @default(OTHER)
+  label        String      @default("")    // "Depósito central", "Casa matriz", etc.
+  street       String      @default("")
+  streetNumber String      @default("")
+  floor        String      @default("")
+  apartment    String      @default("")
+  city         String      @default("")
+  province     String      @default("")
+  country      String      @default("Argentina")
+  postalCode   String      @default("")
+  isDefault    Boolean     @default(false) // default para su tipo AddressType
+  deletedAt    DateTime?
+  createdAt    DateTime    @default(now())
+
+  entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@index([entityId])
+  @@index([jewelryId])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model EntityContact {
+  id                          String   @id @default(cuid())
+  entityId                    String
+  jewelryId                   String
+  firstName                   String   @default("")
+  lastName                    String   @default("")
+  position                    String   @default("") // cargo / puesto en la empresa
+  email                       String   @default("")
+  phone                       String   @default("")
+  whatsapp                    String   @default("")
+  isPrimary                   Boolean  @default(false)
+  receivesDocuments           Boolean  @default(false)
+  receivesPaymentsOrCollections Boolean @default(false)
+  portalAccess                Boolean  @default(false) // reservado para portal futuro
+  notes                       String   @default("")
+  deletedAt                   DateTime?
+  createdAt                   DateTime @default(now())
+
+  entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@index([entityId])
+  @@index([jewelryId])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model EntityCommercialRule {
+  id          String              @id @default(cuid())
+  entityId    String
+  jewelryId   String
+  scope       CommercialRuleScope @default(GLOBAL)
+  metalId     String?
+  variantId   String?
+  categoryId  String?
+  ruleType    CommercialRuleType  @default(DISCOUNT)
+  valueType   CommercialValueType @default(PERCENTAGE)
+  value       Decimal             @db.Decimal(10, 4)
+  applyOn     CommercialApplyOn   @default(TOTAL)
+  minQuantity Decimal?            @db.Decimal(10, 4)
+  validFrom   DateTime?
+  validTo     DateTime?
+  notes       String              @default("")
+  isActive    Boolean             @default(true)
+  sortOrder   Int                 @default(0)
+  deletedAt   DateTime?
+  createdAt   DateTime            @default(now())
+
+  entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@index([entityId])
+  @@index([jewelryId])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model EntityTaxOverride {
+  id           String          @id @default(cuid())
+  entityId     String
+  jewelryId    String
+  taxId        String
+  overrideMode TaxOverrideMode @default(INHERIT)
+  customRate   Decimal?        @db.Decimal(10, 4)
+  applyOn      TaxApplyOn?     // si null, hereda el applyOn del Tax base
+  notes        String          @default("")
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+
+  entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@unique([entityId, taxId])
+  @@index([entityId])
+  @@index([jewelryId])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model EntityBalanceEntry {
+  id          String           @id @default(cuid())
+  entityId    String
+  jewelryId   String
+  role        EntityRole       @default(CLIENT)
+  entryType   BalanceEntryType @default(INVOICE)
+  amount      Decimal          @db.Decimal(14, 2)
+  currency    String           @default("ARS")
+  documentRef String           @default("") // referencia al comprobante origen
+  notes       String           @default("")
+  createdAt   DateTime         @default(now())
+  createdBy   String           @default("")
+  voidedAt    DateTime?
+  voidedBy    String?
+  voidReason  String           @default("")
+
+  entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@index([entityId])
+  @@index([jewelryId])
+  @@index([entityId, role])
+}
+
+/// ///////////////////////////
+/// ///////////////////////////
+model EntityAttachment {
+  id         String    @id @default(cuid())
+  entityId   String
+  jewelryId  String
+  filename   String
+  url        String
+  mimeType   String    @default("")
+  size       Int       @default(0)
+  label      String    @default("")
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  uploadedBy String    @default("")
+
+  entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@index([entityId])
+  @@index([jewelryId])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// ARTÍCULOS
+/// ///////////////////////////
+model Article {
+  id               String           @id @default(cuid())
+  jewelryId        String
+  code             String
+  name             String
+  description      String           @default("")
+  categoryId       String?
+  status           ArticleStatus    @default(DRAFT)
+  stockMode        StockMode        @default(NO_STOCK)
+  hechuraPrice     Decimal?         @db.Decimal(14, 4)
+  hechuraPriceMode HechuraPriceMode @default(FIXED)
+  mermaPercent     Decimal?         @db.Decimal(5, 2)
+  mainImageUrl     String           @default("")
+  isFavorite       Boolean          @default(false)
+  isActive         Boolean          @default(true)
+  notes            String           @default("")
+  deletedAt        DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  jewelry         Jewelry                   @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  category        ArticleCategory?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  compositions    ArticleMetalComposition[]
+  variants        ArticleVariant[]
+  attributeValues ArticleAttributeValue[]
+  images          ArticleImage[]
+  stock           ArticleStock[]
+
+  @@unique([jewelryId, code])
+  @@index([jewelryId])
+  @@index([categoryId])
+  @@index([jewelryId, status])
+  @@index([jewelryId, isActive])
+  @@index([deletedAt])
+}
+
+model ArticleMetalComposition {
+  id          String      @id @default(cuid())
+  articleId   String
+  jewelryId   String
+  variantId   String
+  grams       Decimal     @db.Decimal(10, 4)
+  isBase      Boolean     @default(false)
+  sortOrder   Int         @default(0)
+  createdAt   DateTime    @default(now())
+
+  article      Article      @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  metalVariant MetalVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@unique([articleId, variantId])
+  @@index([articleId])
+  @@index([jewelryId])
+}
+
+model ArticleVariant {
+  id                   String    @id @default(cuid())
+  articleId            String
+  jewelryId            String
+  code                 String
+  name                 String
+  weightOverride       Decimal?  @db.Decimal(10, 4)
+  hechuraPriceOverride Decimal?  @db.Decimal(14, 4)
+  priceOverride        Decimal?  @db.Decimal(14, 4)
+  imageUrl             String    @default("")
+  isActive             Boolean   @default(true)
+  sortOrder            Int       @default(0)
+  deletedAt            DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  article Article        @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  stock   ArticleStock[]
+
+  @@unique([articleId, code])
+  @@index([articleId])
+  @@index([jewelryId])
+}
+
+model ArticleAttributeValue {
+  id           String   @id @default(cuid())
+  articleId    String
+  jewelryId    String
+  assignmentId String
+  value        String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  article    Article                  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  assignment ArticleCategoryAttribute @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+
+  @@unique([articleId, assignmentId])
+  @@index([articleId])
+  @@index([assignmentId])
+}
+
+model ArticleImage {
+  id        String   @id @default(cuid())
+  articleId String
+  jewelryId String
+  url       String
+  label     String   @default("")
+  isMain    Boolean  @default(false)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@index([jewelryId])
+}
+
+model ArticleStock {
+  id          String    @id @default(cuid())
+  articleId   String
+  variantId   String?
+  warehouseId String
+  jewelryId   String
+  quantity    Decimal   @default(0) @db.Decimal(14, 4)
+  updatedAt   DateTime  @updatedAt
+
+  article   Article         @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  variant   ArticleVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  warehouse Warehouse       @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([jewelryId, warehouseId, articleId, variantId])
+  @@index([articleId])
+  @@index([jewelryId])
+  @@index([warehouseId])
+}
+
+/// ///////////////////////////
+/// ENUMS — ARTÍCULOS
+/// ///////////////////////////
+enum ArticleStatus {
+  DRAFT
+  ACTIVE
+  DISCONTINUED
+  ARCHIVED
+}
+
+enum StockMode {
+  NO_STOCK
+  BY_ARTICLE
+  BY_MATERIAL
+}
+
+enum HechuraPriceMode {
+  FIXED
+  PER_GRAM
 }

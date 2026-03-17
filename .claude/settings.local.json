@@ -13,7 +13,12 @@
       "Bash(cmd:*)",
       "Bash(npm install:*)",
       "Bash(xargs grep:*)",
-      "Bash(do echo:*)"
+      "Bash(do echo:*)",
+      "Bash(find \"C:/Users/leotu/OneDrive/Escritorio/TPTech/tptech-frontend/src/pages\" -name \"*.tsx\" 2>/dev/null | head -50)",
+      "Bash(find \"C:/Users/leotu/OneDrive/Escritorio/TPTech/tptech-frontend/src/components/users/edit\" -type f -name \"*.tsx\" -o -name \"*.ts\" 2>/dev/null | head -20)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(cd:*)"
     ]
   }
 }

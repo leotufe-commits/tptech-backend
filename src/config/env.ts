@@ -19,6 +19,21 @@ const EnvSchema = z.object({
   // =========================
   // Mail
   // =========================
+  MAIL_MODE: z.enum(["preview", "console", "production"]).optional().default("preview"),
+  MAIL_FROM: z.string().optional().default("no-reply@tptech.local"),
+  MAIL_APP_NAME: z.string().optional().default("TPTech"),
+
+  // Postmark — ambos nombres aceptados (SERVER_TOKEN es el correcto en código)
+  POSTMARK_SERVER_TOKEN: z.string().optional(),
+  POSTMARK_API_TOKEN: z.string().optional(), // alias por compatibilidad
+
+  // Dev link en respuesta de invitación — false por defecto, solo activar en local
+  MAIL_EXPOSE_DEV_LINK: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((v) => v === "true"),
+
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.coerce.number().optional(),
   SMTP_USER: z.string().optional(),
@@ -27,7 +42,7 @@ const EnvSchema = z.object({
   // =========================
   // App
   // =========================
-  APP_URL: z.string().optional(),
+  APP_URL: z.string().url("APP_URL debe ser una URL válida (ej: https://tptech.onrender.com)").optional().default("http://localhost:5173"),
 
   // =========================
   // R2 (Cloudflare Storage)
@@ -43,12 +58,33 @@ const EnvSchema = z.object({
 export type Env = z.infer<typeof EnvSchema>;
 
 export function getEnv(): Env {
+  // ✅ Normalizar alias Postmark ANTES del parse, para que Zod lo vea como POSTMARK_SERVER_TOKEN
+  if (!process.env.POSTMARK_SERVER_TOKEN && process.env.POSTMARK_API_TOKEN) {
+    process.env.POSTMARK_SERVER_TOKEN = process.env.POSTMARK_API_TOKEN;
+  }
+
   const parsed = EnvSchema.safeParse(process.env);
 
   if (!parsed.success) {
     console.error("❌ Error en variables de entorno:");
     console.error(parsed.error.flatten().fieldErrors);
     throw new Error("Variables de entorno inválidas. Revisá el .env / Render env vars.");
+  }
+
+  // ✅ Validación cruzada: MAIL_MODE=production requiere configuración real
+  if (parsed.data.MAIL_MODE === "production") {
+    if (!parsed.data.POSTMARK_SERVER_TOKEN) {
+      throw new Error(
+        "❌ MAIL_MODE=production requiere configurar POSTMARK_SERVER_TOKEN (o POSTMARK_API_TOKEN como alias)."
+      );
+    }
+
+    const fromDomain = parsed.data.MAIL_FROM.split("@")[1] ?? "";
+    if (!fromDomain || fromDomain.endsWith(".local") || parsed.data.MAIL_FROM === "no-reply@tptech.local") {
+      throw new Error(
+        `❌ MAIL_MODE=production: MAIL_FROM "${parsed.data.MAIL_FROM}" no es válido para producción. Configurá un dominio real (ej: no-reply@tujoyeria.com).`
+      );
+    }
   }
 
   return parsed.data;

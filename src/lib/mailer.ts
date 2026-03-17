@@ -10,6 +10,46 @@ const DEFAULT_FROM =
 const APP_NAME = process.env.MAIL_APP_NAME || "TPTech";
 
 /* =========================
+   TENANT MAIL CONTEXT
+   Contexto de branding por joyería.
+   Se pasa a sendResetEmail / sendInviteEmail cuando el backend
+   tiene acceso al registro Jewelry del tenant.
+
+   Rutas de expansión futura:
+   - logoUrl         → header con logo de la joyería
+   - signature       → firma al pie del cuerpo
+   - footer          → párrafo de pie del correo
+   - contact/phone   → datos de contacto en el footer
+   - replyTo         → pasa directo como Reply-To header
+========================= */
+export type TenantMailContext = {
+  senderName?:     string; // "Joyería Pérez" — nombre visible del remitente
+  replyTo?:        string; // ventas@joyeriaperez.com
+  logoUrl?:        string; // URL del logo para el header
+  signature?:      string; // Firma al pie del cuerpo del email
+  footer?:         string; // Párrafo de pie del correo
+  contact?:        string; // email de contacto visible
+  phone?:          string;
+  whatsapp?:       string;
+  addressLine?:    string;
+  businessHours?:  string;
+  website?:        string;
+  instagram?:      string;
+};
+
+/**
+ * Construye el encabezado "From" para un tenant.
+ * Ejemplo: "Joyería Pérez <no-reply@tptech.com>"
+ *
+ * El FROM real siempre es el de TPTech (envío desde infraestructura propia).
+ * Solo el nombre visible cambia según la joyería.
+ */
+export function buildSenderFrom(tenantSenderName?: string): string {
+  const name = String(tenantSenderName || "").trim() || APP_NAME;
+  return `${name} <${DEFAULT_FROM}>`;
+}
+
+/* =========================
    HELPERS
 ========================= */
 
@@ -178,10 +218,11 @@ function buildText(opts: TemplateOpts): string {
    ENVÍO GENÉRICO
 ========================= */
 
-async function sendTemplatedEmail(to: string, opts: TemplateOpts) {
+async function sendTemplatedEmail(to: string, opts: TemplateOpts, tenant?: TenantMailContext) {
   await sendMail({
     to,
-    from: DEFAULT_FROM,
+    from: buildSenderFrom(tenant?.senderName),
+    replyTo: tenant?.replyTo || undefined,
     subject: opts.subject,
     html: buildHtml(opts),
     text: buildText(opts),
@@ -193,7 +234,7 @@ async function sendTemplatedEmail(to: string, opts: TemplateOpts) {
 ========================= */
 
 /** Recuperación de contraseña (link de un solo uso, 30 minutos) */
-export async function sendResetEmail(to: string, resetLink: string) {
+export async function sendResetEmail(to: string, resetLink: string, tenant?: TenantMailContext) {
   return sendTemplatedEmail(to, {
     subject: `${APP_NAME} · Recuperar contraseña`,
     heading: "Recuperar contraseña",
@@ -202,18 +243,19 @@ export async function sendResetEmail(to: string, resetLink: string) {
     ctaUrl: resetLink,
     expiry: "30 minutos",
     showIgnoreNote: true,
-  });
+  }, tenant);
 }
 
 /** Invitación de acceso al sistema (link de un solo uso, 7 días) */
-export async function sendInviteEmail(to: string, inviteLink: string) {
+export async function sendInviteEmail(to: string, inviteLink: string, jewelryName?: string, tenant?: TenantMailContext) {
+  const storeName = jewelryName ? escapeHtml(jewelryName) : APP_NAME;
   return sendTemplatedEmail(to, {
-    subject: `${APP_NAME} · Te invitaron a ingresar`,
-    heading: "Bienvenido a " + APP_NAME,
-    intro: "Un administrador te invitó a acceder al sistema. Hacé click en el botón para crear tu contraseña y activar tu cuenta.",
-    ctaText: "Aceptar invitación",
+    subject: `Te invitaron a unirte a ${storeName} en ${APP_NAME}`,
+    heading: `Bienvenido/a a ${storeName}`,
+    intro: `Fuiste invitado/a a acceder a ${APP_NAME} como parte del equipo de ${storeName}. Hacé click en el botón para crear tu contraseña y activar tu cuenta.`,
+    ctaText: "Activar mi cuenta",
     ctaUrl: inviteLink,
     expiry: "7 días",
     showIgnoreNote: false,
-  });
+  }, tenant);
 }

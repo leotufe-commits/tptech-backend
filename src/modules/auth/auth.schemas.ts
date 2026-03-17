@@ -80,6 +80,11 @@ export const resetSchema = z.object({
   newPassword: password,
 });
 
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, "Contraseña actual requerida."),
+  newPassword: password,
+});
+
 /* =========================
    UPDATE EMPRESA / JOYERÍA
 ========================= */

@@ -122,6 +122,22 @@ export async function updateMyJewelry(req: Request, res: Response) {
       province: data.province ?? undefined,
       postalCode: data.postalCode ?? undefined,
       country: data.country ?? undefined,
+
+      // ── Email branding ──────────────────────────────────────────────────
+      emailEnabled:          typeof data.emailEnabled === "boolean" ? data.emailEnabled : undefined,
+      emailSenderName:       data.emailSenderName   ?? undefined,
+      emailLogoUrl:          data.emailLogoUrl       ?? undefined,
+      emailSignature:        data.emailSignature     ?? undefined,
+      emailReplyTo:          data.emailReplyTo       ?? undefined,
+      emailContact:          data.emailContact       ?? undefined,
+      emailPhone:            data.emailPhone         ?? undefined,
+      emailWhatsapp:         data.emailWhatsapp      ?? undefined,
+      emailAddressLine:      data.emailAddressLine   ?? undefined,
+      emailBusinessHours:    data.emailBusinessHours ?? undefined,
+      emailWebsite:          data.emailWebsite       ?? undefined,
+      emailInstagram:        data.emailInstagram     ?? undefined,
+      emailFooter:           data.emailFooter        ?? undefined,
+      // ────────────────────────────────────────────────────────────────────
     },
   });
 

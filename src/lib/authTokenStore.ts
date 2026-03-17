@@ -11,11 +11,11 @@ function getReqIp(req: Request) {
   return xf || (req.socket?.remoteAddress ? String(req.socket.remoteAddress) : undefined);
 }
 
-async function cleanupResetAuthTokens() {
+async function cleanupExpiredAuthTokens() {
   try {
     await prisma.authToken.deleteMany({
       where: {
-        type: "reset",
+        type: { in: ["reset", "invite"] },
         OR: [{ expiresAt: { lt: new Date() } }, { usedAt: { not: null } }],
       },
     });
@@ -29,7 +29,7 @@ async function cleanupResetAuthTokens() {
 ========================= */
 
 export async function createAuthTokenRecord(args: {
-  type: "reset";
+  type: "reset" | "invite";
   userId: string;
   jti: string;
   expiresAt: Date;
@@ -39,7 +39,20 @@ export async function createAuthTokenRecord(args: {
   const { type, userId, jti, expiresAt, emailSnapshot, req } = args;
 
   // higiene best-effort (no rompe si falla)
-  await cleanupResetAuthTokens();
+  await cleanupExpiredAuthTokens();
+
+  // Invalidar tokens activos previos del mismo usuario y tipo.
+  // Usamos usedAt en lugar de delete para preservar el registro de auditoría.
+  // Esto evita que tokens anteriores interceptados sigan siendo utilizables.
+  await prisma.authToken.updateMany({
+    where: {
+      userId: args.userId,
+      type: args.type,
+      usedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    data: { usedAt: new Date() },
+  });
 
   return prisma.authToken.create({
     data: {
@@ -61,7 +74,7 @@ export async function createAuthTokenRecord(args: {
    - marca usedAt atómicamente
 ========================= */
 
-export async function consumeResetAuthToken(args: { userId: string; jti: string }) {
+export async function consumeAuthToken(args: { userId: string; jti: string }) {
   const { userId, jti } = args;
   const now = new Date();
 
@@ -72,7 +85,7 @@ export async function consumeResetAuthToken(args: { userId: string; jti: string 
   });
 
   if (!row) return { ok: false as const, reason: "not_found" as const };
-  if (row.type !== "reset") return { ok: false as const, reason: "wrong_type" as const };
+  if (!["reset", "invite"].includes(row.type)) return { ok: false as const, reason: "wrong_type" as const };
   if (row.userId !== userId) return { ok: false as const, reason: "user_mismatch" as const };
   if (row.usedAt) return { ok: false as const, reason: "already_used" as const };
   if (row.expiresAt.getTime() < now.getTime()) return { ok: false as const, reason: "expired" as const };

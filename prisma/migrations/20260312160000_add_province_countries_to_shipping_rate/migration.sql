@@ -1,0 +1,2 @@
+ALTER TABLE "ShippingRate" ADD COLUMN "province" TEXT NOT NULL DEFAULT '';
+ALTER TABLE "ShippingRate" ADD COLUMN "countries" JSONB NOT NULL DEFAULT '[]';

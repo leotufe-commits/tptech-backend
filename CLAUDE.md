@@ -21,7 +21,7 @@ La app es usada desde celulares con conexión limitada. Las respuestas de la API
 
 - **Hosting**: [Render](https://render.com) — backend como Web Service, frontend como Static Site
 - **Repositorios**: GitHub (`leotufe-commits/tptech-backend` y `leotufe-commits/tptech-frontend`)
-- **Email en producción**: [Postmark](https://postmarkapp.com) — configurar `MAIL_MODE=production` y `POSTMARK_API_TOKEN` en las env vars de Render
+- **Email en producción**: [Postmark](https://postmarkapp.com) — configurar `MAIL_MODE=production` y `POSTMARK_SERVER_TOKEN` en las env vars de Render
 - **Almacenamiento de archivos**: Cloudflare R2 en producción (configurar las vars `R2_*` en Render)
 
 ## Commands
@@ -59,7 +59,7 @@ APP_URL=http://localhost:5173  # used to build reset/invite links in emails
 MAIL_MODE=preview         # preview | console | production
 MAIL_FROM=no-reply@tptech.local
 MAIL_APP_NAME=TPTech      # name shown in email templates
-POSTMARK_API_TOKEN=       # required when MAIL_MODE=production
+POSTMARK_SERVER_TOKEN=    # required when MAIL_MODE=production (también acepta POSTMARK_API_TOKEN como alias)
 
 # R2 storage (Cloudflare) — optional, falls back to local /uploads/
 R2_ENDPOINT=

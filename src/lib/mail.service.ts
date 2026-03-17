@@ -11,6 +11,7 @@ export type SendMailOptions = {
   html: string;
   text?: string;
   from?: string;
+  replyTo?: string; // Reply-To header — toma valor de TenantMailContext.replyTo
 };
 
 const MAIL_MODE = String(process.env.MAIL_MODE || "preview").toLowerCase(); // preview | console | production
@@ -21,11 +22,11 @@ const previewStore = new Map<
 >();
 
 export async function sendMail(options: SendMailOptions) {
-  const { to, subject, html, text, from } = options;
+  const { to, subject, html, text, from, replyTo } = options;
 
   if (MAIL_MODE === "preview") {
     const id = crypto.randomUUID();
-    previewStore.set(id, { subject, html, text, to, from, createdAt: Date.now() });
+    previewStore.set(id, { subject, html, text, to, from: replyTo ? `${from} (Reply-To: ${replyTo})` : from, createdAt: Date.now() });
 
     console.log("📧 [MAIL PREVIEW] Subject:", subject);
     console.log("👉 Preview URL:", `/dev/mail/${id}`);
@@ -40,10 +41,10 @@ export async function sendMail(options: SendMailOptions) {
   }
 
   if (MAIL_MODE === "production") {
-    // ✅ Postmark real (cuando tengas token)
     await postmarkSendMail({
       to,
       from: from || process.env.MAIL_FROM || "no-reply@tptech.local",
+      replyTo,  // TODO: postmark provider debe leer este campo y pasarlo como ReplyTo
       subject,
       html,
       text,

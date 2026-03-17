@@ -10,6 +10,7 @@ import fs from "node:fs/promises";
 import { signResetToken, buildResetLink, buildInviteLink } from "../../lib/authTokens.js";
 import { sendResetEmail, sendInviteEmail } from "../../lib/mailer.js";
 import { createAuthTokenRecord } from "../../lib/authTokenStore.js";
+import { env } from "../../config/env.js";
 
 import { prisma } from "../../lib/prisma.js";
 import { auditLog } from "../../lib/auditLogger.js";
@@ -91,6 +92,8 @@ export async function listUsers(req: Request, res: Response) {
     where.OR = [
       { email: { contains: q, mode: "insensitive" } },
       { name: { contains: q, mode: "insensitive" } },
+      { firstName: { contains: q, mode: "insensitive" } },
+      { lastName: { contains: q, mode: "insensitive" } },
     ];
   }
 
@@ -101,6 +104,8 @@ export async function listUsers(req: Request, res: Response) {
       select: {
         id: true,
         email: true,
+        firstName: true,
+        lastName: true,
         name: true,
         status: true,
         avatarUrl: true,
@@ -110,6 +115,17 @@ export async function listUsers(req: Request, res: Response) {
 
         quickPinHash: true,
         quickPinEnabled: true,
+
+        documentType: true,
+        documentNumber: true,
+        phoneCountry: true,
+        phoneNumber: true,
+        street: true,
+        number: true,
+        city: true,
+        province: true,
+        postalCode: true,
+        country: true,
 
         roles: {
           select: {
@@ -139,6 +155,8 @@ export async function listUsers(req: Request, res: Response) {
     users: users.map((u) => ({
       id: u.id,
       email: u.email,
+      firstName: u.firstName,
+      lastName: u.lastName,
       name: u.name,
       status: u.status,
       avatarUrl: u.avatarUrl,
@@ -148,6 +166,17 @@ export async function listUsers(req: Request, res: Response) {
 
       hasQuickPin: Boolean(u.quickPinHash),
       pinEnabled: Boolean(u.quickPinHash) && Boolean(u.quickPinEnabled),
+
+      documentType: u.documentType,
+      documentNumber: u.documentNumber,
+      phoneCountry: u.phoneCountry,
+      phoneNumber: u.phoneNumber,
+      street: u.street,
+      number: u.number,
+      city: u.city,
+      province: u.province,
+      postalCode: u.postalCode,
+      country: u.country,
 
       roles: mapRolesForTenant(tenantId, u.roles as any),
 
@@ -173,6 +202,8 @@ export async function getUser(req: Request, res: Response) {
     select: {
       id: true,
       email: true,
+      firstName: true,
+      lastName: true,
       name: true,
       status: true,
       tokenVersion: true,
@@ -249,6 +280,8 @@ export async function createUser(req: Request, res: Response) {
 
   const body = req.body as {
     email: string;
+    firstName?: string;
+    lastName?: string;
     name?: string | null;
     password?: string;
     roleIds?: string[];
@@ -256,7 +289,11 @@ export async function createUser(req: Request, res: Response) {
   };
 
   const email = normalizeEmail(body.email);
-  const name = normalizeName(body.name);
+  const firstName = normStr(body.firstName);
+  const lastName = normStr(body.lastName);
+  const name = firstName || lastName
+    ? [firstName, lastName].filter(Boolean).join(" ")
+    : normalizeName(body.name);
 
   if (!email) return res.status(400).json({ message: "Email inválido." });
 
@@ -277,13 +314,13 @@ export async function createUser(req: Request, res: Response) {
       ? UserStatus.ACTIVE
       : UserStatus.PENDING;
 
+  // Solo chequeamos usuarios vivos. Los eliminados tienen email obfuscado (deleted__...@deleted.local).
   const existing = await prisma.user.findFirst({
-    where: { jewelryId: tenantId, email },
-    select: { id: true, deletedAt: true },
+    where: { jewelryId: tenantId, email, deletedAt: null },
+    select: { id: true },
   });
 
-  // ✅ Si existe "vivo" => conflicto
-  if (existing && existing.deletedAt == null) {
+  if (existing) {
     auditLog(req, {
       action: "users.create",
       success: false,
@@ -292,18 +329,6 @@ export async function createUser(req: Request, res: Response) {
       meta: { email, reason: "email_already_exists" },
     });
     return res.status(409).json({ message: "El email ya está registrado." });
-  }
-
-  // ✅ Si existe "borrado", lo más seguro es pedir restaurar (evita choques del unique si quedó viejo)
-  if (existing && existing.deletedAt != null) {
-    auditLog(req, {
-      action: "users.create",
-      success: false,
-      userId: actorId,
-      tenantId,
-      meta: { email, reason: "email_soft_deleted_exists" },
-    });
-    return res.status(409).json({ message: "Ese email pertenece a un usuario eliminado. Restauralo en vez de crearlo de nuevo." });
   }
 
   if (roleIds.length) {
@@ -321,10 +346,14 @@ export async function createUser(req: Request, res: Response) {
     ? await bcrypt.hash(String(body.password), 10)
     : await randomPasswordHash();
 
-  const created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+  let created: any;
+  try {
+    created = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const user = await tx.user.create({
       data: {
         email,
+        firstName,
+        lastName,
         name,
         status,
         jewelryId: tenantId,
@@ -341,6 +370,8 @@ export async function createUser(req: Request, res: Response) {
       select: {
         id: true,
         email: true,
+        firstName: true,
+        lastName: true,
         name: true,
         status: true,
         avatarUrl: true,
@@ -369,6 +400,13 @@ export async function createUser(req: Request, res: Response) {
       roles: mapRolesForTenant(tenantId, roles as any),
     };
   });
+  } catch (e: any) {
+    // P2002 = unique constraint violation (email duplicado a nivel DB)
+    if (e?.code === "P2002") {
+      return res.status(409).json({ message: "El email ya está registrado." });
+    }
+    throw e;
+  }
 
   auditLog(req, {
     action: "users.create",
@@ -393,6 +431,8 @@ export async function updateUserProfile(req: Request, res: Response) {
   if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
 
   const body = req.body as {
+    firstName?: string;
+    lastName?: string;
     name?: string | null;
 
     phoneCountry?: string;
@@ -418,7 +458,27 @@ export async function updateUserProfile(req: Request, res: Response) {
 
   const data: any = {};
 
-  if ("name" in body) data.name = normalizeName(body.name);
+  if ("firstName" in body) data.firstName = normStr(body.firstName);
+  if ("lastName" in body) data.lastName = normStr(body.lastName);
+
+  // Recalcular name cuando cambian firstName o lastName
+  if ("firstName" in body || "lastName" in body) {
+    const fn = "firstName" in body ? normStr(body.firstName) : undefined;
+    const ln = "lastName" in body ? normStr(body.lastName) : undefined;
+    if (fn !== undefined || ln !== undefined) {
+      // Necesitamos los valores actuales para calcular el nombre completo
+      const current = await prisma.user.findFirst({
+        where: { id: targetUserId },
+        select: { firstName: true, lastName: true },
+      });
+      const resolvedFn = fn !== undefined ? fn : (current?.firstName ?? "");
+      const resolvedLn = ln !== undefined ? ln : (current?.lastName ?? "");
+      const computedName = [resolvedFn, resolvedLn].filter(Boolean).join(" ");
+      data.name = computedName || null;
+    }
+  } else if ("name" in body) {
+    data.name = normalizeName(body.name);
+  }
 
   const setOpt = (key: string, value: any) => {
     const v = normOpt(value);
@@ -455,6 +515,8 @@ export async function updateUserProfile(req: Request, res: Response) {
     select: {
       id: true,
       email: true,
+      firstName: true,
+      lastName: true,
       name: true,
       status: true,
       tokenVersion: true,
@@ -514,9 +576,14 @@ export async function updateUserStatus(req: Request, res: Response) {
 
   const target = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
-    select: { id: true },
+    select: { id: true, status: true },
   });
   if (!target) return res.status(404).json({ message: "Usuario no encontrado." });
+
+  // Un usuario PENDING solo puede activarse a través del flujo de invitación
+  if (target.status === UserStatus.PENDING && raw === UserStatus.ACTIVE) {
+    return res.status(400).json({ message: "No se puede activar un usuario pendiente directamente. El usuario debe activar su cuenta mediante la invitación." });
+  }
 
   const updated = await prisma.user.update({
     where: { id: targetUserId },
@@ -1093,7 +1160,7 @@ export async function sendUserInvite(req: Request, res: Response) {
 
   const user = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
-    select: { id: true, email: true, status: true, jewelryId: true },
+    select: { id: true, email: true, status: true, jewelryId: true, jewelry: { select: { name: true } } },
   });
 
   if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
@@ -1117,7 +1184,7 @@ export async function sendUserInvite(req: Request, res: Response) {
 
   try {
     await createAuthTokenRecord({
-      type: "reset",
+      type: "invite",
       userId: user.id,
       jti,
       expiresAt,
@@ -1141,8 +1208,10 @@ export async function sendUserInvite(req: Request, res: Response) {
     return res.status(500).json({ message: "No se pudo generar la invitación." });
   }
 
+  const jewelryName = (user as any).jewelry?.name || "";
+
   try {
-    await sendInviteEmail(user.email, inviteLink);
+    await sendInviteEmail(user.email, inviteLink, jewelryName);
   } catch (e: any) {
     auditLog(req, {
       action: "users.invite_send",
@@ -1162,6 +1231,92 @@ export async function sendUserInvite(req: Request, res: Response) {
     meta: { targetUserId: user.id, email: user.email, status: user.status, jti },
   });
 
-  const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
-  return res.json(isDev ? { ok: true, devLink: inviteLink } : { ok: true });
+  // ✅ devLink solo si desarrollo local explícito: NODE_ENV=development Y MAIL_EXPOSE_DEV_LINK=true.
+  // Nunca se expone en staging/preview/QA aunque MAIL_MODE no sea production.
+  const exposeDevLink = env.NODE_ENV === "development" && env.MAIL_EXPOSE_DEV_LINK === true;
+  return res.json(exposeDevLink ? { ok: true, devLink: inviteLink } : { ok: true });
+}
+
+/* =========================
+   POST /users/:id/send-reset (ADMIN)
+   Envía link de reset de contraseña a un usuario ACTIVE.
+   Solo para ACTIVE (los PENDING usan /invite).
+   Genera token type "reset" con 30 min de expiración.
+========================= */
+export async function sendResetForUser(req: Request, res: Response) {
+  const actorId = (req as any).userId as string;
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const targetUserId = String(req.params.id || "").trim();
+  if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
+
+  const user = await prisma.user.findFirst({
+    where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },
+    select: { id: true, email: true, status: true, jewelryId: true },
+  });
+
+  if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
+
+  if (user.status !== UserStatus.ACTIVE) {
+    auditLog(req, {
+      action: "users.send_reset",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId: user.id, email: user.email, status: user.status, reason: "not_active" },
+    });
+    return res.status(400).json({
+      message: "El reset de contraseña solo está disponible para usuarios Activos. Los usuarios Pendientes usan el flujo de invitación.",
+    });
+  }
+
+  const jti = crypto.randomUUID();
+  const resetToken = signResetToken(user.id, jti, "30m");
+  const resetLink = buildResetLink(resetToken);
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+
+  try {
+    await createAuthTokenRecord({
+      type: "reset",
+      userId: user.id,
+      jti,
+      expiresAt,
+      emailSnapshot: user.email,
+      req,
+    });
+  } catch {
+    auditLog(req, {
+      action: "users.send_reset",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId: user.id, email: user.email, reason: "authtoken_create_failed" },
+    });
+    return res.status(500).json({ message: "No se pudo generar el link de recuperación." });
+  }
+
+  try {
+    await sendResetEmail(user.email, resetLink);
+  } catch (e: any) {
+    auditLog(req, {
+      action: "users.send_reset",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { targetUserId: user.id, email: user.email, jti, reason: "mailer_failed" },
+    });
+    return res.status(500).json({ message: e?.message || "No se pudo enviar el email de recuperación." });
+  }
+
+  auditLog(req, {
+    action: "users.send_reset",
+    success: true,
+    userId: actorId,
+    tenantId,
+    meta: { targetUserId: user.id, email: user.email, jti },
+  });
+
+  const exposeDevLink = env.NODE_ENV === "development" && env.MAIL_EXPOSE_DEV_LINK === true;
+  return res.json(exposeDevLink ? { ok: true, devLink: resetLink } : { ok: true });
 }

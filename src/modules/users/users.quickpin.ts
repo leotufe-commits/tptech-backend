@@ -325,6 +325,123 @@ export async function removeUserQuickPin(req: Request, res: Response) {
   });
 }
 
+/* ============ SELF: RESET CON CONTRASEÑA ============ */
+export async function resetMyQuickPinWithPassword(req: Request, res: Response) {
+  const actorId = (req as any).userId as string;
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const { password } = (req.body ?? {}) as { password?: string };
+
+  if (!password || String(password).trim() === "") {
+    return res.status(400).json({ message: "Ingresá tu contraseña para confirmar." });
+  }
+
+  const me = await prisma.user.findFirst({
+    where: { id: actorId, jewelryId: tenantId, deletedAt: null },
+    select: { id: true, password: true, quickPinHash: true },
+  });
+
+  if (!me) return res.status(404).json({ message: "Usuario no encontrado." });
+
+  // Sin PIN: nada que hacer
+  if (!me.quickPinHash) {
+    return res.json({ ok: true, hasQuickPin: false, pinEnabled: false, quickPinUpdatedAt: null, pinLockDisabled: false });
+  }
+
+  // Validar contraseña ANTES de revelar cualquier estado del sistema
+  const passwordOk = await bcrypt.compare(String(password), me.password);
+  if (!passwordOk) {
+    auditLog(req, {
+      action: "users.quick_pin.reset_with_password",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { reason: "invalid_password" },
+    });
+    return res.status(400).json({ message: "Contraseña incorrecta." });
+  }
+
+  // Verificar si es el último PIN con bloqueo global activo.
+  // En ese caso: deshabilitar el lock automáticamente (igual que el flujo normal de eliminar PIN).
+  const jewelry = await prisma.jewelry.findFirst({
+    where: { id: tenantId },
+    select: { pinLockEnabled: true },
+  });
+
+  const now = new Date();
+
+  if (jewelry?.pinLockEnabled) {
+    const countEnabled = await prisma.user.count({
+      where: {
+        jewelryId: tenantId,
+        deletedAt: null,
+        quickPinHash: { not: null },
+        quickPinEnabled: true,
+      },
+    });
+
+    if (countEnabled <= 1) {
+      // Último PIN con lock activo → deshabilitar lock + borrar PIN en una transacción
+      await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await tx.jewelry.update({
+          where: { id: tenantId },
+          data: { pinLockEnabled: false },
+        });
+        await tx.user.update({
+          where: { id: actorId },
+          data: {
+            quickPinHash: null,
+            quickPinEnabled: false,
+            quickPinUpdatedAt: now,
+            quickPinFailedCount: 0,
+            quickPinLockedUntil: null,
+          },
+        });
+      });
+
+      auditLog(req, {
+        action: "users.quick_pin.reset_with_password",
+        success: true,
+        userId: actorId,
+        tenantId,
+        meta: { hasPin: false, pinLockDisabled: true },
+      });
+
+      return res.json({ ok: true, hasQuickPin: false, pinEnabled: false, quickPinUpdatedAt: now, pinLockDisabled: true });
+    }
+  }
+
+  // Caso normal: simplemente borrar el PIN
+  const updated = await prisma.user.update({
+    where: { id: actorId },
+    data: {
+      quickPinHash: null,
+      quickPinEnabled: false,
+      quickPinUpdatedAt: now,
+      quickPinFailedCount: 0,
+      quickPinLockedUntil: null,
+    },
+    select: { id: true, quickPinHash: true, quickPinEnabled: true, quickPinUpdatedAt: true },
+  });
+
+  auditLog(req, {
+    action: "users.quick_pin.reset_with_password",
+    success: true,
+    userId: actorId,
+    tenantId,
+    meta: { hasPin: false, pinLockDisabled: false },
+  });
+
+  return res.json({
+    ok: true,
+    hasQuickPin: Boolean(updated.quickPinHash),
+    pinEnabled: Boolean(updated.quickPinHash) && Boolean(updated.quickPinEnabled),
+    quickPinUpdatedAt: updated.quickPinUpdatedAt,
+    pinLockDisabled: false,
+  });
+}
+
 export async function updateUserQuickPinEnabled(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
   const tenantId = requireTenantId(req, res);

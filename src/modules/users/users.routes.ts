@@ -34,6 +34,7 @@ router.patch("/me/favorite-warehouse", Core.updateMyFavoriteWarehouse);
 
 router.put("/me/quick-pin", Pin.updateMyQuickPin);
 router.delete("/me/quick-pin", Pin.removeMyQuickPin);
+router.post("/me/quick-pin/reset-with-password", Pin.resetMyQuickPinWithPassword);
 
 // Avatar propio
 router.put("/me/avatar", uploadAvatarMiddleware, uploadMyAvatar);
@@ -66,8 +67,11 @@ router.delete("/:id/avatar", requireUsersAdmin, deleteUserAvatar);
 router.put("/:id/attachments", requireUsersAdmin, uploadUserAttachmentsFiles, Attachments.uploadUserAttachments);
 router.delete("/:id/attachments/:attachmentId", requireUsersAdmin, Attachments.deleteUserAttachment);
 
-// Invite
+// Invite (solo PENDING)
 router.post("/:id/invite", requireUsersAdmin, Core.sendUserInvite);
+
+// Reset de contraseña admin-iniciado (solo ACTIVE)
+router.post("/:id/send-reset", requireUsersAdmin, Core.sendResetForUser);
 
 // CRUD user
 router.post("/", requireUsersAdmin, Core.createUser);

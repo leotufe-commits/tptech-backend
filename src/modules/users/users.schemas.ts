@@ -36,6 +36,8 @@ export const userOverrideSchema = z.object({
 ========================= */
 export const createUserSchema = z.object({
   email: z.string().email("Email inválido."),
+  firstName: z.string().trim().min(1, "El nombre es obligatorio."),
+  lastName: z.string().trim().min(1, "El apellido es obligatorio."),
   name: z.string().trim().min(1).optional().nullable(),
   password: z.string().min(6, "La contraseña debe tener al menos 6 caracteres.").optional(),
   roleIds: z.array(z.string().min(1)).optional().default([]),
