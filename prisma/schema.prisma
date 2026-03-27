@@ -2297,6 +2297,8 @@ model PrinterProfile {
   gapHMm          Decimal     @db.Decimal(8, 2) @default(2)
   gapVMm          Decimal     @db.Decimal(8, 2) @default(2)
   columns         Int         @default(1)
+  offsetXMm       Decimal     @db.Decimal(8, 2) @default(0)
+  offsetYMm       Decimal     @db.Decimal(8, 2) @default(0)
   isDefault       Boolean     @default(false)
   isActive        Boolean     @default(true)
   deletedAt       DateTime?

@@ -10,6 +10,7 @@ const PP_SELECT = {
   pageWidthMm: true, pageHeightMm: true,
   marginTopMm: true, marginLeftMm: true, marginRightMm: true, marginBottomMm: true,
   gapHMm: true, gapVMm: true, columns: true,
+  offsetXMm: true, offsetYMm: true,
   isDefault: true, isActive: true, deletedAt: true, createdAt: true, updatedAt: true,
 } as const;
 
@@ -46,6 +47,8 @@ export async function createPrinterProfile(jewelryId: string, data: any) {
       gapHMm:         Number(data.gapHMm ?? 2),
       gapVMm:         Number(data.gapVMm ?? 2),
       columns:        Number(data.columns ?? 1),
+      offsetXMm:      Number(data.offsetXMm ?? 0),
+      offsetYMm:      Number(data.offsetYMm ?? 0),
       isDefault:      !!data.isDefault,
       isActive:       data.isActive !== false,
     },
@@ -79,6 +82,8 @@ export async function updatePrinterProfile(id: string, jewelryId: string, data: 
       ...(data.gapHMm         !== undefined ? { gapHMm:         Number(data.gapHMm) }        : {}),
       ...(data.gapVMm         !== undefined ? { gapVMm:         Number(data.gapVMm) }        : {}),
       ...(data.columns        !== undefined ? { columns:        Number(data.columns) }        : {}),
+      ...(data.offsetXMm      !== undefined ? { offsetXMm:      Number(data.offsetXMm) }      : {}),
+      ...(data.offsetYMm      !== undefined ? { offsetYMm:      Number(data.offsetYMm) }      : {}),
       ...(data.isDefault      !== undefined ? { isDefault:      !!data.isDefault }            : {}),
       ...(data.isActive       !== undefined ? { isActive:       !!data.isActive }             : {}),
     },
