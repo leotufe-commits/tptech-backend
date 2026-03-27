@@ -109,7 +109,7 @@ async function getEffectiveCategoryAxes(categoryId: string, jewelryId: string): 
 
   while (currentId && !visited.has(currentId)) {
     visited.add(currentId);
-    const cat = await prisma.articleCategory.findFirst({
+    const cat: { parentId: string | null; attributes: CatAxis[] } | null = await prisma.articleCategory.findFirst({
       where: { id: currentId, jewelryId, deletedAt: null },
       select: {
         parentId: true,
@@ -812,7 +812,7 @@ export async function executeImport(
 
         const created_article = await prisma.article.create({
           data: {
-            jewelry: { connect: { id: jewelryId } },
+            jewelryId,
             code,
             name,
             description: s(row["Descripcion"] ?? "") || "",
@@ -824,7 +824,7 @@ export async function executeImport(
             barcodeType,
             brand: s(row["Marca"] ?? ""),
             manufacturer: s(row["Fabricante"] ?? ""),
-            categoryId,
+            categoryId: categoryId ?? undefined,
             costPrice: n(row["Precio_Costo"]),
             salePrice: n(row["Precio_Venta"]),
             hechuraPrice: n(row["Hechura"]),

@@ -1018,7 +1018,7 @@ async function batchComputeCosts(
     });
     for (const t of taxes) {
       taxMap.set(t.id, {
-        rate:            new Prisma.Decimal(t.rate.toString()),
+        rate:            new Prisma.Decimal((t.rate ?? 0).toString()),
         fixedAmount:     new Prisma.Decimal((t.fixedAmount ?? 0).toString()),
         calculationType: t.calculationType,
       });
@@ -1187,7 +1187,7 @@ export async function getArticle(articleId: string, jewelryId: string) {
         select: { id: true, rate: true, fixedAmount: true, calculationType: true },
       });
       const taxMap = new Map(taxObjects.map((t) => [t.id, {
-        rate:            new Prisma.Decimal(t.rate.toString()),
+        rate:            new Prisma.Decimal((t.rate ?? 0).toString()),
         fixedAmount:     new Prisma.Decimal((t.fixedAmount ?? 0).toString()),
         calculationType: t.calculationType,
       }]));
