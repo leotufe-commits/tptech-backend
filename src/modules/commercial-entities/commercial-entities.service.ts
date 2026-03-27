@@ -75,6 +75,11 @@ const ENTITY_LIST_SELECT = {
   avatarUrl: true,
   priceListId: true,
   currencyId: true,
+  paymentTerm: true,
+  commercialApplyOn: true,
+  commercialRuleType: true,
+  commercialValueType: true,
+  commercialValue: true,
   balanceType: true,
   isActive: true,
   sourceType: true,
@@ -95,6 +100,7 @@ const ENTITY_DETAIL_SELECT = {
       id: true,
       type: true,
       label: true,
+      attn: true,
       street: true,
       streetNumber: true,
       floor: true,
@@ -116,6 +122,7 @@ const ENTITY_DETAIL_SELECT = {
       lastName: true,
       position: true,
       email: true,
+      phonePrefix: true,
       phone: true,
       whatsapp: true,
       isPrimary: true,
@@ -126,7 +133,7 @@ const ENTITY_DETAIL_SELECT = {
       createdAt: true,
     },
     orderBy: [
-      { isPrimary: "desc" as const },
+      { createdAt: "asc" as const },
       { lastName: "asc" as const },
       { firstName: "asc" as const },
     ] as any,
@@ -182,6 +189,16 @@ const ENTITY_DETAIL_SELECT = {
 // ---------------------------------------------------------------------------
 // List (paginated)
 // ---------------------------------------------------------------------------
+const ENTITY_SORT_MAP: Record<string, string> = {
+  displayName:    "displayName",
+  email:          "email",
+  documentNumber: "documentNumber",
+  entityType:     "entityType",
+  code:           "code",
+  createdAt:      "createdAt",
+  updatedAt:      "updatedAt",
+};
+
 export async function listEntities(
   jewelryId: string,
   params: {
@@ -190,10 +207,12 @@ export async function listEntities(
     skip?: number;
     take?: number;
     showInactive?: boolean;
+    sortKey?: string;
+    sortDir?: "asc" | "desc";
   } = {}
 ) {
   assert(jewelryId, "Tenant inválido.");
-  const { role = "all", q = "", skip = 0, take = 50, showInactive = false } = params;
+  const { role = "all", q = "", skip = 0, take = 25, showInactive = false, sortKey = "displayName", sortDir = "asc" } = params;
 
   const roleFilter =
     role === "client"
@@ -224,16 +243,29 @@ export async function listEntities(
     ...searchFilter,
   };
 
-  const [rows, total] = await Promise.all([
+  const [rowsRaw, total] = await Promise.all([
     prisma.commercialEntity.findMany({
       where,
-      select: ENTITY_LIST_SELECT,
-      orderBy: { displayName: "asc" },
+      select: {
+        ...ENTITY_LIST_SELECT,
+        _count: {
+          select: {
+            relationsFrom: { where: { deletedAt: null } },
+            relationsTo:   { where: { deletedAt: null } },
+          },
+        },
+      },
+      orderBy: { [ENTITY_SORT_MAP[sortKey] ?? "displayName"]: sortDir },
       skip,
       take,
     }),
     prisma.commercialEntity.count({ where }),
   ]);
+
+  const rows = rowsRaw.map(({ _count, ...e }) => ({
+    ...e,
+    hasRelations: (_count.relationsFrom + _count.relationsTo) > 0,
+  }));
 
   return { rows, total, skip, take };
 }
@@ -245,12 +277,21 @@ export async function getEntity(id: string, jewelryId: string) {
   assert(id, "Id inválido.");
   assert(jewelryId, "Tenant inválido.");
 
-  const entity = await prisma.commercialEntity.findFirst({
+  const raw = await prisma.commercialEntity.findFirst({
     where: { id, jewelryId, deletedAt: null },
-    select: ENTITY_DETAIL_SELECT,
+    select: {
+      ...ENTITY_DETAIL_SELECT,
+      _count: {
+        select: {
+          relationsFrom: { where: { deletedAt: null } },
+          relationsTo:   { where: { deletedAt: null } },
+        },
+      },
+    },
   });
-  assert(entity, "Entidad no encontrada.");
-  return entity;
+  assert(raw, "Entidad no encontrada.");
+  const { _count, ...entity } = raw;
+  return { ...entity, hasRelations: (_count.relationsFrom + _count.relationsTo) > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +315,7 @@ export async function createEntity(jewelryId: string, data: any) {
     assert(firstName, "El nombre es obligatorio para personas físicas.");
     assert(lastName, "El apellido es obligatorio para personas físicas.");
   } else {
-    assert(companyName, "La razón social es obligatoria para empresas.");
+    assert(tradeName, "El nombre de fantasía es obligatorio para empresas.");
   }
 
   const displayName = calcDisplayName(entityType, firstName, lastName, tradeName, companyName);
@@ -314,6 +355,14 @@ export async function createEntity(jewelryId: string, data: any) {
       creditLimitSupplier,
       priceListId: data?.priceListId || null,
       currencyId: data?.currencyId || null,
+      paymentTerm: s(data?.paymentTerm),
+      commercialApplyOn: data?.commercialApplyOn || null,
+      commercialRuleType: data?.commercialRuleType || null,
+      commercialValueType: data?.commercialValueType || null,
+      commercialValue:
+        data?.commercialValue != null && data.commercialValue !== ""
+          ? String(data.commercialValue)
+          : null,
       notes: s(data?.notes),
       isActive: true,
       sourceType: "MANUAL",
@@ -350,7 +399,7 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
     assert(firstName, "El nombre es obligatorio para personas físicas.");
     assert(lastName, "El apellido es obligatorio para personas físicas.");
   } else {
-    assert(companyName, "La razón social es obligatoria para empresas.");
+    assert(tradeName, "El nombre de fantasía es obligatorio para empresas.");
   }
 
   const displayName = calcDisplayName(entityType, firstName, lastName, tradeName, companyName);
@@ -388,6 +437,14 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
       creditLimitSupplier,
       priceListId: data?.priceListId || null,
       currencyId: data?.currencyId || null,
+      paymentTerm: s(data?.paymentTerm),
+      commercialApplyOn: data?.commercialApplyOn || null,
+      commercialRuleType: data?.commercialRuleType || null,
+      commercialValueType: data?.commercialValueType || null,
+      commercialValue:
+        data?.commercialValue != null && data.commercialValue !== ""
+          ? String(data.commercialValue)
+          : null,
       notes: s(data?.notes),
     },
     select: ENTITY_DETAIL_SELECT,
@@ -444,6 +501,44 @@ export async function deleteEntity(id: string, jewelryId: string) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Bulk soft-delete — máx. 100 IDs por operación
+// Protección: no elimina entidades con historial financiero (balanceEntries)
+// ---------------------------------------------------------------------------
+export async function bulkDeleteEntities(ids: string[], jewelryId: string) {
+  assert(ids.length > 0, "Se requiere al menos un ID.");
+  assert(jewelryId, "Tenant inválido.");
+
+  const capped = ids.slice(0, 100);
+
+  const entities = await prisma.commercialEntity.findMany({
+    where: { id: { in: capped }, jewelryId, deletedAt: null },
+    select: { id: true, _count: { select: { balanceEntries: true } } },
+  });
+
+  const deletable: string[] = [];
+  let blocked = 0;
+
+  for (const e of entities) {
+    if (e._count.balanceEntries > 0) {
+      blocked++;
+    } else {
+      deletable.push(e.id);
+    }
+  }
+
+  const skipped = capped.length - entities.length;
+
+  if (deletable.length > 0) {
+    await prisma.commercialEntity.updateMany({
+      where: { id: { in: deletable }, jewelryId },
+      data: { deletedAt: new Date(), isActive: false },
+    });
+  }
+
+  return { deleted: deletable.length, blocked, skipped };
+}
+
 // ===========================================================================
 // Helpers for sub-resources
 // ===========================================================================
@@ -453,6 +548,7 @@ const ADDRESS_SELECT = {
   id: true,
   type: true,
   label: true,
+  attn: true,
   street: true,
   streetNumber: true,
   floor: true,
@@ -471,6 +567,7 @@ const CONTACT_SELECT = {
   lastName: true,
   position: true,
   email: true,
+  phonePrefix: true,
   phone: true,
   whatsapp: true,
   isPrimary: true,
@@ -539,6 +636,7 @@ export async function createAddress(entityId: string, jewelryId: string, data: a
         jewelryId,
         type,
         label: s(data?.label),
+        attn: s(data?.attn),
         street: s(data?.street),
         streetNumber: s(data?.streetNumber),
         floor: s(data?.floor),
@@ -596,6 +694,7 @@ export async function updateAddress(entityId: string, addressId: string, jewelry
       data: {
         type: newType,
         label: s(data?.label),
+        attn: s(data?.attn),
         street: s(data?.street),
         streetNumber: s(data?.streetNumber),
         floor: s(data?.floor),
@@ -664,7 +763,7 @@ export async function listContacts(entityId: string, jewelryId: string) {
     where: { entityId, deletedAt: null },
     select: CONTACT_SELECT,
     orderBy: [
-      { isPrimary: "desc" as const },
+      { createdAt: "asc" as const },
       { lastName: "asc" as const },
       { firstName: "asc" as const },
     ],
@@ -697,6 +796,7 @@ export async function createContact(entityId: string, jewelryId: string, data: a
         lastName,
         position: s(data?.position),
         email: s(data?.email),
+        phonePrefix: s(data?.phonePrefix),
         phone: s(data?.phone),
         whatsapp: s(data?.whatsapp),
         isPrimary: makePrimary,
@@ -741,6 +841,7 @@ export async function updateContact(entityId: string, contactId: string, jewelry
         lastName,
         position: s(data?.position),
         email: s(data?.email),
+        phonePrefix: s(data?.phonePrefix),
         phone: s(data?.phone),
         whatsapp: s(data?.whatsapp),
         isPrimary: makePrimary,
@@ -1076,6 +1177,12 @@ export async function upsertTaxOverride(entityId: string, jewelryId: string, dat
   assert(tax, "Impuesto no encontrado.");
 
   const overrideMode = VALID_OVERRIDE_MODES.has(data?.overrideMode) ? data.overrideMode : "INHERIT";
+
+  if (overrideMode === "CUSTOM_RATE") {
+    assert(data?.customRate != null && data.customRate !== "", "customRate es obligatorio en modo CUSTOM_RATE.");
+    assert(VALID_TAX_APPLY_ON.has(data?.applyOn), "applyOn es obligatorio en modo CUSTOM_RATE.");
+  }
+
   const customRate = overrideMode === "CUSTOM_RATE" && data?.customRate != null && data.customRate !== ""
     ? String(data.customRate)
     : null;

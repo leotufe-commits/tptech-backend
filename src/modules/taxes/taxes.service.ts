@@ -53,6 +53,7 @@ const SELECT = {
   validTo: true,
   isActive: true,
   isFavorite: true,
+  isSystem: true,
   sortOrder: true,
   notes: true,
   deletedAt: true,

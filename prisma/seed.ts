@@ -1,8 +1,9 @@
 // prisma/seed.ts
 import "dotenv/config";
-import { PrismaClient, PermModule, PermAction, UserStatus } from "@prisma/client";
+import { PrismaClient, UserStatus } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import bcrypt from "bcryptjs";
+import { ensureGlobalPermissions, ensureSystemRoles, ensureSystemDefaults } from "../src/lib/initTenantDefaults.js";
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
 const prisma = new PrismaClient({ adapter });
@@ -34,70 +35,9 @@ async function main() {
     }));
 
   /* =========================
-     2) PERMISOS (GLOBAL)
+     2) PERMISOS + ROLES (GLOBAL + POR JOYERÍA)
   ========================= */
-  const permissionsData: { module: PermModule; action: PermAction }[] = [];
-  for (const module of Object.values(PermModule)) {
-    for (const action of Object.values(PermAction)) {
-      permissionsData.push({ module, action });
-    }
-  }
-
-  await prisma.permission.createMany({
-    data: permissionsData,
-    skipDuplicates: true,
-  });
-
-  const allPermissions = await prisma.permission.findMany();
-
-  const permIdByKey = new Map<string, string>();
-  for (const p of allPermissions) permIdByKey.set(`${p.module}:${p.action}`, p.id);
-
-  function pick(modules: PermModule[], actions: PermAction[]) {
-    const ids: string[] = [];
-    for (const m of modules) {
-      for (const a of actions) {
-        const id = permIdByKey.get(`${m}:${a}`);
-        if (id) ids.push(id);
-      }
-    }
-    return ids;
-  }
-
-  const ALL_MODULES = Object.values(PermModule) as PermModule[];
-  const ALL_ACTIONS = Object.values(PermAction) as PermAction[];
-
-  const OWNER_PERMS = allPermissions.map((p) => p.id);
-  const ADMIN_PERMS = pick(ALL_MODULES, ALL_ACTIONS);
-  const STAFF_PERMS = pick(ALL_MODULES, [PermAction.VIEW, PermAction.CREATE, PermAction.EDIT]);
-  const READONLY_PERMS = pick(ALL_MODULES, [PermAction.VIEW]);
-
-  /**
-   * Roles del sistema
-   * - name = código técnico (NO cambia)
-   * - displayName = nombre visible editable
-   */
-  const rolesToCreate = [
-    { name: "OWNER", displayName: "Propietario", isSystem: true, permIds: OWNER_PERMS },
-    { name: "ADMIN", displayName: "Administrador", isSystem: true, permIds: ADMIN_PERMS },
-    { name: "STAFF", displayName: "Vendedor", isSystem: true, permIds: STAFF_PERMS },
-    { name: "READONLY", displayName: "Solo lectura", isSystem: true, permIds: READONLY_PERMS },
-  ] as const;
-
-  async function setRolePermissions(roleId: string, permIds: string[]) {
-    await prisma.rolePermission.deleteMany({ where: { roleId } });
-
-    if (permIds.length) {
-      await prisma.rolePermission.createMany({
-        data: permIds.map((permissionId) => ({ roleId, permissionId })),
-        skipDuplicates: true,
-      });
-    }
-  }
-
-  /**
-   * Limpieza de duplicados exactos (mismo jewelryId + name)
-   */
+  // Limpieza de duplicados exactos (mismo jewelryId + name) — solo necesario en seed
   async function cleanupExactRoleDuplicates(jewelryId: string, name: string) {
     const same = await prisma.role.findMany({
       where: { jewelryId, name, deletedAt: null },
@@ -119,37 +59,13 @@ async function main() {
   /* =========================
      3) ROLES + PERMISOS (por joyería)
   ========================= */
-  for (const r of rolesToCreate) {
-    await cleanupExactRoleDuplicates(jewelry.id, r.name);
-
-    const role = await prisma.role.upsert({
-      where: { jewelryId_name: { jewelryId: jewelry.id, name: r.name } },
-      create: {
-        name: r.name,
-        displayName: r.displayName,
-        jewelryId: jewelry.id,
-        isSystem: r.isSystem,
-      },
-      update: {
-        isSystem: r.isSystem,
-        deletedAt: null,
-        // 👇 NO pisa si el usuario ya personalizó el nombre
-        displayName: r.displayName,
-      },
-    });
-
-    if (r.name === "OWNER") {
-      await setRolePermissions(role.id, r.permIds);
-      continue;
-    }
-
-    // ADMIN / STAFF / READONLY:
-    // solo setea permisos por defecto si está vacío (no pisa custom)
-    const existingCount = await prisma.rolePermission.count({ where: { roleId: role.id } });
-    if (existingCount === 0) {
-      await setRolePermissions(role.id, r.permIds);
-    }
+  for (const name of ["OWNER", "ADMIN", "STAFF", "READONLY"] as const) {
+    await cleanupExactRoleDuplicates(jewelry.id, name);
   }
+
+  const permIdByKey = await ensureGlobalPermissions(prisma as any);
+  const { ownerRoleId } = await ensureSystemRoles(prisma as any, jewelry.id, permIdByKey);
+  await ensureSystemDefaults(prisma as any, jewelry.id);
 
   /**
    * Migración de roles legacy (nombres viejos)
@@ -220,10 +136,6 @@ async function main() {
   /* =========================
      4) USUARIO OWNER
   ========================= */
-  const ownerRole = await prisma.role.findFirstOrThrow({
-    where: { jewelryId: jewelry.id, name: "OWNER", deletedAt: null },
-  });
-
   const passwordHash = await bcrypt.hash(OWNER_PASSWORD, 10);
 
   const ownerUser = await prisma.user.upsert({
@@ -246,7 +158,7 @@ async function main() {
      5) ASIGNAR ROL OWNER
   ========================= */
   await prisma.userRole.deleteMany({ where: { userId: ownerUser.id } });
-  await prisma.userRole.create({ data: { userId: ownerUser.id, roleId: ownerRole.id } });
+  await prisma.userRole.create({ data: { userId: ownerUser.id, roleId: ownerRoleId } });
 
   console.log("✅ Seed TPTech OK");
   console.log(`🏪 Jewelry: ${JEWELRY_NAME}`);

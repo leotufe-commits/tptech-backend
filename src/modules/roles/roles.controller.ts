@@ -55,6 +55,7 @@ export async function getRoleById(req: Request, res: Response) {
     role: {
       id: role.id,
       name: role.name,
+      displayName: role.displayName,
       code: role.name,
       isSystem: role.isSystem,
       usersCount: role._count.users,
@@ -100,6 +101,7 @@ export async function updateRole(req: Request, res: Response) {
   const body = (req.body ?? {}) as any;
   const role = await Svc.updateRole(tenantId, roleId, {
     name: body.name,
+    displayName: body.displayName,
   });
 
   return res.json({ role });

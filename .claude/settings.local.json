@@ -18,7 +18,16 @@
       "Bash(find \"C:/Users/leotu/OneDrive/Escritorio/TPTech/tptech-frontend/src/components/users/edit\" -type f -name \"*.tsx\" -o -name \"*.ts\" 2>/dev/null | head -20)",
       "Bash(find:*)",
       "Bash(grep:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION=\"si\" npx prisma migrate reset --force)",
+      "Bash(PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION=\"si\" npx prisma migrate reset --force --skip-seed)",
+      "Bash(npm list:*)",
+      "Bash(npx --prefix \"C:/Users/leotu/OneDrive/Escritorio/TPTech/tptech-frontend\" tsc --noEmit -p \"C:/Users/leotu/OneDrive/Escritorio/TPTech/tptech-frontend/tsconfig.json\")",
+      "mcp__ide__getDiagnostics",
+      "Bash(psql:*)",
+      "Bash(where psql:*)",
+      "Bash(where pg_isready)",
+      "Bash(\"C:/Users/leotu/OneDrive/Escritorio/TPTech/tptech-backend/src/modules/articles/articles.controller.ts\")"
     ]
   }
 }

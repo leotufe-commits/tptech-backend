@@ -258,9 +258,12 @@ export async function getUser(req: Request, res: Response) {
 
   if (!user) return res.status(404).json({ message: "Usuario no encontrado." });
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { quickPinHash, ...userWithoutHash } = user;
+
   return res.json({
     user: {
-      ...user,
+      ...userWithoutHash,
       hasQuickPin: Boolean(user.quickPinHash),
       pinEnabled: Boolean(user.quickPinHash) && Boolean(user.quickPinEnabled),
       roles: mapRolesForTenant(tenantId, user.roles as any),

@@ -81,6 +81,7 @@ const ASSIGN_SELECT = {
           label: true,
           value: true,
           colorHex: true,
+          codeExtension: true,
           sortOrder: true,
           isActive: true,
         },
@@ -99,6 +100,7 @@ const OPT_SELECT = {
   label: true,
   value: true,
   colorHex: true,
+  codeExtension: true,
   sortOrder: true,
   isActive: true,
   createdAt: true,
@@ -122,6 +124,16 @@ function mapCategory(r: any, previewMap?: Map<string, string[]>) {
 /** Flatten assignment + definition into a single response object */
 function mapAssignment(row: any) {
   const { definition, ...assign } = row;
+  const mappedOptions = (definition.options ?? []).map((o: any) => ({
+    id: o.id,
+    attributeId: assign.id, // backward compat
+    label: o.label,
+    value: o.value,
+    colorHex: o.colorHex,
+    codeExtension: o.codeExtension ?? "",
+    sortOrder: o.sortOrder,
+    isActive: o.isActive,
+  }));
   return {
     ...assign,
     // Definition fields surfaced at root level (backward-compat shape)
@@ -131,15 +143,18 @@ function mapAssignment(row: any) {
     helpText: definition.helpText,
     unit: definition.unit,
     defaultValue: definition.defaultValue,
-    options: (definition.options ?? []).map((o: any) => ({
-      id: o.id,
-      attributeId: assign.id, // backward compat
-      label: o.label,
-      value: o.value,
-      colorHex: o.colorHex,
-      sortOrder: o.sortOrder,
-      isActive: o.isActive,
-    })),
+    options: mappedOptions,
+    // Nested definition object — requerido por el frontend (CategoryAttribute.definition)
+    definition: {
+      id: assign.definitionId,
+      name: definition.name,
+      code: definition.code,
+      inputType: definition.inputType,
+      helpText: definition.helpText ?? "",
+      unit: definition.unit ?? "",
+      defaultValue: definition.defaultValue ?? "",
+      options: mappedOptions,
+    },
   };
 }
 
@@ -780,6 +795,7 @@ export async function createOption(assignId: string, jewelryId: string, data: an
       label,
       value: s(data?.value) || label,
       colorHex: s(data?.colorHex),
+      codeExtension: s(data?.codeExtension),
       sortOrder: Number(data?.sortOrder ?? 0) || 0,
       isActive: true,
     },
@@ -809,6 +825,7 @@ export async function updateOption(optionId: string, jewelryId: string, data: an
       label,
       value: s(data?.value) || label,
       colorHex: s(data?.colorHex),
+      codeExtension: s(data?.codeExtension),
       sortOrder: Number(data?.sortOrder ?? 0) || 0,
     },
     select: OPT_SELECT,

@@ -30,7 +30,7 @@ const CARRIER_SELECT = {
   freeShippingThreshold: true, type: true, warehouseId: true, provider: true,
   providerConfig: true,
   city: true, province: true, country: true,
-  isFavorite: true, isActive: true, sortOrder: true,
+  isFavorite: true, isActive: true, isSystem: true, sortOrder: true,
   notes: true, deletedAt: true, createdAt: true, updatedAt: true,
   warehouse: { select: WAREHOUSE_SELECT },
   rates: {
@@ -240,8 +240,13 @@ export async function setFavoriteCarrier(id: string, jewelryId: string) {
 
 export async function deleteCarrier(id: string, jewelryId: string) {
   assert(id, "Id inválido."); assert(jewelryId, "Tenant inválido.");
-  const c = await prisma.shippingCarrier.findFirst({ where: { id, jewelryId, deletedAt: null }, select: { id: true } });
+  const c = await prisma.shippingCarrier.findFirst({ where: { id, jewelryId, deletedAt: null }, select: { id: true, isSystem: true } });
   assert(c, "Transportista no encontrado.");
+  if (c.isSystem) {
+    const e: any = new Error("Este elemento es del sistema y no puede eliminarse.");
+    e.status = 409;
+    throw e;
+  }
   return prisma.shippingCarrier.update({ where: { id }, data: { deletedAt: new Date(), isActive: false }, select: { id: true } });
 }
 

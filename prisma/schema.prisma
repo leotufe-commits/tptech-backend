@@ -80,6 +80,12 @@ model Jewelry {
   attributeDefs              ArticleAttributeDef[]
   commercialEntities         CommercialEntity[]
   articles                   Article[]
+  articleMovements           ArticleMovement[]
+  sales                      Sale[]
+  promotions                 Promotion[]
+  quantityDiscounts          QuantityDiscount[]
+  labelTemplates             LabelTemplate[]
+  printerProfiles            PrinterProfile[]
 
   @@index([createdAt])
   @@index([deletedAt])
@@ -133,8 +139,12 @@ model Warehouse {
   jewelry          Jewelry             @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
   stocks           WarehouseStock[]
   sellers          SellerWarehouse[]
-  shippingCarriers ShippingCarrier[]   @relation("WarehousePickups")
-  articleStock     ArticleStock[]
+  shippingCarriers     ShippingCarrier[]   @relation("WarehousePickups")
+  articleStock         ArticleStock[]
+  articleMovements     ArticleMovement[]   @relation("ArticleMovementWarehouse")
+  articleMovementsFrom ArticleMovement[]   @relation("ArticleMovementFrom")
+  articleMovementsTo   ArticleMovement[]   @relation("ArticleMovementTo")
+  sales                Sale[]              @relation("SaleWarehouse")
 
   @@index([jewelryId])
   @@index([deletedAt])
@@ -258,6 +268,11 @@ model User {
   permissionOverrides        UserPermissionOverride[]
   roles                      UserRole[]
   seller                     Seller?
+  articleMovementsCreated    ArticleMovement[]          @relation("ArticleMovementCreatedBy")
+  articleMovementsVoided     ArticleMovement[]          @relation("ArticleMovementVoidedBy")
+  salesCreated               Sale[]                     @relation("SaleCreatedBy")
+  salesConfirmed             Sale[]                     @relation("SaleConfirmedBy")
+  salesCancelled             Sale[]                     @relation("SaleCancelledBy")
 
   @@unique([jewelryId, email])
   @@index([jewelryId])
@@ -412,6 +427,7 @@ model Currency {
   rates          CurrencyRate[]
   quotes         MetalQuote[]
   entityDefaults CommercialEntity[] @relation("EntityCurrency")
+  costLines      ArticleCostLine[]  @relation("CostLineCurrency")
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -478,7 +494,9 @@ model MetalVariant {
   metal         Metal                      @relation(fields: [metalId], references: [id], onDelete: Cascade)
   valueHistory  MetalVariantValueHistory[]
   stocks        WarehouseStock[]
-  compositions  ArticleMetalComposition[]
+  compositions   ArticleMetalComposition[]
+  mermaOverrides EntityMermaOverride[]
+  costLines      ArticleCostLine[]         @relation("CostLineMetalVariant")
 
   @@unique([metalId, sku])
   @@index([metalId])
@@ -556,6 +574,7 @@ model CatalogItem {
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
   isFavorite Boolean     @default(false)
+  isSystem   Boolean     @default(false)
   deletedAt  DateTime?
   jewelry    Jewelry     @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
 
@@ -591,6 +610,8 @@ model ArticleCategory {
   defaultPriceList PriceList?                 @relation("DefaultPriceList", fields: [defaultPriceListId], references: [id], onDelete: SetNull)
   attributes       ArticleCategoryAttribute[]
   articles         Article[]
+  promotionCategories PromotionCategory[]     @relation("CategoryPromotions")
+  quantityDiscounts   QuantityDiscount[]      @relation("CategoryQuantityDiscounts")
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
@@ -620,6 +641,7 @@ model ArticleCategoryAttribute {
   category        ArticleCategory       @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   definition      ArticleAttributeDef   @relation(fields: [definitionId], references: [id], onDelete: Restrict)
   articleValues   ArticleAttributeValue[]
+  variantValues   ArticleVariantAttributeValue[]
 
   @@index([jewelryId])
   @@index([categoryId])
@@ -657,15 +679,16 @@ model ArticleAttributeDef {
 /// ///////////////////////////
 /// ///////////////////////////
 model ArticleAttributeDefOption {
-  id           String   @id @default(cuid())
-  definitionId String
-  label        String
-  value        String
-  colorHex     String   @default("")
-  sortOrder    Int      @default(0)
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id            String   @id @default(cuid())
+  definitionId  String
+  label         String
+  value         String
+  colorHex      String   @default("")
+  codeExtension String   @default("") // extensión de código para generar SKU de variante (ej. "A" → A000A)
+  sortOrder     Int      @default(0)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   definition ArticleAttributeDef @relation(fields: [definitionId], references: [id], onDelete: Cascade)
 
@@ -691,6 +714,7 @@ model Tax {
   isActive        Boolean            @default(true)
   allowDocumentOverride Boolean            @default(false) // si true, el comprobante puede excepcionarlo con auditoría
   isFavorite            Boolean            @default(false)
+  isSystem              Boolean            @default(false)
   sortOrder             Int                @default(0)
   notes                 String             @default("")
   deletedAt             DateTime?
@@ -718,6 +742,7 @@ model PaymentMethod {
   adjustmentValue Decimal?               @db.Decimal(10, 4)
   isFavorite      Boolean                @default(false)
   isActive        Boolean                @default(true)
+  isSystem        Boolean                @default(false)
   sortOrder       Int                    @default(0)
   notes           String                 @default("")
   deletedAt       DateTime?
@@ -726,6 +751,7 @@ model PaymentMethod {
 
   jewelry          Jewelry                  @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
   installmentPlans PaymentInstallmentPlan[]
+  salePayments     SalePayment[]            @relation("SalePaymentMethod")
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
@@ -770,6 +796,7 @@ model ShippingCarrier {
   country                String              @default("")
   isFavorite             Boolean             @default(false)
   isActive               Boolean             @default(true)
+  isSystem               Boolean             @default(false)
   sortOrder              Int                 @default(0)
   notes                  String              @default("")
   deletedAt              DateTime?
@@ -851,6 +878,7 @@ model Seller {
   user        User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
   warehouses  SellerWarehouse[]
   attachments SellerAttachment[]
+  sales       Sale[]             @relation("SaleSeller")
 
   @@index([jewelryId])
   @@index([jewelryId, isActive])
@@ -1022,6 +1050,11 @@ enum CatalogType {
   PROVINCE
   COUNTRY
   DOCUMENT_TYPE
+  PAYMENT_TERM
+  ARTICLE_BRAND
+  ARTICLE_MANUFACTURER
+  UNIT_OF_MEASURE
+  MULTIPLIER_BASE
 }
 
 enum TaxType {
@@ -1222,6 +1255,11 @@ model CommercialEntity {
   // Defaults comerciales
   priceListId         String?          // lista de precios habitual (FK a PriceList)
   currencyId          String?          // moneda habitual de facturación (FK a Currency)
+  paymentTerm         String           @default("") // término de pago (ej: "30 días" — catálogo PAYMENT_TERM)
+  commercialApplyOn   CommercialApplyOn?   // base de aplicación de impuestos por defecto
+  commercialRuleType  CommercialRuleType?  // tipo de beneficio/recargo por defecto (BONUS/SURCHARGE)
+  commercialValueType CommercialValueType? // tipo de valor del beneficio/recargo por defecto
+  commercialValue     Decimal?         @db.Decimal(14, 4) // valor del beneficio/recargo por defecto
 
   // Estado y trazabilidad
   isActive            Boolean          @default(true)
@@ -1243,6 +1281,13 @@ model CommercialEntity {
   taxOverrides    EntityTaxOverride[]
   balanceEntries  EntityBalanceEntry[]
   attachments     EntityAttachment[]
+  mermaOverrides  EntityMermaOverride[]
+  relationsFrom   EntityRelation[]      @relation("RelationFrom")
+  relationsTo     EntityRelation[]      @relation("RelationTo")
+  mergedFrom           CommercialEntity[]    @relation("EntityMerge")
+  mergedInto           CommercialEntity?     @relation("EntityMerge", fields: [mergedIntoEntityId], references: [id], onDelete: SetNull)
+  preferredSupplierFor Article[]             @relation("ArticlePreferredSupplier")
+  salesAsClient        Sale[]                 @relation("SaleClient")
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -1264,6 +1309,7 @@ model EntityAddress {
   jewelryId    String
   type         AddressType @default(OTHER)
   label        String      @default("")    // "Depósito central", "Casa matriz", etc.
+  attn         String      @default("")    // A la atención de
   street       String      @default("")
   streetNumber String      @default("")
   floor        String      @default("")
@@ -1293,6 +1339,7 @@ model EntityContact {
   lastName                    String   @default("")
   position                    String   @default("") // cargo / puesto en la empresa
   email                       String   @default("")
+  phonePrefix                 String   @default("")
   phone                       String   @default("")
   whatsapp                    String   @default("")
   isPrimary                   Boolean  @default(false)
@@ -1414,37 +1461,132 @@ model EntityAttachment {
 model Article {
   id               String           @id @default(cuid())
   jewelryId        String
-  code             String
+  code             String           // ART-NNNN — autogenerado si no se provee
   name             String
   description      String           @default("")
   categoryId       String?
-  status           ArticleStatus    @default(DRAFT)
-  stockMode        StockMode        @default(NO_STOCK)
-  hechuraPrice     Decimal?         @db.Decimal(14, 4)
-  hechuraPriceMode HechuraPriceMode @default(FIXED)
-  mermaPercent     Decimal?         @db.Decimal(5, 2)
-  mainImageUrl     String           @default("")
-  isFavorite       Boolean          @default(false)
-  isActive         Boolean          @default(true)
-  notes            String           @default("")
-  deletedAt        DateTime?
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
 
-  jewelry         Jewelry                   @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
-  category        ArticleCategory?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  compositions    ArticleMetalComposition[]
-  variants        ArticleVariant[]
-  attributeValues ArticleAttributeValue[]
-  images          ArticleImage[]
-  stock           ArticleStock[]
+  // ── Tipo y comportamiento ───────────────────────────────────────────────
+  articleType         ArticleType      @default(PRODUCT)
+  status              ArticleStatus    @default(DRAFT)
+  stockMode           StockMode        @default(NO_STOCK)
+
+  // ── Identidad comercial ─────────────────────────────────────────────────
+  sku                 String           @default("")  // código interno del tenant (libre, no impuesto único a nivel DB para no frenar importaciones)
+  barcode             String?          // código de barras — único por tenant cuando presente
+  barcodeType         BarcodeType      @default(CODE128)
+  barcodeSource       BarcodeSource    @default(CUSTOM) // de dónde viene el barcode: CODE / SKU / CUSTOM
+  brand               String           @default("")  // marca
+  manufacturer        String           @default("")  // fabricante
+  supplierCode        String           @default("")  // código en el sistema del proveedor
+  preferredSupplierId String?          // proveedor habitual (FK a CommercialEntity isSupplier)
+
+  // ── Precios y costos ────────────────────────────────────────────────────
+  costPrice           Decimal?         @db.Decimal(14, 4)  // costo manual (override); null = calculado de composición
+  salePrice           Decimal?         @db.Decimal(14, 4)  // precio de venta manual; cuando useManualSalePrice=true, manda sobre lista
+  useManualSalePrice  Boolean          @default(false)     // si true, salePrice es el precio efectivo (override explícito)
+  hechuraPrice        Decimal?         @db.Decimal(14, 4)
+  hechuraPriceMode    HechuraPriceMode @default(FIXED)
+  mermaPercent        Decimal?         @db.Decimal(5, 2)
+
+  // ── Método de cálculo de costo ──────────────────────────────────────────
+  costCalculationMode CostCalculationMode @default(MANUAL)
+  // MULTIPLIER: cantidad base según MultiplierBase (gramos, kilates, unidades)
+  multiplierBase       String           @default("")
+  multiplierValue      Decimal?         @db.Decimal(14, 6)  // precio unitario del multiplicador
+  multiplierQuantity   Decimal?         @db.Decimal(14, 4)  // cantidad de la unidad base
+  multiplierCurrencyId String?                               // moneda del valor del multiplicador (para UI)
+
+  // ── Parámetros fuente del cálculo de costo manual (para reconstrucción al editar) ──
+  manualBaseCost        Decimal?         @db.Decimal(14, 4)  // costo base antes del ajuste
+  manualCurrencyId      String?                               // moneda del costo base (para UI)
+  manualAdjustmentKind  String           @default("")        // "" | "BONUS" | "SURCHARGE"
+  manualAdjustmentType  String           @default("")        // "" | "PERCENTAGE" | "FIXED_AMOUNT"
+  manualAdjustmentValue Decimal?         @db.Decimal(14, 4)  // valor absoluto del ajuste
+  manualTaxIds          String[]         @default([])         // IDs de impuestos (solo visual, no componible)
+
+  // ── Comportamiento de variantes ─────────────────────────────────────────
+  sellWithoutVariants Boolean          @default(true) // si true, el artículo padre puede venderse sin elegir variante
+
+  // ── Flags comerciales ───────────────────────────────────────────────────
+  isReturnable        Boolean          @default(true)
+  showInStore         Boolean          @default(false)  // visible en tienda / catálogo web
+  unitOfMeasure       String           @default("")     // "unidad", "par", "set", etc.
+  reorderPoint        Decimal?         @db.Decimal(14, 4) // stock mínimo para alerta de reposición
+
+  // ── Control y visibilidad ───────────────────────────────────────────────
+  mainImageUrl        String           @default("")
+  isFavorite          Boolean          @default(false)
+  isActive            Boolean          @default(true)
+  notes               String           @default("")
+  deletedAt           DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  jewelry           Jewelry                   @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  category          ArticleCategory?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  preferredSupplier CommercialEntity?         @relation("ArticlePreferredSupplier", fields: [preferredSupplierId], references: [id], onDelete: SetNull)
+  compositions      ArticleMetalComposition[]
+  variants          ArticleVariant[]
+  attributeValues   ArticleAttributeValue[]
+  images            ArticleImage[]
+  stock             ArticleStock[]
+  movementLines     ArticleMovementLine[]
+  saleLines         SaleLine[]
+  costComposition   ArticleCostLine[]
+  costLineRefs      ArticleCostLine[]  @relation("CostLineRefArticle")
+  promotionArticles PromotionArticle[] @relation("ArticlePromotions")
+  quantityDiscounts QuantityDiscount[] @relation("ArticleQuantityDiscounts")
 
   @@unique([jewelryId, code])
+  @@unique([jewelryId, barcode])         // barcode único por tenant (NULLs excluidos del check)
   @@index([jewelryId])
   @@index([categoryId])
+  @@index([preferredSupplierId])
   @@index([jewelryId, status])
   @@index([jewelryId, isActive])
+  @@index([jewelryId, articleType])
+  @@index([jewelryId, sku])
+  @@index([jewelryId, barcode])
   @@index([deletedAt])
+}
+
+/// Tipo de componente en la composición de costo por líneas
+enum CostLineType {
+  METAL    // gramos × cotización × (1 + merma%)
+  HECHURA  // mano de obra / fabricación
+  PRODUCT  // insumo / producto externo
+  SERVICE  // servicio externo
+  MANUAL   // costo libre (descripción + cantidad + precio unitario)
+}
+
+/// Composición de costo del artículo por líneas.
+/// Alternativa flexible a ArticleMetalComposition + campos de hechura.
+/// Si el artículo tiene líneas → computeCostPrice usa estas líneas.
+/// Si no tiene líneas → fallback a lógica legacy (costCalculationMode).
+model ArticleCostLine {
+  id             String       @id @default(cuid())
+  articleId      String
+  jewelryId      String
+  type           CostLineType @default(MANUAL)
+  label          String       @default("")
+  quantity       Decimal      @default(1)  @db.Decimal(14, 4)
+  unitValue      Decimal      @default(0)  @db.Decimal(18, 6)
+  currencyId     String?                                        // null = moneda base del tenant
+  mermaPercent   Decimal?                  @db.Decimal(5, 2)   // solo para type=METAL
+  metalVariantId String?                                        // solo para type=METAL
+  catalogItemId  String?                                        // para tipo PRODUCT/SERVICE: ID del artículo catálogo referenciado
+  sortOrder      Int          @default(0)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  article      Article       @relation(fields: [articleId],     references: [id], onDelete: Cascade)
+  currency     Currency?     @relation("CostLineCurrency",     fields: [currencyId],     references: [id])
+  metalVariant MetalVariant? @relation("CostLineMetalVariant", fields: [metalVariantId], references: [id])
+  catalogItem  Article?      @relation("CostLineRefArticle",   fields: [catalogItemId],  references: [id])
+
+  @@index([articleId])
+  @@index([jewelryId])
 }
 
 model ArticleMetalComposition {
@@ -1466,27 +1608,51 @@ model ArticleMetalComposition {
 }
 
 model ArticleVariant {
-  id                   String    @id @default(cuid())
+  id                   String      @id @default(cuid())
   articleId            String
   jewelryId            String
-  code                 String
+  code                 String      // código único dentro del artículo
   name                 String
-  weightOverride       Decimal?  @db.Decimal(10, 4)
-  hechuraPriceOverride Decimal?  @db.Decimal(14, 4)
-  priceOverride        Decimal?  @db.Decimal(14, 4)
-  imageUrl             String    @default("")
-  isActive             Boolean   @default(true)
-  sortOrder            Int       @default(0)
-  deletedAt            DateTime?
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
 
-  article Article        @relation(fields: [articleId], references: [id], onDelete: Cascade)
-  stock   ArticleStock[]
+  // ── Identidad comercial ─────────────────────────────────────────────────
+  sku                  String        @default("")
+  barcode              String?       // único por tenant cuando presente
+  barcodeType          BarcodeType   @default(CODE128)
+  barcodeSource        BarcodeSource @default(CUSTOM) // de dónde viene el barcode: CODE / SKU / CUSTOM
+
+  // ── Precios/costos override ─────────────────────────────────────────────
+  weightOverride       Decimal?    @db.Decimal(10, 4)
+  hechuraPriceOverride Decimal?    @db.Decimal(14, 4)
+  priceOverride        Decimal?    @db.Decimal(14, 4)  // precio de venta override para esta variante
+  costPrice            Decimal?    @db.Decimal(14, 4)  // costo override para esta variante
+
+  // ── Inventario ──────────────────────────────────────────────────────────
+  reorderPoint         Decimal?    @db.Decimal(14, 4) // stock mínimo para alerta de reposición (por variante)
+
+  // ── Visual y control ────────────────────────────────────────────────────
+  imageUrl             String      @default("")
+  notes                String      @default("")
+  isActive             Boolean     @default(true)
+  sortOrder            Int         @default(0)
+  deletedAt            DateTime?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  article           Article             @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  stock             ArticleStock[]
+  movementLines     ArticleMovementLine[]
+  saleLines         SaleLine[]
+  promotionVariants PromotionVariant[]    @relation("VariantPromotions")
+  quantityDiscounts QuantityDiscount[]   @relation("VariantQuantityDiscounts")
+  attributeValues   ArticleVariantAttributeValue[]
+  images            ArticleVariantImage[]
 
   @@unique([articleId, code])
+  @@unique([jewelryId, barcode])   // barcode único por tenant (NULLs excluidos)
   @@index([articleId])
   @@index([jewelryId])
+  @@index([jewelryId, sku])
+  @@index([jewelryId, barcode])
 }
 
 model ArticleAttributeValue {
@@ -1506,6 +1672,26 @@ model ArticleAttributeValue {
   @@index([assignmentId])
 }
 
+/// Valores de atributos con isVariantAxis=true asignados a cada variante.
+/// Mismo patrón que ArticleAttributeValue pero para ArticleVariant.
+model ArticleVariantAttributeValue {
+  id           String   @id @default(cuid())
+  jewelryId    String
+  variantId    String
+  assignmentId String   // FK → ArticleCategoryAttribute (debe tener isVariantAxis=true)
+  value        String   @default("") // serialización unificada (igual que ArticleAttributeValue)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  variant    ArticleVariant           @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  assignment ArticleCategoryAttribute @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+
+  @@unique([variantId, assignmentId])
+  @@index([variantId])
+  @@index([assignmentId])
+  @@index([jewelryId])
+}
+
 model ArticleImage {
   id        String   @id @default(cuid())
   articleId String
@@ -1522,14 +1708,34 @@ model ArticleImage {
   @@index([jewelryId])
 }
 
+model ArticleVariantImage {
+  id        String   @id @default(cuid())
+  variantId String
+  articleId String
+  jewelryId String
+  url       String
+  label     String   @default("")
+  isMain    Boolean  @default(false)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  variant ArticleVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@index([variantId])
+  @@index([articleId])
+  @@index([jewelryId])
+}
+
 model ArticleStock {
-  id          String    @id @default(cuid())
-  articleId   String
-  variantId   String?
-  warehouseId String
-  jewelryId   String
-  quantity    Decimal   @default(0) @db.Decimal(14, 4)
-  updatedAt   DateTime  @updatedAt
+  id           String    @id @default(cuid())
+  articleId    String
+  variantId    String?
+  warehouseId  String
+  jewelryId    String
+  quantity     Decimal   @default(0) @db.Decimal(14, 4)
+  reservedQty  Decimal   @default(0) @db.Decimal(14, 4) // reservado para pedidos futuros — no se descuenta de quantity todavía
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   article   Article         @relation(fields: [articleId], references: [id], onDelete: Cascade)
   variant   ArticleVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
@@ -1560,4 +1766,545 @@ enum StockMode {
 enum HechuraPriceMode {
   FIXED
   PER_GRAM
+}
+
+/// Tipo de artículo — define el comportamiento esperado (stock, composición, etc.)
+/// PRODUCT  → joya o artículo físico fabricable. stockMode: NO_STOCK | BY_ARTICLE | BY_MATERIAL
+/// SERVICE  → servicio (reparación, diseño, etc.). stockMode forzado a NO_STOCK. Sin variantes.
+/// MATERIAL → insumo no metálico comprado (cierres, cadenas). stockMode: NO_STOCK | BY_ARTICLE
+enum ArticleType {
+  PRODUCT
+  SERVICE
+  MATERIAL
+}
+
+/// Simbología de código de barras soportada
+enum BarcodeType {
+  CODE128  // Alfanumérico general — usado internamente y para uso flexible
+  EAN13    // Estándar retail — 13 dígitos con dígito verificador
+  QR       // QR code — para uso futuro (etiquetas digitales, etc.)
+}
+
+/// Método de cálculo del costo del artículo
+/// MANUAL              → costPrice fijo ingresado a mano
+/// METAL_MERMA_HECHURA → cálculo joyero clásico: gramos × precio_metal × (1 + merma%) + hechura
+/// MULTIPLIER          → cantidad × multiplierValue (flexible: gramos, kilates, unidades, etc.)
+enum CostCalculationMode {
+  MANUAL
+  METAL_MERMA_HECHURA
+  MULTIPLIER
+}
+
+/// De dónde proviene el barcode de un artículo o variante
+/// CODE   → el barcode es igual al campo `code` del artículo/variante (se sincroniza automáticamente)
+/// SKU    → el barcode es igual al campo `sku` (se sincroniza automáticamente)
+/// CUSTOM → el usuario escribe el barcode manualmente
+enum BarcodeSource {
+  CODE
+  SKU
+  CUSTOM
+}
+
+/// Unidad base para el modo MULTIPLIER
+enum MultiplierBase {
+  GRAMS    // gramos × multiplierValue
+  KILATES  // kilates × multiplierValue
+  UNITS    // unidades × multiplierValue
+}
+
+/// Tipos de movimiento de stock de artículos terminados
+enum ArticleMovementKind {
+  IN        // Entrada de stock (compra, devolución de cliente, etc.)
+  OUT       // Salida de stock (venta, pérdida, etc.)
+  TRANSFER  // Transferencia entre almacenes
+  ADJUST    // Ajuste de inventario (cantidad absoluta nueva)
+  OPENING   // Apertura de inventario (carga inicial)
+}
+
+/// Cabecera de movimiento de stock de artículos terminados
+/// Análogo a InventoryMovement pero para artículos (unidades) en vez de metal (gramos)
+model ArticleMovement {
+  id              String              @id @default(cuid())
+  jewelryId       String
+  kind            ArticleMovementKind
+  code            String              @default("") // AE/AS/AT/AA/AO-NNNN
+  note            String              @default("")
+  effectiveAt     DateTime
+  warehouseId     String?             // IN / OUT / ADJUST / OPENING
+  fromWarehouseId String?             // TRANSFER — origen
+  toWarehouseId   String?             // TRANSFER — destino
+  createdById     String?
+  voidedAt        DateTime?
+  voidedNote      String              @default("")
+  voidedById      String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  jewelry       Jewelry               @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  warehouse     Warehouse?            @relation("ArticleMovementWarehouse", fields: [warehouseId], references: [id], onDelete: Restrict)
+  fromWarehouse Warehouse?            @relation("ArticleMovementFrom", fields: [fromWarehouseId], references: [id], onDelete: Restrict)
+  toWarehouse   Warehouse?            @relation("ArticleMovementTo", fields: [toWarehouseId], references: [id], onDelete: Restrict)
+  createdBy     User?                 @relation("ArticleMovementCreatedBy", fields: [createdById], references: [id])
+  voidedBy      User?                 @relation("ArticleMovementVoidedBy", fields: [voidedById], references: [id])
+  lines         ArticleMovementLine[]
+
+  @@index([jewelryId, createdAt])
+  @@index([jewelryId, effectiveAt])
+  @@index([jewelryId, kind])
+  @@index([warehouseId])
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
+  @@index([jewelryId, voidedAt])
+}
+
+/// Línea de movimiento de artículo — un movimiento puede afectar múltiples artículos
+model ArticleMovementLine {
+  id         String          @id @default(cuid())
+  movementId String
+  jewelryId  String
+  articleId  String
+  variantId  String?
+  // quantity semántica según kind del movimiento padre:
+  //   IN / OUT / OPENING / TRANSFER: magnitud positiva (dirección implícita por kind)
+  //   ADJUST: delta firmado (positivo = aumentar, negativo = disminuir)
+  quantity   Decimal         @db.Decimal(14, 4)
+  createdAt  DateTime        @default(now())
+
+  movement ArticleMovement @relation(fields: [movementId], references: [id], onDelete: Cascade)
+  article  Article         @relation(fields: [articleId], references: [id], onDelete: Restrict)
+  variant  ArticleVariant? @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@index([movementId])
+  @@index([articleId])
+  @@index([variantId])
+  @@index([jewelryId])
+}
+
+enum EntityRelationType {
+  CLIENT_OF
+  SUPPLIES_TO
+  SAME_GROUP
+  RELATED_COMPANY
+  REFERRED_BY
+  OTHER
+}
+
+/// Merma % override por variante por entidad comercial
+model EntityMermaOverride {
+  id           String     @id @default(cuid())
+  entityId     String
+  jewelryId    String
+  variantId    String
+  role         EntityRole @default(CLIENT)
+  mermaPercent Decimal    @db.Decimal(5, 2)
+  notes        String     @default("")
+  isActive     Boolean    @default(true)
+  deletedAt    DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  entity  CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  variant MetalVariant     @relation(fields: [variantId], references: [id])
+
+  @@unique([entityId, variantId, role])
+  @@index([entityId])
+  @@index([jewelryId])
+  @@index([variantId])
+  @@index([deletedAt])
+}
+
+/// Relación entre dos entidades comerciales del mismo tenant
+model EntityRelation {
+  id           String             @id @default(cuid())
+  jewelryId    String
+  fromEntityId String
+  toEntityId   String
+  relationType EntityRelationType @default(OTHER)
+  notes        String             @default("")
+  isActive     Boolean            @default(true)
+  deletedAt    DateTime?
+  createdAt    DateTime           @default(now())
+
+  fromEntity CommercialEntity @relation("RelationFrom", fields: [fromEntityId], references: [id], onDelete: Cascade)
+  toEntity   CommercialEntity @relation("RelationTo", fields: [toEntityId], references: [id], onDelete: Cascade)
+
+  @@unique([fromEntityId, toEntityId, relationType])
+  @@index([jewelryId])
+  @@index([fromEntityId])
+  @@index([toEntityId])
+  @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// VENTAS
+/// ///////////////////////////
+enum SaleStatus {
+  DRAFT           // en construcción — sin stock descontado
+  CONFIRMED       // confirmada — stock descontado, pendiente de cobro
+  PAID            // cobrada completamente
+  PARTIALLY_PAID  // cobrada parcialmente
+  CANCELLED       // anulada — stock restituido si fue CONFIRMED
+}
+
+model Sale {
+  id              String     @id @default(cuid())
+  jewelryId       String
+  code            String     // VTA-0001 — autogenerado al crear
+  status          SaleStatus @default(DRAFT)
+
+  // ── Partes ───────────────────────────────────────────────────────────────
+  clientId        String?    // FK a CommercialEntity (isClient=true)
+  clientSnapshot  Json?      // snapshot del cliente al momento de confirmación
+  sellerId        String?    // FK a Seller
+  warehouseId     String?    // almacén de donde se descuenta el stock
+
+  // ── Totales (calculados al confirmar, nunca recalculados después) ─────
+  subtotal        Decimal    @default(0) @db.Decimal(14, 2)
+  discountAmount  Decimal    @default(0) @db.Decimal(14, 2)
+  taxAmount       Decimal    @default(0) @db.Decimal(14, 2)
+  total           Decimal    @default(0) @db.Decimal(14, 2)
+  paidAmount      Decimal    @default(0) @db.Decimal(14, 2)
+
+  // ── Fechas y trazabilidad ────────────────────────────────────────────────
+  saleDate        DateTime   @default(now())
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  confirmedAt     DateTime?
+  cancelledAt     DateTime?
+  cancelNote      String     @default("")
+  notes           String     @default("")
+
+  createdById     String?
+  confirmedById   String?
+  cancelledById   String?
+
+  jewelry     Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  client      CommercialEntity? @relation("SaleClient", fields: [clientId], references: [id], onDelete: SetNull)
+  seller      Seller?           @relation("SaleSeller", fields: [sellerId], references: [id], onDelete: SetNull)
+  warehouse   Warehouse?        @relation("SaleWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
+  createdBy   User?             @relation("SaleCreatedBy", fields: [createdById], references: [id])
+  confirmedBy User?             @relation("SaleConfirmedBy", fields: [confirmedById], references: [id])
+  cancelledBy User?             @relation("SaleCancelledBy", fields: [cancelledById], references: [id])
+  lines       SaleLine[]
+  payments    SalePayment[]
+
+  @@unique([jewelryId, code])
+  @@index([jewelryId])
+  @@index([jewelryId, status])
+  @@index([jewelryId, saleDate])
+  @@index([clientId])
+  @@index([sellerId])
+  @@index([warehouseId])
+  @@index([createdById])
+}
+
+model SaleLine {
+  id          String  @id @default(cuid())
+  saleId      String
+  jewelryId   String
+  articleId   String
+  variantId   String?
+
+  // ── Snapshot al momento de la venta ─────────────────────────────────────
+  articleName String  @default("")
+  variantName String  @default("")
+  sku         String  @default("")
+  barcode     String  @default("")
+
+  // ── Precio y cantidad ────────────────────────────────────────────────────
+  quantity    Decimal @db.Decimal(14, 4)
+  unitPrice   Decimal @db.Decimal(14, 4)
+  discountPct Decimal @default(0) @db.Decimal(10, 4)
+  lineTotal   Decimal @db.Decimal(14, 2)
+
+  // ── Snapshot de resolución de precio ────────────────────────────────────
+  priceSource        String  @default("")   // PROMOTION | MANUAL_OVERRIDE | QUANTITY_DISCOUNT | PRICE_LIST | MANUAL_FALLBACK
+  appliedPriceListId String?
+  appliedPromotionId String?
+  appliedDiscountId  String?
+
+  // ── Snapshot de costo y margen (congelado al confirmar) ──────────────────
+  unitCost      Decimal? @db.Decimal(14, 4) // costo unitario al momento de confirmar
+  totalCost     Decimal? @db.Decimal(14, 2) // unitCost × quantity
+  unitMargin    Decimal? @db.Decimal(14, 4) // unitPrice - unitCost (antes de descuento)
+  totalMargin   Decimal? @db.Decimal(14, 2) // lineTotal - totalCost
+  marginPercent Decimal? @db.Decimal(10, 4) // (totalMargin / lineTotal) × 100
+
+  sortOrder   Int     @default(0)
+  createdAt   DateTime @default(now())
+
+  sale    Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  article Article        @relation(fields: [articleId], references: [id], onDelete: Restrict)
+  variant ArticleVariant? @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+  @@index([articleId])
+  @@index([variantId])
+  @@index([jewelryId])
+}
+
+model SalePayment {
+  id                String   @id @default(cuid())
+  saleId            String
+  jewelryId         String
+  paymentMethodId   String?  // FK a PaymentMethod — null si fue eliminado
+  paymentMethodName String   @default("")
+  amount            Decimal  @db.Decimal(14, 2)
+  installments      Int      @default(1)
+  reference         String   @default("") // nro de autorización, cheque, etc.
+  paidAt            DateTime @default(now())
+  createdAt         DateTime @default(now())
+
+  sale          Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  paymentMethod PaymentMethod? @relation("SalePaymentMethod", fields: [paymentMethodId], references: [id], onDelete: SetNull)
+
+  @@index([saleId])
+  @@index([jewelryId])
+  @@index([paymentMethodId])
+}
+
+/// ///////////////////////////
+/// PROMOCIONES Y DESCUENTOS
+/// ///////////////////////////
+
+/// Alcance de una promoción: a qué artículos aplica.
+enum PromotionScope {
+  ALL       // todos los artículos
+  ARTICLE   // artículos específicos (via PromotionArticle)
+  VARIANT   // variantes específicas (via PromotionVariant)
+  CATEGORY  // categorías de artículos (via PromotionCategory)
+  BRAND     // marcas específicas (via PromotionBrand)
+}
+
+/// Tipo de ajuste de precio: descuento fijo o porcentual
+enum PromotionType {
+  FIXED       // descuento en monto fijo (moneda base)
+  PERCENTAGE  // descuento en porcentaje sobre el precio base
+}
+
+/// Promoción especial por tiempo limitado o evento.
+/// Prioridad máxima en la resolución de precio de venta.
+model Promotion {
+  id            String         @id @default(cuid())
+  jewelryId     String
+  name          String
+  type          PromotionType
+  value         Decimal        @db.Decimal(14, 4) // monto o % de descuento
+  scope         PromotionScope @default(ALL)       // alcance de la promoción
+  validFrom     DateTime?
+  validTo       DateTime?
+  untilStockEnd Boolean        @default(false)
+  priority      Int            @default(0)        // menor número = mayor prioridad
+  isActive      Boolean        @default(true)
+  notes         String         @default("")
+  deletedAt     DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  jewelry    Jewelry             @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  articles   PromotionArticle[]
+  variants   PromotionVariant[]
+  categories PromotionCategory[]
+  brands     PromotionBrand[]
+
+  @@index([jewelryId])
+  @@index([scope])
+  @@index([jewelryId, isActive])
+  @@index([deletedAt])
+}
+
+/// Artículos específicos a los que aplica una promoción (scope = ARTICLE).
+model PromotionArticle {
+  id          String @id @default(cuid())
+  promotionId String
+  articleId   String
+  jewelryId   String
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  article   Article   @relation("ArticlePromotions", fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, articleId])
+  @@index([promotionId])
+  @@index([articleId])
+  @@index([jewelryId])
+}
+
+/// Variantes específicas a las que aplica una promoción (scope = VARIANT).
+model PromotionVariant {
+  id          String @id @default(cuid())
+  promotionId String
+  variantId   String
+  jewelryId   String
+
+  promotion Promotion      @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  variant   ArticleVariant @relation("VariantPromotions", fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, variantId])
+  @@index([promotionId])
+  @@index([variantId])
+  @@index([jewelryId])
+}
+
+/// Categorías a las que aplica una promoción (scope = CATEGORY).
+model PromotionCategory {
+  id          String @id @default(cuid())
+  promotionId String
+  categoryId  String
+  jewelryId   String
+
+  promotion Promotion       @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  category  ArticleCategory @relation("CategoryPromotions", fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, categoryId])
+  @@index([promotionId])
+  @@index([categoryId])
+  @@index([jewelryId])
+}
+
+/// Marcas a las que aplica una promoción (scope = BRAND).
+model PromotionBrand {
+  id          String @id @default(cuid())
+  promotionId String
+  brand       String
+  jewelryId   String
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, brand])
+  @@index([promotionId])
+  @@index([jewelryId])
+}
+
+/// Descuento por volumen/cantidad mínima de compra.
+/// Aplica cuando la cantidad en la línea de venta supera el umbral.
+model QuantityDiscount {
+  id          String    @id @default(cuid())
+  jewelryId   String
+  articleId   String?       // null cuando el alcance no es por artículo
+  variantId   String?       // solo si scope es variante específica
+  categoryId  String?       // null cuando el alcance no es por categoría
+  brand       String?       // null cuando el alcance no es por marca
+  isActive    Boolean   @default(true)
+  sortOrder   Int       @default(0)
+  deletedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  jewelry  Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  article  Article?         @relation("ArticleQuantityDiscounts", fields: [articleId], references: [id], onDelete: SetNull)
+  variant  ArticleVariant?  @relation("VariantQuantityDiscounts", fields: [variantId], references: [id], onDelete: SetNull)
+  category ArticleCategory? @relation("CategoryQuantityDiscounts", fields: [categoryId], references: [id], onDelete: SetNull)
+  tiers    QuantityDiscountTier[]
+
+  @@index([jewelryId])
+  @@index([articleId])
+  @@index([variantId])
+  @@index([categoryId])
+  @@index([deletedAt])
+}
+
+/// Tramo individual de un descuento por cantidad.
+model QuantityDiscountTier {
+  id         String        @id @default(cuid())
+  discountId String
+  minQty     Decimal       @db.Decimal(14, 4)
+  type       PromotionType
+  value      Decimal       @db.Decimal(14, 4)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  discount QuantityDiscount @relation(fields: [discountId], references: [id], onDelete: Cascade)
+
+  @@index([discountId])
+}
+
+enum LabelElementType {
+  TEXT
+  BARCODE
+  QR
+  IMAGE
+  LINE
+}
+
+enum PrinterType {
+  THERMAL
+  ZEBRA
+  A4
+  INKJET
+}
+
+/// Plantilla de etiqueta para impresión
+model LabelTemplate {
+  id          String   @id @default(cuid())
+  jewelryId   String
+  name        String
+  widthMm     Decimal  @db.Decimal(8, 2)
+  heightMm    Decimal  @db.Decimal(8, 2)
+  dpi         Int      @default(203)
+  orientation String   @default("portrait")
+  bgColor     String   @default("#ffffff")
+  isDefault   Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  deletedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  jewelry  Jewelry        @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  elements LabelElement[]
+
+  @@index([jewelryId])
+  @@index([deletedAt])
+}
+
+/// Elemento dentro de una plantilla de etiqueta
+model LabelElement {
+  id          String           @id @default(cuid())
+  templateId  String
+  type        LabelElementType
+  label       String           @default("")
+  fieldKey    String           @default("")
+  x           Decimal          @db.Decimal(8, 2)
+  y           Decimal          @db.Decimal(8, 2)
+  width       Decimal          @db.Decimal(8, 2)
+  height      Decimal          @db.Decimal(8, 2)
+  fontSize    Int              @default(8)
+  fontWeight  String           @default("normal")
+  align       String           @default("left")
+  visible     Boolean          @default(true)
+  sortOrder   Int              @default(0)
+  configJson  String           @default("{}")
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  template LabelTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+}
+
+/// Perfil de impresora para configurar el layout de impresión
+model PrinterProfile {
+  id              String      @id @default(cuid())
+  jewelryId       String
+  name            String
+  type            PrinterType @default(THERMAL)
+  dpi             Int         @default(203)
+  pageWidthMm     Decimal     @db.Decimal(8, 2) @default(210)
+  pageHeightMm    Decimal     @db.Decimal(8, 2) @default(297)
+  marginTopMm     Decimal     @db.Decimal(8, 2) @default(5)
+  marginLeftMm    Decimal     @db.Decimal(8, 2) @default(5)
+  marginRightMm   Decimal     @db.Decimal(8, 2) @default(5)
+  marginBottomMm  Decimal     @db.Decimal(8, 2) @default(5)
+  gapHMm          Decimal     @db.Decimal(8, 2) @default(2)
+  gapVMm          Decimal     @db.Decimal(8, 2) @default(2)
+  columns         Int         @default(1)
+  isDefault       Boolean     @default(false)
+  isActive        Boolean     @default(true)
+  deletedAt       DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  jewelry Jewelry @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+
+  @@index([jewelryId])
+  @@index([deletedAt])
 }

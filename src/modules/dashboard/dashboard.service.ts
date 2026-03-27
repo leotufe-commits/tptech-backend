@@ -1,5 +1,6 @@
 // tptech-backend/src/modules/dashboard/dashboard.service.ts
 import { prisma } from "../../lib/prisma.js";
+import { Prisma } from "@prisma/client";
 
 export type DashboardRange = "7d" | "30d" | "90d" | "1y";
 
@@ -102,8 +103,30 @@ export async function getDashboardSummary(args: {
     }),
   ]);
 
-  const currencyIds = currencies.map((c) => c.id);
   const metalIds = metals.map((m) => m.id);
+
+  const variants = await prisma.metalVariant.findMany({
+    where: { metalId: { in: metalIds }, deletedAt: null, isActive: true },
+    select: { id: true, metalId: true, name: true, sku: true, purity: true, saleFactor: true },
+    orderBy: [{ purity: "desc" }, { name: "asc" }],
+  });
+
+  const variantIds = variants.map((v) => v.id);
+
+  const latestVariantHistory = await prisma.metalVariantValueHistory.findMany({
+    where: { variantId: { in: variantIds } },
+    select: { variantId: true, finalSalePrice: true, effectiveAt: true },
+    orderBy: { effectiveAt: "desc" },
+  });
+
+  const latestByVariant = new Map<string, number>();
+  for (const row of latestVariantHistory) {
+    if (!latestByVariant.has(row.variantId)) {
+      latestByVariant.set(row.variantId, Number(row.finalSalePrice));
+    }
+  }
+
+  const currencyIds = currencies.map((c) => c.id);
 
   const [currencyRates, metalRefHistory] = await Promise.all([
     prisma.currencyRate.findMany({
@@ -212,7 +235,164 @@ export async function getDashboardSummary(args: {
     },
     currencies,
     metals,
+    variants: variants.map((v) => ({
+      id: v.id,
+      metalId: v.metalId,
+      name: v.name,
+      sku: v.sku,
+      purity: Number(v.purity),
+      saleFactor: Number(v.saleFactor),
+      value: latestByVariant.get(v.id) ?? null,
+    })),
     series: { fx: fxSeries, metals: metalsSeries },
     activity,
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROFIT SUMMARY
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type ProfitGroupBy = "day" | "week" | "month";
+
+function bucketKey(date: Date, groupBy: ProfitGroupBy): string {
+  const d = new Date(date);
+  if (groupBy === "month") return d.toISOString().slice(0, 7); // YYYY-MM
+  if (groupBy === "week") {
+    d.setHours(0, 0, 0, 0);
+    const dow = d.getDay();
+    const diff = dow === 0 ? -6 : 1 - dow; // shift to Monday
+    d.setDate(d.getDate() + diff);
+    return d.toISOString().slice(0, 10);
+  }
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function r2(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+export async function getProfitSummary(args: {
+  jewelryId: string;
+  from: Date;
+  to: Date;
+  groupBy: ProfitGroupBy;
+}) {
+  const { jewelryId, from, to, groupBy } = args;
+
+  // Only confirmed sales with frozen cost snapshots
+  const lines = await prisma.saleLine.findMany({
+    where: {
+      jewelryId,
+      sale: {
+        status: { in: ["CONFIRMED", "PAID", "PARTIALLY_PAID"] as any[] },
+        confirmedAt: { gte: from, lte: to },
+      },
+    },
+    select: {
+      id: true,
+      articleId: true,
+      articleName: true,
+      quantity: true,
+      lineTotal: true,
+      totalCost: true,
+      totalMargin: true,
+      sale: { select: { id: true, confirmedAt: true } },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  let revenue = 0;
+  let cost    = 0;
+  let margin  = 0;
+  let linesWithCost     = 0;
+  let linesWithoutCost  = 0;
+  let linesNegativeMargin = 0;
+  const negSaleIds = new Set<string>();
+
+  const seriesMap = new Map<string, { revenue: number; cost: number; margin: number }>();
+  const artMap    = new Map<string, {
+    articleId: string; articleName: string;
+    revenue: number; cost: number; margin: number; quantity: number;
+  }>();
+
+  for (const line of lines) {
+    const rev = Number(line.lineTotal);
+    const c   = line.totalCost   != null ? Number(line.totalCost)   : null;
+    const m   = line.totalMargin != null ? Number(line.totalMargin) : null;
+    const qty = Number(line.quantity);
+
+    revenue += rev;
+    if (c != null) { cost += c; linesWithCost++; } else { linesWithoutCost++; }
+    if (m != null) {
+      margin += m;
+      if (m < 0) { linesNegativeMargin++; if (line.sale?.id) negSaleIds.add(line.sale.id); }
+    }
+
+    // Time series bucket
+    const confirmedAt = line.sale?.confirmedAt;
+    if (confirmedAt) {
+      const key = bucketKey(confirmedAt, groupBy);
+      const b   = seriesMap.get(key) ?? { revenue: 0, cost: 0, margin: 0 };
+      b.revenue += rev;
+      if (c != null) b.cost += c;
+      if (m != null) b.margin += m;
+      seriesMap.set(key, b);
+    }
+
+    // Top articles aggregation
+    const a = artMap.get(line.articleId) ?? {
+      articleId: line.articleId, articleName: line.articleName,
+      revenue: 0, cost: 0, margin: 0, quantity: 0,
+    };
+    a.revenue  += rev;
+    if (c != null) a.cost   += c;
+    if (m != null) a.margin += m;
+    a.quantity += qty;
+    artMap.set(line.articleId, a);
+  }
+
+  const marginPct = revenue > 0 ? (margin / revenue) * 100 : 0;
+
+  const series = Array.from(seriesMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, v]) => ({
+      date,
+      revenue: r2(v.revenue),
+      cost:    r2(v.cost),
+      margin:  r2(v.margin),
+    }));
+
+  const topArticles = Array.from(artMap.values())
+    .map((a) => ({
+      articleId:     a.articleId,
+      articleName:   a.articleName,
+      revenue:       r2(a.revenue),
+      cost:          r2(a.cost),
+      margin:        r2(a.margin),
+      marginPercent: a.revenue > 0 ? r2((a.margin / a.revenue) * 100) : 0,
+      quantity:      Number(Number(a.quantity).toFixed(4)),
+    }))
+    .sort((a, b) => b.margin - a.margin)
+    .slice(0, 20);
+
+  return {
+    period: { from: from.toISOString(), to: to.toISOString(), groupBy },
+    totals: {
+      revenue:       r2(revenue),
+      cost:          r2(cost),
+      margin:        r2(margin),
+      marginPercent: r2(marginPct),
+      linesCount:    lines.length,
+      linesWithCost,
+      linesWithoutCost,
+      linesNegativeMargin,
+      salesWithNegativeMargin: negSaleIds.size,
+    },
+    series,
+    topArticles,
+  };
+}
+
+// Suppress unused import warning — Prisma is imported for future Decimal use
+void Prisma;

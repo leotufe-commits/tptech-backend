@@ -103,7 +103,7 @@ export async function createRole(
 export async function updateRole(
   jewelryId: string,
   roleId: string,
-  data: { name?: string }
+  data: { name?: string; displayName?: string }
 ) {
   const nextName = data.name !== undefined ? assertNonEmpty(data.name, "Nombre requerido.") : undefined;
 
@@ -113,6 +113,11 @@ export async function updateRole(
   });
   if (!current) throw err(404, "Rol no encontrado.");
 
+  // El nombre técnico (name) no puede cambiar en roles del sistema
+  if (current.isSystem && nextName && nextName !== current.name) {
+    throw err(409, "El nombre técnico de un rol del sistema no puede modificarse.");
+  }
+
   if (nextName && nextName !== current.name) {
     const dup = await prisma.role.findFirst({
       where: { jewelryId, name: nextName, deletedAt: null, id: { not: roleId } },
@@ -121,9 +126,18 @@ export async function updateRole(
     if (dup) throw err(409, `Ya existe un rol con nombre "${nextName}".`);
   }
 
+  // displayName: vacío → null (vuelve a mostrar el name técnico)
+  const nextDisplayName =
+    data.displayName !== undefined
+      ? (data.displayName.trim() || null)
+      : undefined;
+
   const updated = await prisma.role.update({
     where: { id: roleId },
-    data: { ...(nextName ? { name: nextName } : {}) },
+    data: {
+      ...(nextName ? { name: nextName } : {}),
+      ...(nextDisplayName !== undefined ? { displayName: nextDisplayName } : {}),
+    },
     select: { id: true, jewelryId: true, name: true, displayName: true, isSystem: true, createdAt: true, updatedAt: true },
   });
 
@@ -148,9 +162,13 @@ export async function updateRolePermissions(
 ) {
   const role = await prisma.role.findFirst({
     where: { id: roleId, jewelryId, deletedAt: null },
-    select: { id: true },
+    select: { id: true, name: true },
   });
   if (!role) throw err(404, "Rol no encontrado.");
+
+  if (role.name === "OWNER") {
+    throw err(409, "Los permisos del rol Propietario no pueden modificarse.");
+  }
 
   const ids = uniqStrings((permissionIds ?? []).map(String).filter(Boolean));
 

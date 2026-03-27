@@ -9,8 +9,9 @@ import { sendResetEmail } from "../../lib/mailer.js";
 import { createAuthTokenRecord, consumeAuthToken } from "../../lib/authTokenStore.js";
 import { auditLog } from "../../lib/auditLogger.js";
 import { buildAuthResponse } from "../../lib/authResponse.js";
-import { UserStatus, PermModule, PermAction } from "@prisma/client";
-import type { Prisma, Permission as PermissionRow } from "@prisma/client";
+import { ensureGlobalPermissions, ensureSystemRoles, ensureSystemDefaults, ensureEmailBranding } from "../../lib/initTenantDefaults.js";
+import { UserStatus } from "@prisma/client";
+import type { Prisma } from "@prisma/client";
 
 // ✅ Unificamos reset token/link en un solo lugar
 import { signResetToken, buildResetLink, verifyResetToken } from "../../lib/authTokens.js";
@@ -162,10 +163,8 @@ export async function register(req: Request, res: Response) {
   const email = s(data.email).toLowerCase();
   const hashed = await bcrypt.hash(String(data.password ?? ""), 10);
 
-  const ALL_MODULES = Object.values(PermModule);
-  const ALL_ACTIONS = Object.values(PermAction);
-
   try {
+    // timeout: 30s — el registro crea ~150 registros de defaults en una sola TX
     const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
 
       // 1️⃣ Crear Jewelry
@@ -195,71 +194,28 @@ export async function register(req: Request, res: Response) {
         },
       });
 
-      // 3️⃣ Crear permisos base
-      const permissionsData: { module: PermModule; action: PermAction }[] = [];
-      for (const module of ALL_MODULES)
-        for (const action of ALL_ACTIONS)
-          permissionsData.push({ module, action });
-
-      await tx.permission.createMany({ data: permissionsData, skipDuplicates: true });
-
-      const allPermissions: PermissionRow[] = await tx.permission.findMany();
-      const permIdByKey = new Map<string, string>();
-      for (const p of allPermissions)
-        permIdByKey.set(`${p.module}:${p.action}`, p.id);
-
-      const pick = (modules: PermModule[], actions: PermAction[]) => {
-        const ids: string[] = [];
-        for (const m of modules)
-          for (const a of actions) {
-            const id = permIdByKey.get(`${m}:${a}`);
-            if (id) ids.push(id);
-          }
-        return ids;
-      };
-
-      const rolesToCreate = [
-        { name: "OWNER", isSystem: true, permIds: allPermissions.map((p) => p.id) },
-        { name: "ADMIN", isSystem: true, permIds: pick(ALL_MODULES as PermModule[], ALL_ACTIONS as PermAction[]) },
-        {
-          name: "STAFF",
-          isSystem: true,
-          permIds: pick(ALL_MODULES as PermModule[], [
-            PermAction.VIEW,
-            PermAction.CREATE,
-            PermAction.EDIT,
-          ]),
-        },
-        { name: "READONLY", isSystem: true, permIds: pick(ALL_MODULES as PermModule[], [PermAction.VIEW]) },
-      ] as const;
-
-      let ownerRoleId = "";
-      for (const r of rolesToCreate) {
-        const role = await tx.role.create({
-          data: {
-            name: r.name,
-            jewelryId: jewelry.id,
-            isSystem: r.isSystem,
-          },
-        });
-
-        if (r.name === "OWNER") ownerRoleId = role.id;
-
-        await tx.rolePermission.createMany({
-          data: r.permIds.map((permissionId) => ({
-            roleId: role.id,
-            permissionId,
-          })),
-          skipDuplicates: true,
-        });
-      }
+      // 3️⃣ Crear permisos base, roles y defaults del sistema
+      const permIdByKey = await ensureGlobalPermissions(tx);
+      const { ownerRoleId } = await ensureSystemRoles(tx, jewelry.id, permIdByKey);
+      await ensureSystemDefaults(tx, jewelry.id);
+      await ensureEmailBranding(tx, jewelry, email);
 
       // 4️⃣ Crear usuario OWNER con almacén favorito
       const user = await tx.user.create({
         data: {
           email,
           password: hashed,
-          name: `${s(data.firstName)} ${s(data.lastName)}`.trim(),
+          firstName: s(data.firstName),
+          lastName: s(data.lastName),
+          name: `${s(data.firstName)} ${s(data.lastName)}`.trim() || null,
+          phoneCountry: s(data.phoneCountry),
+          phoneNumber: s(data.phoneNumber),
+          street: s(data.street),
+          number: s(data.number),
+          city: s(data.city),
+          province: s(data.province),
+          postalCode: s(data.postalCode),
+          country: s(data.country),
           status: UserStatus.ACTIVE,
           jewelryId: jewelry.id,
           tokenVersion: 0,
@@ -277,7 +233,7 @@ export async function register(req: Request, res: Response) {
       });
 
       return { user: fullUser, jewelry };
-    });
+    }, { timeout: 30_000 });
 
     const token = signToken(
       result.user.id,
@@ -315,10 +271,18 @@ export async function register(req: Request, res: Response) {
       }
     }
 
+    // Log detallado para diagnóstico — incluye el mensaje real del error
+    console.error("[register] Error inesperado:", {
+      message: e?.message,
+      code:    e?.code,
+      meta:    e?.meta,
+      stack:   e?.stack?.split("\n").slice(0, 6).join(" | "),
+    });
+
     auditLog(req, {
       action: "auth.register",
       success: false,
-      meta: { email, reason: "unknown_error" },
+      meta: { email, reason: "unknown_error", errorMessage: e?.message },
     });
 
     return res.status(500).json({ message: "No se pudo registrar." });

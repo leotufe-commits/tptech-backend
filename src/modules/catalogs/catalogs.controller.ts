@@ -42,6 +42,11 @@ const ALLOWED_TYPES = new Set<CatalogType>([
   "CITY",
   "PROVINCE",
   "COUNTRY",
+  "PAYMENT_TERM",
+  "ARTICLE_BRAND",
+  "ARTICLE_MANUFACTURER",
+  "UNIT_OF_MEASURE",
+  "MULTIPLIER_BASE",
 ]);
 
 function parseType(raw: any): CatalogType | null {
@@ -96,14 +101,16 @@ export async function listCatalog(req: Request, res: Response) {
       where: {
         jewelryId: tenantId,
         type,
+        deletedAt: null,
         ...(includeInactive ? {} : { isActive: true }),
       },
-      orderBy: [{ isFavorite: "desc" }, { sortOrder: "asc" }, { label: "asc" }],
+      orderBy: [{ sortOrder: "asc" }, { label: "asc" }],
       select: {
         id: true,
         type: true,
         label: true,
         isActive: true,
+        isSystem: true,
         sortOrder: true,
         isFavorite: true,
         createdAt: true,
@@ -156,6 +163,81 @@ export async function createCatalogItem(req: Request, res: Response) {
 
   const sortOrder = Number.isFinite(Number(body.sortOrder)) ? Math.trunc(Number(body.sortOrder)) : 0;
 
+  const ITEM_SELECT = {
+    id: true,
+    type: true,
+    label: true,
+    isActive: true,
+    isSystem: true,
+    sortOrder: true,
+    isFavorite: true,
+    createdAt: true,
+    updatedAt: true,
+  };
+
+  // 1. Duplicado activo (case-insensitive) → rechazar con 409
+  const existingActive = await catalog.findFirst({
+    where: {
+      jewelryId: tenantId,
+      type,
+      label: { equals: label, mode: "insensitive" },
+      deletedAt: null,
+    },
+    select: { id: true },
+  });
+
+  if (existingActive) {
+    auditLog(req, {
+      action: "company.catalogs.create",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { type, label, reason: "duplicate_active" },
+    });
+    return res.status(409).json({ message: "Ya existe un ítem con ese nombre en este catálogo." });
+  }
+
+  // 2. Soft-deleted (case-insensitive) → restaurar automáticamente
+  const softDeleted = await catalog.findFirst({
+    where: {
+      jewelryId: tenantId,
+      type,
+      label: { equals: label, mode: "insensitive" },
+      deletedAt: { not: null },
+    },
+    select: { id: true },
+  });
+
+  if (softDeleted) {
+    try {
+      const restored = await catalog.update({
+        where: { id: softDeleted.id },
+        data: { deletedAt: null, isActive: true, sortOrder, label },
+        select: ITEM_SELECT,
+      });
+
+      auditLog(req, {
+        action: "company.catalogs.create",
+        success: true,
+        userId: actorId,
+        tenantId,
+        meta: { type, label, sortOrder, created: true, restored: true },
+      });
+
+      return res.status(200).json({ item: restored, created: true, restored: true });
+    } catch (e: any) {
+      auditLog(req, {
+        action: "company.catalogs.create",
+        success: false,
+        userId: actorId,
+        tenantId,
+        meta: { type, label, error: String(e?.message ?? e) },
+      });
+      return res.status(500).json({ message: "No se pudo restaurar el ítem." });
+    }
+  }
+
+  // 3. Crear nuevo
   try {
     const created = await catalog.create({
       data: {
@@ -165,16 +247,7 @@ export async function createCatalogItem(req: Request, res: Response) {
         sortOrder,
         isActive: true,
       },
-      select: {
-        id: true,
-        type: true,
-        label: true,
-        isActive: true,
-        sortOrder: true,
-        isFavorite: true,
-        createdAt: true,
-        updatedAt: true,
-      },
+      select: ITEM_SELECT,
     });
 
     auditLog(req, {
@@ -187,34 +260,6 @@ export async function createCatalogItem(req: Request, res: Response) {
 
     return res.status(201).json({ item: created, created: true });
   } catch (e: any) {
-    if (isPrismaUniqueViolation(e)) {
-      try {
-        const existing = await catalog.findFirst({
-          where: { jewelryId: tenantId, type, label },
-          select: {
-            id: true,
-            type: true,
-            label: true,
-            isActive: true,
-            sortOrder: true,
-            isFavorite: true,
-            createdAt: true,
-            updatedAt: true,
-          },
-        });
-
-        auditLog(req, {
-          action: "company.catalogs.create",
-          success: true,
-          userId: actorId,
-          tenantId,
-          meta: { type, label, sortOrder, created: false, reason: "already_exists" },
-        });
-
-        if (existing) return res.status(200).json({ item: existing, created: false });
-      } catch {}
-    }
-
     auditLog(req, {
       action: "company.catalogs.create",
       success: false,
@@ -223,7 +268,7 @@ export async function createCatalogItem(req: Request, res: Response) {
       meta: { type, label, error: String(e?.message ?? e) },
     });
 
-    return res.status(400).json({ message: "No se pudo crear. Verificá que no exista un item con el mismo nombre." });
+    return res.status(500).json({ message: "No se pudo crear el ítem." });
   }
 }
 
@@ -448,5 +493,164 @@ export async function setCatalogItemFavorite(req: Request, res: Response) {
     });
 
     return res.status(500).json({ message: "Error actualizando favorito." });
+  }
+}
+
+/* =========================
+   HELPER — ¿Está el label en uso en otras entidades del tenant?
+   Devuelve un mensaje de error si está en uso, null si está libre.
+   La búsqueda es por coincidencia exacta de string (el label se guarda denormalizado).
+========================= */
+async function checkCatalogItemInUse(
+  tenantId: string,
+  type: CatalogType,
+  label: string
+): Promise<string | null> {
+  const db = prisma as any;
+
+  try {
+    switch (type) {
+      case "IVA_CONDITION": {
+        const [jewelry, entities] = await Promise.all([
+          db.jewelry.findFirst({ where: { id: tenantId, ivaCondition: label }, select: { id: true } }),
+          db.commercialEntity?.count({ where: { jewelryId: tenantId, ivaCondition: label, deletedAt: null } }) ?? 0,
+        ]);
+        if (jewelry || entities > 0)
+          return "No se puede eliminar porque está siendo usado en datos fiscales.";
+        return null;
+      }
+
+      case "PHONE_PREFIX": {
+        const [jewelry, users, warehouses] = await Promise.all([
+          db.jewelry.findFirst({ where: { id: tenantId, phoneCountry: label }, select: { id: true } }),
+          db.user.count({ where: { jewelryId: tenantId, phoneCountry: label, deletedAt: null } }),
+          db.warehouse.count({ where: { jewelryId: tenantId, phoneCountry: label, deletedAt: null } }),
+        ]);
+        if (jewelry || users > 0 || warehouses > 0)
+          return "No se puede eliminar porque está siendo usado en prefijos telefónicos.";
+        return null;
+      }
+
+      case "DOCUMENT_TYPE": {
+        const [users, sellers, entities] = await Promise.all([
+          db.user.count({ where: { jewelryId: tenantId, documentType: label, deletedAt: null } }),
+          db.seller.count({ where: { jewelryId: tenantId, documentType: label, deletedAt: null } }),
+          db.commercialEntity?.count({ where: { jewelryId: tenantId, documentType: label, deletedAt: null } }) ?? 0,
+        ]);
+        if (users > 0 || sellers > 0 || entities > 0)
+          return "No se puede eliminar porque está siendo usado en tipos de documento.";
+        return null;
+      }
+
+      case "COUNTRY": {
+        const [jewelry, users, warehouses, carriers, sellers, addresses] = await Promise.all([
+          db.jewelry.findFirst({ where: { id: tenantId, country: label }, select: { id: true } }),
+          db.user.count({ where: { jewelryId: tenantId, country: label, deletedAt: null } }),
+          db.warehouse.count({ where: { jewelryId: tenantId, country: label, deletedAt: null } }),
+          db.shippingCarrier.count({ where: { jewelryId: tenantId, country: label, deletedAt: null } }),
+          db.seller.count({ where: { jewelryId: tenantId, country: label, deletedAt: null } }),
+          db.entityAddress?.count({ where: { jewelryId: tenantId, country: label, deletedAt: null } }) ?? 0,
+        ]);
+        if (jewelry || users > 0 || warehouses > 0 || carriers > 0 || sellers > 0 || addresses > 0)
+          return "No se puede eliminar porque está siendo usado en direcciones.";
+        return null;
+      }
+
+      case "PROVINCE": {
+        const [jewelry, users, warehouses, carriers, sellers, addresses, rates] = await Promise.all([
+          db.jewelry.findFirst({ where: { id: tenantId, province: label }, select: { id: true } }),
+          db.user.count({ where: { jewelryId: tenantId, province: label, deletedAt: null } }),
+          db.warehouse.count({ where: { jewelryId: tenantId, province: label, deletedAt: null } }),
+          db.shippingCarrier.count({ where: { jewelryId: tenantId, province: label, deletedAt: null } }),
+          db.seller.count({ where: { jewelryId: tenantId, province: label, deletedAt: null } }),
+          db.entityAddress?.count({ where: { jewelryId: tenantId, province: label, deletedAt: null } }) ?? 0,
+          db.shippingRate?.count({ where: { jewelryId: tenantId, province: label } }) ?? 0,
+        ]);
+        if (jewelry || users > 0 || warehouses > 0 || carriers > 0 || sellers > 0 || addresses > 0 || rates > 0)
+          return "No se puede eliminar porque está siendo usado en provincias/estados.";
+        return null;
+      }
+
+      case "CITY": {
+        const [jewelry, users, warehouses, carriers, sellers, addresses] = await Promise.all([
+          db.jewelry.findFirst({ where: { id: tenantId, city: label }, select: { id: true } }),
+          db.user.count({ where: { jewelryId: tenantId, city: label, deletedAt: null } }),
+          db.warehouse.count({ where: { jewelryId: tenantId, city: label, deletedAt: null } }),
+          db.shippingCarrier.count({ where: { jewelryId: tenantId, city: label, deletedAt: null } }),
+          db.seller.count({ where: { jewelryId: tenantId, city: label, deletedAt: null } }),
+          db.entityAddress?.count({ where: { jewelryId: tenantId, city: label, deletedAt: null } }) ?? 0,
+        ]);
+        if (jewelry || users > 0 || warehouses > 0 || carriers > 0 || sellers > 0 || addresses > 0)
+          return "No se puede eliminar porque está siendo usado en ciudades.";
+        return null;
+      }
+
+      default:
+        return null;
+    }
+  } catch {
+    // Si algún modelo no está disponible aún en el cliente Prisma, no bloquear
+    return null;
+  }
+}
+
+/* =========================
+   DELETE /company/catalogs/item/:id
+========================= */
+export async function deleteCatalogItem(req: Request, res: Response) {
+  const tenantId = requireTenantId(req, res);
+  if (!tenantId) return;
+
+  const catalog = requireCatalogDelegate(res);
+  if (!catalog) return;
+
+  const actorId = (req as any).userId as string | undefined;
+
+  const id = String((req.params as any).id ?? "").trim();
+  if (!id) return res.status(400).json({ message: "id inválido." });
+
+  const existing = await catalog.findFirst({
+    where: { id, jewelryId: tenantId, deletedAt: null },
+    select: { id: true, type: true, label: true },
+  });
+
+  if (!existing) return res.status(404).json({ message: "Ítem no encontrado." });
+
+  const inUseMessage = await checkCatalogItemInUse(tenantId, existing.type, existing.label);
+  if (inUseMessage) {
+    auditLog(req, {
+      action: "company.catalogs.delete",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { id, type: existing.type, label: existing.label, reason: "in_use" },
+    });
+    return res.status(409).json({ message: inUseMessage });
+  }
+
+  try {
+    await catalog.update({
+      where: { id },
+      data: { deletedAt: new Date(), isActive: false },
+    });
+
+    auditLog(req, {
+      action: "company.catalogs.delete",
+      success: true,
+      userId: actorId,
+      tenantId,
+      meta: { id, type: existing.type, label: existing.label },
+    });
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    auditLog(req, {
+      action: "company.catalogs.delete",
+      success: false,
+      userId: actorId,
+      tenantId,
+      meta: { id, error: String(e?.message ?? e) },
+    });
+    return res.status(500).json({ message: "No se pudo eliminar el ítem." });
   }
 }

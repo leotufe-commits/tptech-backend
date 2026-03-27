@@ -7,6 +7,7 @@ import {
   bulkCreateCatalogItems,
   updateCatalogItem,
   setCatalogItemFavorite,
+  deleteCatalogItem,
 } from "./catalogs.controller.js";
 
 const router = Router();
@@ -20,5 +21,6 @@ router.post("/:type", createCatalogItem);
 router.post("/:type/bulk", bulkCreateCatalogItems);
 router.patch("/item/:id", updateCatalogItem);
 router.patch("/item/:id/favorite", setCatalogItemFavorite);
+router.delete("/item/:id", deleteCatalogItem);
 
 export default router;

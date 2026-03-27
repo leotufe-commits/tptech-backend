@@ -14,7 +14,7 @@ const PM_SELECT = {
   id: true, jewelryId: true, name: true, code: true, type: true,
   customTypeLabel: true,
   adjustmentType: true, adjustmentValue: true,
-  isFavorite: true, isActive: true, sortOrder: true, notes: true,
+  isFavorite: true, isActive: true, isSystem: true, sortOrder: true, notes: true,
   deletedAt: true, createdAt: true, updatedAt: true,
   installmentPlans: {
     where: { isActive: true },
@@ -161,7 +161,6 @@ export async function deletePaymentMethod(id: string, jewelryId: string) {
   const pm = await prisma.paymentMethod.findFirst({ where: { id, jewelryId, deletedAt: null }, select: { id: true, isFavorite: true } });
   assert(pm, "Medio de pago no encontrado.");
   if (pm.isFavorite) {
-    // unset favorite before deleting
     await prisma.paymentMethod.updateMany({ where: { jewelryId, deletedAt: null }, data: { isFavorite: false } });
   }
   return prisma.paymentMethod.update({ where: { id }, data: { deletedAt: new Date(), isActive: false }, select: { id: true } });

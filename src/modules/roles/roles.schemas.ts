@@ -27,6 +27,8 @@ export const createRoleSchema = z.object({
 export const updateRoleSchema = z
   .object({
     name: roleNameSchema.optional(),
+    /** Nombre visible para el usuario (puede dejarse vacío para usar el name técnico) */
+    displayName: z.string().trim().max(60, "El nombre visible es muy largo.").optional(),
   })
   .refine((v) => Object.keys(v).length > 0, {
     message: "No hay campos para actualizar.",
@@ -42,4 +44,6 @@ export const updateRolePermissionsSchema = z.object({
 
 export type CreateRoleInput = z.infer<typeof createRoleSchema>;
 export type UpdateRoleInput = z.infer<typeof updateRoleSchema>;
+// Re-exported for service typing
+export type UpdateRoleData = { name?: string; displayName?: string };
 export type UpdateRolePermissionsInput = z.infer<typeof updateRolePermissionsSchema>;

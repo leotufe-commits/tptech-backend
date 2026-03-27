@@ -28,6 +28,12 @@ import priceListsRoutes from "../modules/price-lists/price-lists.routes.js";
 import attributeDefsRoutes from "../modules/attribute-defs/attribute-defs.routes.js";
 import commercialEntitiesRoutes from "../modules/commercial-entities/commercial-entities.routes.js";
 import articlesRoutes from "../modules/articles/articles.routes.js";
+import articleMovementsRoutes from "../modules/article-movements/article-movements.routes.js";
+import salesRoutes from "../modules/sales/sales.routes.js";
+import promotionsRoutes from "../modules/promotions/promotions.routes.js";
+import quantityDiscountsRoutes from "../modules/quantity-discounts/quantity-discounts.routes.js";
+import labelTemplatesRouter  from "../modules/label-templates/label-templates.routes.js";
+import printerProfilesRouter from "../modules/printer-profiles/printer-profiles.routes.js";
 
 /* =====================
    ✅ DASHBOARD
@@ -63,6 +69,12 @@ router.use("/price-lists", requireAuth, priceListsRoutes);
 router.use("/attribute-defs", requireAuth, attributeDefsRoutes);
 router.use("/commercial-entities", requireAuth, commercialEntitiesRoutes);
 router.use("/articles", requireAuth, articlesRoutes);
+router.use("/article-movements", requireAuth, articleMovementsRoutes);
+router.use("/sales", requireAuth, salesRoutes);
+router.use("/promotions", requireAuth, promotionsRoutes);
+router.use("/quantity-discounts", requireAuth, quantityDiscountsRoutes);
+router.use("/label-templates",  labelTemplatesRouter);
+router.use("/printer-profiles", printerProfilesRouter);
 
 /**
  * Catalogs
