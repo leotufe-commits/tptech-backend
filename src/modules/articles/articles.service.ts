@@ -2904,8 +2904,8 @@ export async function computePurchaseTaxes(
       taxId:           t.id,
       name:            t.name,
       calculationType: t.calculationType,
-      rate:            t.rate ?? null,
-      fixedAmount:     t.fixedAmount ?? null,
+      rate:            t.rate != null ? t.rate.toNumber() : null,
+      fixedAmount:     t.fixedAmount != null ? t.fixedAmount.toNumber() : null,
       taxAmount:       taxAmt.toNumber(),
     });
   }
