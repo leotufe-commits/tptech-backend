@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { asyncHandler } from "../../middlewares/asyncHandlers.js";
 import * as controller from "./commercial-entities.controller.js";
+import * as statementCtrl from "./account-statement.controller.js";
 import { uploadEntityAvatarMiddleware } from "../../middlewares/uploadEntityAvatar.js";
 import { uploadEntityAttachmentMiddleware } from "../../middlewares/uploadEntityAttachments.js";
 
@@ -97,5 +98,11 @@ router.delete("/:id/merma-overrides/:overrideId", asyncHandler(controller.remove
 router.get(   "/:id/relations",             asyncHandler(controller.listRelations));
 router.post(  "/:id/relations",             asyncHandler(controller.addRelation));
 router.delete("/:id/relations/:relationId", asyncHandler(controller.removeRelation));
+
+// ===========================================================================
+// Account Statement
+// ===========================================================================
+router.get( "/:id/account-statement",       asyncHandler(statementCtrl.getStatement));
+router.post("/:id/account-statement/email", asyncHandler(statementCtrl.emailStatement));
 
 export default router;

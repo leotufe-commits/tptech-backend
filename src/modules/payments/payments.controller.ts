@@ -39,3 +39,23 @@ export async function remove(req: any, res: Response) {
   assert(jewelryId, "Tenant inválido."); assert(id, "Id inválido.");
   return res.json(await service.deletePaymentMethod(id, jewelryId));
 }
+
+// Checkout preview — resuelve ajuste de pago + cuotas sobre un monto dado
+export async function checkoutPreview(req: any, res: Response) {
+  const jewelryId = req.user?.jewelryId;
+  assert(jewelryId, "Tenant inválido.");
+
+  const amount          = parseFloat(String(req.query.amount ?? "0")) || 0;
+  const paymentMethodId = s(req.query.paymentMethodId) || undefined;
+  const installmentsQty = parseInt(String(req.query.installmentsQty ?? "0"), 10) || 0;
+
+  assert(amount >= 0, "Monto inválido.");
+
+  const result = await service.getCheckoutPreview(jewelryId, amount, paymentMethodId, installmentsQty);
+  return res.json(result ?? {
+    baseAmount: amount,
+    paymentAdjustment: 0,
+    finalAmount: amount,
+    steps: [],
+  });
+}

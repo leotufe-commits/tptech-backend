@@ -47,6 +47,7 @@ const ALLOWED_TYPES = new Set<CatalogType>([
   "ARTICLE_MANUFACTURER",
   "UNIT_OF_MEASURE",
   "MULTIPLIER_BASE",
+  "WEIGHT_UNIT",
 ]);
 
 function parseType(raw: any): CatalogType | null {

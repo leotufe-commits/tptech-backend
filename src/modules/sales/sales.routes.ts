@@ -4,6 +4,7 @@ import * as controller from "./sales.controller.js";
 
 const router = Router();
 
+router.post("/preview", asyncHandler(controller.previewSale));
 router.get("/", asyncHandler(controller.list));
 router.post("/", asyncHandler(controller.create));
 router.get("/caja", asyncHandler(controller.cajaSummary));

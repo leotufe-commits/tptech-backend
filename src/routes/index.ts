@@ -34,6 +34,9 @@ import promotionsRoutes from "../modules/promotions/promotions.routes.js";
 import quantityDiscountsRoutes from "../modules/quantity-discounts/quantity-discounts.routes.js";
 import labelTemplatesRouter  from "../modules/label-templates/label-templates.routes.js";
 import printerProfilesRouter from "../modules/printer-profiles/printer-profiles.routes.js";
+import purchasesRoutes from "../modules/purchases/purchases.routes.js";
+import crossSettlementsRoutes from "../modules/cross-settlements/cross-settlements.routes.js";
+import articleGroupsRoutes from "../modules/article-groups/article-groups.routes.js";
 
 /* =====================
    ✅ DASHBOARD
@@ -75,6 +78,9 @@ router.use("/promotions", requireAuth, promotionsRoutes);
 router.use("/quantity-discounts", requireAuth, quantityDiscountsRoutes);
 router.use("/label-templates",  labelTemplatesRouter);
 router.use("/printer-profiles", printerProfilesRouter);
+router.use("/purchases", requireAuth, purchasesRoutes);
+router.use("/cross-settlements", requireAuth, crossSettlementsRoutes);
+router.use("/article-groups", requireAuth, articleGroupsRoutes);
 
 /**
  * Catalogs

@@ -70,6 +70,31 @@ export async function setVariantAttributeValues(
   await assertVariantAccess(variantId, articleId, jewelryId);
   assert(Array.isArray(values), "values debe ser un array.");
 
+  // Validar que todos los ejes activos de la categoría estén cubiertos con valor no vacío.
+  // Solo aplica si el artículo tiene categoría con ejes de variante configurados.
+  const articleForAxes = await prisma.article.findFirst({
+    where:  { id: articleId, jewelryId, deletedAt: null },
+    select: { categoryId: true },
+  });
+  if (articleForAxes?.categoryId) {
+    const requiredAxes = await prisma.articleCategoryAttribute.findMany({
+      where: { categoryId: articleForAxes.categoryId, isVariantAxis: true, deletedAt: null },
+      select: { id: true, definition: { select: { name: true } } },
+    });
+    if (requiredAxes.length > 0) {
+      const provided = new Set(
+        values.filter(v => s(v.value) !== "").map(v => s(v.assignmentId))
+      );
+      const missing = requiredAxes.filter(ax => !provided.has(ax.id));
+      if (missing.length > 0) {
+        const names = missing.map(ax => ax.definition?.name ?? ax.id).join(", ");
+        const err: any = new Error(`La variante debe completar todos los ejes: ${names}`);
+        err.status = 400;
+        throw err;
+      }
+    }
+  }
+
   if (values.length === 0) {
     // Nada que guardar; devolver estado actual
     return getVariantAttributeValues(articleId, variantId, jewelryId);

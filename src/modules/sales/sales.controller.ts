@@ -49,7 +49,18 @@ export async function confirm(req: any, res: Response) {
   assert(req.user?.jewelryId, "Tenant inválido.");
   assert(id, "Id inválido.");
   const userId = s(req.userId || req.user?.id || "");
-  return res.json(await service.confirmSale(id, req.user.jewelryId, userId));
+  try {
+    return res.json(await service.confirmSale(id, req.user.jewelryId, userId));
+  } catch (e: any) {
+    if (e.status === 422 && e.blockingAlerts) {
+      return res.status(422).json({
+        ok: false,
+        message: e.message,
+        blockingAlerts: e.blockingAlerts as string[],
+      });
+    }
+    throw e;
+  }
 }
 
 export async function addPayment(req: any, res: Response) {
@@ -72,4 +83,19 @@ export async function cancel(req: any, res: Response) {
   const userId = s(req.userId || req.user?.id || "");
   const note = s(req.body?.note ?? req.body?.cancelNote ?? "");
   return res.json(await service.cancelSale(id, req.user.jewelryId, userId, note));
+}
+
+// Preview — calcula precios + checkout sin crear la venta
+export async function previewSale(req: any, res: Response) {
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  const { lines, clientId, paymentMethodId, installmentsQty } = req.body ?? {};
+  assert(Array.isArray(lines) && lines.length > 0, "lines[] requerido.");
+  return res.json(
+    await service.previewSale(req.user.jewelryId, {
+      lines,
+      clientId:        clientId        ?? null,
+      paymentMethodId: paymentMethodId ?? null,
+      installmentsQty: parseInt(String(installmentsQty ?? "0"), 10) || 0,
+    }),
+  );
 }

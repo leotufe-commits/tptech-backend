@@ -6,8 +6,10 @@
 import { PermModule, PermAction } from "@prisma/client";
 import type { Prisma } from "@prisma/client";
 
-// Precio de referencia del Oro en moneda base (ARS / gramo)
-const ORO_REF_VALUE = 250_000;
+// Precios de referencia iniciales en moneda base (ARS / gramo)
+const ORO_REF_VALUE     = 250_000;
+const PLATA_REF_VALUE   =   1_800;
+const PLATINO_REF_VALUE = 230_000;
 
 const ALL_MODULES = Object.values(PermModule) as PermModule[];
 const ALL_ACTIONS = Object.values(PermAction) as PermAction[];
@@ -200,12 +202,23 @@ async function ensureJewelryAttributes(
     name: "Color de Gemas",
     inputType: "SELECT",
     options: [
-      { label: "Sin gema", codeExtension: "" },
-      { label: "Blanca",   codeExtension: "B" },
-      { label: "Roja",     codeExtension: "R" },
-      { label: "Azul",     codeExtension: "A" },
-      { label: "Verde",    codeExtension: "V" },
-      { label: "Negra",    codeExtension: "N" },
+      { label: "Cubic Zirconia", codeExtension: "CZ" },
+      { label: "Zafiro",         codeExtension: "ZF" },
+      { label: "Esmeralda",      codeExtension: "ES" },
+      { label: "Rubi",           codeExtension: "RB" },
+    ],
+  });
+
+  const ATTR_LARGO = await ensureAttributeDef(db, jewelryId, {
+    code: "LARGO",
+    name: "Largo",
+    inputType: "SELECT",
+    options: [
+      { label: "40 cm.", codeExtension: "40" },
+      { label: "45 cm.", codeExtension: "45" },
+      { label: "50 cm.", codeExtension: "50" },
+      { label: "55 cm.", codeExtension: "55" },
+      { label: "60 cm.", codeExtension: "60" },
     ],
   });
 
@@ -219,6 +232,11 @@ async function ensureJewelryAttributes(
   // COLOR_GEMAS → solo "Anillos con piedras"
   if (categoryIds["Anillos con piedras"]) {
     await ensureAttributeAssignment(db, jewelryId, categoryIds["Anillos con piedras"], ATTR_COLOR_GEMAS, 0, false);
+  }
+
+  // LARGO → Cadenas (se hereda a subcategorías)
+  if (categoryIds["Cadenas"]) {
+    await ensureAttributeAssignment(db, jewelryId, categoryIds["Cadenas"], ATTR_LARGO, 1, true);
   }
 }
 
@@ -270,26 +288,28 @@ async function ensureCurrencies(db: any, jewelryId: string): Promise<string> {
 }
 
 /**
- * Creates the "Oro" metal with its 4 standard variants.
- * Also seeds MetalRefValueHistory, MetalVariantValueHistory and MetalQuote
- * (base-currency snapshot) for each variant — same data the UI expects.
- *
- * baseCurrencyId: id of the ARS Currency row (must exist beforehand).
- * Idempotent: skips metal if (jewelryId, name) exists; skips variants by sku.
+ * Crea un metal con sus variantes para el tenant.
+ * También inicializa MetalRefValueHistory, MetalVariantValueHistory y MetalQuote en moneda base.
+ * Idempotente: omite el metal si ya existe (jewelryId, name); omite variantes por sku.
  */
 async function ensureMetalWithVariants(
   db: any,
   jewelryId: string,
-  baseCurrencyId: string
+  baseCurrencyId: string,
+  config: {
+    name: string;
+    symbol: string;
+    referenceValue: number;
+    sortOrder: number;
+    variants: { name: string; sku: string; purity: number; saleFactor: number }[];
+  }
 ): Promise<void> {
   const now = new Date();
-  const refValue = String(ORO_REF_VALUE); // Prisma Decimal acepta string
+  const refValue = String(config.referenceValue);
 
-  // ── Metal "Oro" ──────────────────────────────────────────────────────────
   // Buscar sin filtrar deletedAt: @@unique([jewelryId, name]) no incluye deletedAt.
-  // deleteMetal() libera el nombre (freedName), así que un metal borrado no matcheará "Oro".
   const existingMetal = await db.metal.findFirst({
-    where: { jewelryId, name: "Oro" },
+    where: { jewelryId, name: config.name },
     select: { id: true },
   });
 
@@ -300,79 +320,65 @@ async function ensureMetalWithVariants(
     const metal = await db.metal.create({
       data: {
         jewelryId,
-        name: "Oro",
-        symbol: "AU",
+        name:           config.name,
+        symbol:         config.symbol,
         referenceValue: refValue,
-        sortOrder: 1,
-        isActive: true,
+        sortOrder:      config.sortOrder,
+        isActive:       true,
       },
       select: { id: true },
     });
     metalId = metal.id;
 
-    // Historial inicial del metal padre
     await db.metalRefValueHistory.create({
       data: { jewelryId, metalId, referenceValue: refValue, effectiveAt: now },
     });
   }
 
-  // ── Variantes ────────────────────────────────────────────────────────────
   // finalSalePrice = referenceValue × purity × saleFactor (redondeado a 2 dec)
-  const VARIANTS: { name: string; sku: string; purity: number; saleFactor: number }[] = [
-    { name: "Oro 24 Kilates",        sku: "AU24K", purity: 1.0,    saleFactor: 1.0  },
-    { name: "Oro 22 Kilates",        sku: "AU22K", purity: 0.9,    saleFactor: 1.0  },
-    { name: "Oro 18 Kilates",        sku: "AU18K", purity: 0.825,  saleFactor: 1.0  },
-    { name: "Chafalonia 18 Kilates", sku: "CH18K", purity: 0.7,    saleFactor: 0.95 },
-  ];
-
-  for (const v of VARIANTS) {
-    // Buscar sin filtrar deletedAt: @@unique([metalId, sku]) no incluye deletedAt.
-    // Si la variante fue soft-deleted y su sku fue liberado (freedSku), no matcheará → se crea.
-    // Si existe activa → skip.
+  for (const v of config.variants) {
     const existingVariant = await db.metalVariant.findFirst({
       where: { metalId, sku: v.sku },
       select: { id: true },
     });
     if (existingVariant) continue;
 
-    const finalSaleRaw = ORO_REF_VALUE * v.purity * v.saleFactor;
-    const finalSale = String(Math.round(finalSaleRaw * 100) / 100);
-    const purityStr = String(v.purity);
+    const finalSaleRaw = config.referenceValue * v.purity * v.saleFactor;
+    const finalSale    = String(Math.round(finalSaleRaw * 100) / 100);
+    const purityStr    = String(v.purity);
     const saleFactorStr = String(v.saleFactor);
 
     const variant = await db.metalVariant.create({
       data: {
         metalId,
-        name: v.name,
-        sku: v.sku,
-        purity: purityStr,
+        name:       v.name,
+        sku:        v.sku,
+        purity:     purityStr,
         saleFactor: saleFactorStr,
-        isActive: true,
+        isActive:   true,
         isFavorite: false,
       },
       select: { id: true },
     });
 
-    // Historial de valor de variante
     await db.metalVariantValueHistory.create({
       data: {
         jewelryId,
         metalId,
-        variantId: variant.id,
+        variantId:      variant.id,
         referenceValue: refValue,
-        purity: purityStr,
-        saleFactor: saleFactorStr,
+        purity:         purityStr,
+        saleFactor:     saleFactorStr,
         finalSalePrice: finalSale,
-        effectiveAt: now,
+        effectiveAt:    now,
       },
     });
 
-    // Cotización en moneda base (ARS)
     await db.metalQuote.create({
       data: {
-        variantId: variant.id,
+        variantId:  variant.id,
         currencyId: baseCurrencyId,
-        price: finalSale,
+        price:      finalSale,
         effectiveAt: now,
       },
     });
@@ -481,8 +487,10 @@ export async function ensureSystemRoles(
  * Currencies:
  *   ARS (base), USD (rate 1500), EUR (rate 1800)
  *
- * Metal:
- *   Oro (AU, referenceValue 250000 ARS/g) + 4 variantes (AU24K, AU22K, AU18K, CH18K)
+ * Metales:
+ *   Oro     (AU, referenceValue 250.000 ARS/g) — AU24K, AU22K, AU18K, CH18K
+ *   Plata   (AG, referenceValue   1.800 ARS/g) — AG100, AG950
+ *   Platino (PT, referenceValue 230.000 ARS/g) — PT1000, PT950
  *   Cada variante genera MetalVariantValueHistory + MetalQuote en ARS.
  *
  * PriceLists:
@@ -507,20 +515,20 @@ export async function ensureSystemDefaults(
   type CatalogType = "IVA_CONDITION" | "DOCUMENT_TYPE" | "PHONE_PREFIX" | "COUNTRY" | "PROVINCE" | "CITY"
     | "PAYMENT_TERM" | "ARTICLE_BRAND" | "ARTICLE_MANUFACTURER" | "UNIT_OF_MEASURE" | "MULTIPLIER_BASE";
 
-  const catalogDefaults: { type: CatalogType; label: string }[] = [
+  const catalogDefaults: { type: CatalogType; label: string; isFavorite?: boolean }[] = [
     // Tipos de documento
-    { type: "DOCUMENT_TYPE", label: "DNI"  },
+    { type: "DOCUMENT_TYPE", label: "DNI",  isFavorite: true },
     { type: "DOCUMENT_TYPE", label: "CUIT" },
     { type: "DOCUMENT_TYPE", label: "CUIL" },
 
     // Condición IVA
-    { type: "IVA_CONDITION", label: "Responsable Inscripto" },
+    { type: "IVA_CONDITION", label: "Responsable Inscripto", isFavorite: true },
     { type: "IVA_CONDITION", label: "Monotributo"           },
     { type: "IVA_CONDITION", label: "Consumidor Final"      },
     { type: "IVA_CONDITION", label: "Exento"                },
 
     // Prefijos telefónicos (10 países de referencia)
-    { type: "PHONE_PREFIX", label: "AR +54"  }, // Argentina
+    { type: "PHONE_PREFIX", label: "AR +54",  isFavorite: true }, // Argentina
     { type: "PHONE_PREFIX", label: "UY +598" }, // Uruguay
     { type: "PHONE_PREFIX", label: "CL +56"  }, // Chile
     { type: "PHONE_PREFIX", label: "BR +55"  }, // Brasil
@@ -532,7 +540,7 @@ export async function ensureSystemDefaults(
     { type: "PHONE_PREFIX", label: "IT +39"  }, // Italia
 
     // Países
-    { type: "COUNTRY", label: "Argentina"      },
+    { type: "COUNTRY", label: "Argentina",      isFavorite: true },
     { type: "COUNTRY", label: "Uruguay"        },
     { type: "COUNTRY", label: "Chile"          },
     { type: "COUNTRY", label: "Brasil"         },
@@ -544,7 +552,7 @@ export async function ensureSystemDefaults(
     { type: "COUNTRY", label: "Italia"         },
 
     // Provincias argentinas
-    { type: "PROVINCE", label: "Buenos Aires"                  },
+    { type: "PROVINCE", label: "Buenos Aires",         isFavorite: true },
     { type: "PROVINCE", label: "Catamarca"                     },
     { type: "PROVINCE", label: "Chaco"                         },
     { type: "PROVINCE", label: "Chubut"                        },
@@ -569,7 +577,7 @@ export async function ensureSystemDefaults(
     { type: "PROVINCE", label: "Tucumán"                       },
 
     // Ciudades principales
-    { type: "CITY", label: "Ciudad Autónoma de Buenos Aires" },
+    { type: "CITY", label: "Ciudad Autónoma de Buenos Aires", isFavorite: true },
     { type: "CITY", label: "La Plata"                        },
     { type: "CITY", label: "Mar del Plata"                   },
     { type: "CITY", label: "Córdoba"                         },
@@ -581,52 +589,48 @@ export async function ensureSystemDefaults(
     { type: "CITY", label: "San Carlos de Bariloche"         },
 
     // Términos de pago
-    { type: "PAYMENT_TERM", label: "Contado"       },
-    { type: "PAYMENT_TERM", label: "30 días"        },
-    { type: "PAYMENT_TERM", label: "60 días"        },
-    { type: "PAYMENT_TERM", label: "90 días"        },
-    { type: "PAYMENT_TERM", label: "15 días"        },
-    { type: "PAYMENT_TERM", label: "Anticipo 50%"   },
-    { type: "PAYMENT_TERM", label: "Anticipo 100%"  },
+    { type: "PAYMENT_TERM", label: "Contado",  isFavorite: true },
+    { type: "PAYMENT_TERM", label: "15 días"   },
+    { type: "PAYMENT_TERM", label: "30 días"   },
+    { type: "PAYMENT_TERM", label: "60 días"   },
+    { type: "PAYMENT_TERM", label: "90 días"   },
 
     // Marcas de artículos
-    { type: "ARTICLE_BRAND", label: "Genérica"  },
+    { type: "ARTICLE_BRAND", label: "Genérica",  isFavorite: true },
     { type: "ARTICLE_BRAND", label: "Sin marca" },
 
     // Fabricantes
-    { type: "ARTICLE_MANUFACTURER", label: "Fabricación propia" },
-    { type: "ARTICLE_MANUFACTURER", label: "Tercero"            },
+    { type: "ARTICLE_MANUFACTURER", label: "Fabricación propia", isFavorite: true },
+    { type: "ARTICLE_MANUFACTURER", label: "Tercero"             },
+    { type: "ARTICLE_MANUFACTURER", label: "Tuport - TPT"        },
 
     // Unidades de medida
-    { type: "UNIT_OF_MEASURE", label: "UND" },
-    { type: "UNIT_OF_MEASURE", label: "GR"  },
-    { type: "UNIT_OF_MEASURE", label: "KG"  },
-    { type: "UNIT_OF_MEASURE", label: "MT"  },
-    { type: "UNIT_OF_MEASURE", label: "PAR" },
+    { type: "UNIT_OF_MEASURE", label: "Milimetros (mm)", isFavorite: true },
+    { type: "UNIT_OF_MEASURE", label: "Centimetros (cm)" },
+    { type: "UNIT_OF_MEASURE", label: "Metro (M)"        },
 
     // Bases del multiplicador de costo
-    { type: "MULTIPLIER_BASE", label: "Gramos"  },
+    { type: "MULTIPLIER_BASE", label: "Gramos",  isFavorite: true },
     { type: "MULTIPLIER_BASE", label: "Kilates" },
-    { type: "MULTIPLIER_BASE", label: "Piezas"  },
   ];
 
   // Un solo batch insert en lugar de N upserts individuales — mucho más rápido dentro de TX
   await anyDb.catalogItem.createMany({
     data: catalogDefaults.map((item) => ({
       jewelryId,
-      type:      item.type,
-      label:     item.label,
-      isSystem:  true,
-      isActive:  true,
-      sortOrder: 0,
+      type:       item.type,
+      label:      item.label,
+      isFavorite: item.isFavorite ?? false,
+      isSystem:   true,
+      isActive:   true,
+      sortOrder:  0,
     })),
     skipDuplicates: true,
   });
 
   // ── Taxes ────────────────────────────────────────────────────────────────
   const taxDefaults = [
-    { name: "IVA 21%",   code: "IVA21",  rate: "21",   applyOn: "TOTAL" as const },
-    { name: "IVA 10.5%", code: "IVA105", rate: "10.5", applyOn: "TOTAL" as const },
+    { name: "IVA 21%", code: "IVA21", rate: "21", applyOn: "TOTAL" as const, isFavorite: true },
   ];
 
   for (const t of taxDefaults) {
@@ -641,30 +645,81 @@ export async function ensureSystemDefaults(
           taxType: "IVA", calculationType: "PERCENTAGE",
           rate: t.rate, applyOn: t.applyOn,
           isSystem: true, isActive: true,
+          isFavorite: t.isFavorite ?? false,
         },
       });
     } else {
-      await db.tax.update({ where: { id: exists.id }, data: { isSystem: true } });
+      await db.tax.update({ where: { id: exists.id }, data: { isSystem: true, isFavorite: t.isFavorite ?? false } });
     }
   }
 
   // ── PaymentMethods ───────────────────────────────────────────────────────
-  const paymentDefaults = [
-    { name: "Efectivo",      code: "CASH",     type: "CASH"     as const },
-    { name: "Transferencia", code: "TRANSFER", type: "TRANSFER" as const },
+  const paymentDefaults: {
+    name: string;
+    code: string;
+    type: "CASH" | "TRANSFER" | "CREDIT_CARD" | "DEBIT_CARD" | "QR" | "OTHER";
+    isFavorite?: boolean;
+    adjustmentType?: "NONE" | "PERCENTAGE" | "FIXED_AMOUNT";
+    adjustmentValue?: string;
+    installments?: { installments: number; interestRate: string; sortOrder: number }[];
+  }[] = [
+    { name: "Efectivo",           code: "CASH",     type: "CASH",        isFavorite: true  },
+    { name: "Transferencia",      code: "TRANSFER", type: "TRANSFER"                       },
+    {
+      name: "Tarjeta de Crédito", code: "CREDIT",   type: "CREDIT_CARD",
+      adjustmentType: "PERCENTAGE", adjustmentValue: "2",
+      installments: [
+        { installments: 3, interestRate: "10", sortOrder: 0 },
+        { installments: 6, interestRate: "15", sortOrder: 1 },
+      ],
+    },
   ];
 
   for (const p of paymentDefaults) {
+    let pmId: string;
     const exists = await db.paymentMethod.findFirst({
       where: { jewelryId, code: p.code, deletedAt: null },
       select: { id: true },
     });
     if (!exists) {
-      await db.paymentMethod.create({
-        data: { jewelryId, name: p.name, code: p.code, type: p.type, isSystem: true, isActive: true },
+      const created = await db.paymentMethod.create({
+        data: {
+          jewelryId,
+          name:            p.name,
+          code:            p.code,
+          type:            p.type,
+          isFavorite:      p.isFavorite      ?? false,
+          adjustmentType:  p.adjustmentType  ?? "NONE",
+          adjustmentValue: p.adjustmentValue ?? null,
+          isSystem:        true,
+          isActive:        true,
+        },
+        select: { id: true },
       });
+      pmId = created.id;
     } else {
       await db.paymentMethod.update({ where: { id: exists.id }, data: { isSystem: true } });
+      pmId = exists.id;
+    }
+
+    // Cuotas: crear solo las que no existan aún
+    for (const plan of p.installments ?? []) {
+      const planExists = await anyDb.paymentInstallmentPlan.findFirst({
+        where: { paymentMethodId: pmId, installments: plan.installments },
+        select: { id: true },
+      });
+      if (!planExists) {
+        await anyDb.paymentInstallmentPlan.create({
+          data: {
+            jewelryId,
+            paymentMethodId: pmId,
+            installments:    plan.installments,
+            interestRate:    plan.interestRate,
+            sortOrder:       plan.sortOrder,
+            isActive:        true,
+          },
+        });
+      }
     }
   }
 
@@ -692,34 +747,39 @@ export async function ensureSystemDefaults(
   // Identificadas por code único por tenant (@@unique([jewelryId, code])).
   // Los valores numéricos (márgenes) se cargan desde el inicio para que sean
   // visibles y educativos al abrir la pantalla por primera vez.
-  const priceListDefaults = [
+  const priceListDefaults: {
+    code: string; name: string; description: string;
+    mode: "MARGIN_TOTAL" | "METAL_HECHURA" | "COST_PER_GRAM";
+    marginTotal?: string; marginMetal?: string; marginHechura?: string; costPerGram?: string;
+    roundingTarget?: string; roundingMode?: string; roundingDirection?: string; roundingApplyOn?: string;
+    isFavorite: boolean; sortOrder: number;
+  }[] = [
     {
-      code:          "MINORISTA",
-      name:          "Lista Minorista — Valor Unificado",
-      description:   "Precio de venta al público. Margen total del 150% sobre el costo base.",
-      mode:          "MARGIN_TOTAL" as const,
-      marginTotal:   "150",
-      isFavorite:    true,
-      sortOrder:     0,
+      code:             "MINORISTA",
+      name:             "Lista Minorista — Valor Unificado",
+      description:      "Precio de venta al público. Margen total del 85% sobre el costo base.",
+      mode:             "MARGIN_TOTAL",
+      marginTotal:      "85",
+      roundingTarget:   "FINAL_PRICE",
+      roundingMode:     "HUNDRED",
+      roundingDirection: "NEAREST",
+      roundingApplyOn:  "TOTAL",
+      isFavorite:       true,
+      sortOrder:        0,
     },
     {
-      code:          "MAYORISTA",
-      name:          "Lista Mayorista — Valor Desglosado",
-      description:   "Precio mayorista. 20% sobre el metal y 50% sobre la hechura.",
-      mode:          "METAL_HECHURA" as const,
-      marginMetal:   "20",
-      marginHechura: "50",
-      isFavorite:    false,
-      sortOrder:     1,
-    },
-    {
-      code:          "COSTO-GRAMO",
-      name:          "Lista Costo por Gramo",
-      description:   "Precio fijo por gramo de metal. El porcentaje equivale aproximadamente a un margen del 120%.",
-      mode:          "COST_PER_GRAM" as const,
-      costPerGram:   "120",
-      isFavorite:    false,
-      sortOrder:     2,
+      code:             "MAYORISTA",
+      name:             "Lista Mayorista — Valor Desglosado",
+      description:      "Precio mayorista. 10% sobre el metal y 50% sobre la hechura.",
+      mode:             "METAL_HECHURA",
+      marginMetal:      "10",
+      marginHechura:    "50",
+      roundingTarget:   "METAL",
+      roundingMode:     "DECIMAL_1",
+      roundingDirection: "NEAREST",
+      roundingApplyOn:  "TOTAL",
+      isFavorite:       false,
+      sortOrder:        1,
     },
   ];
 
@@ -739,10 +799,14 @@ export async function ensureSystemDefaults(
         isFavorite:    pl.isFavorite,
         sortOrder:     pl.sortOrder,
         deletedAt:     null,
-        marginTotal:   "marginTotal"   in pl ? pl.marginTotal   : null,
-        marginMetal:   "marginMetal"   in pl ? pl.marginMetal   : null,
-        marginHechura: "marginHechura" in pl ? pl.marginHechura : null,
-        costPerGram:   "costPerGram"   in pl ? pl.costPerGram   : null,
+        marginTotal:      "marginTotal"   in pl ? pl.marginTotal   : null,
+        marginMetal:      "marginMetal"   in pl ? pl.marginMetal   : null,
+        marginHechura:    "marginHechura" in pl ? pl.marginHechura : null,
+        costPerGram:      "costPerGram"   in pl ? pl.costPerGram   : null,
+        roundingTarget:    (pl.roundingTarget   ?? "NONE")    as any,
+        roundingMode:      (pl.roundingMode     ?? "NONE")    as any,
+        roundingDirection: (pl.roundingDirection ?? "NEAREST") as any,
+        roundingApplyOn:   (pl.roundingApplyOn  ?? "TOTAL")   as any,
       },
       update: {
         // Solo restaurar si fue borrado; no tocar valores que el usuario haya modificado
@@ -759,8 +823,32 @@ export async function ensureSystemDefaults(
   const categoryIds = await ensureJewelryCategories(anyDb, jewelryId);
   await ensureJewelryAttributes(anyDb, jewelryId, categoryIds);
 
-  // ── Metal Oro + variantes ─────────────────────────────────────────────────
-  await ensureMetalWithVariants(anyDb, jewelryId, baseCurrencyId);
+  // ── Metales + variantes ───────────────────────────────────────────────────
+  await ensureMetalWithVariants(anyDb, jewelryId, baseCurrencyId, {
+    name: "Oro", symbol: "AU", referenceValue: ORO_REF_VALUE, sortOrder: 1,
+    variants: [
+      { name: "Oro 24 Kilates",        sku: "AU24K", purity: 1.0,   saleFactor: 1.0  },
+      { name: "Oro 22 Kilates",        sku: "AU22K", purity: 0.9,   saleFactor: 1.0  },
+      { name: "Oro 18 Kilates",        sku: "AU18K", purity: 0.825, saleFactor: 1.0  },
+      { name: "Chafalonia 18 Kilates", sku: "CH18K", purity: 0.7,   saleFactor: 0.95 },
+    ],
+  });
+
+  await ensureMetalWithVariants(anyDb, jewelryId, baseCurrencyId, {
+    name: "Plata", symbol: "AG", referenceValue: PLATA_REF_VALUE, sortOrder: 2,
+    variants: [
+      { name: "Plata - Granalla", sku: "AG100", purity: 1.0,  saleFactor: 1.0 },
+      { name: "Plata 950",        sku: "AG950", purity: 0.95, saleFactor: 1.0 },
+    ],
+  });
+
+  await ensureMetalWithVariants(anyDb, jewelryId, baseCurrencyId, {
+    name: "Platino", symbol: "PT", referenceValue: PLATINO_REF_VALUE, sortOrder: 3,
+    variants: [
+      { name: "Platino",      sku: "PT1000", purity: 1.0, saleFactor: 1.0 },
+      { name: "Platino 950",  sku: "PT950",  purity: 1.0, saleFactor: 1.2 },
+    ],
+  });
 
   // ── Entidades demo (solo si no hay ninguna) ────────────────────────────────
   await ensureDemoEntities(anyDb, jewelryId);

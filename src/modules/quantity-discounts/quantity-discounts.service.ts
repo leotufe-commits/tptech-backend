@@ -17,19 +17,24 @@ function validateTiers(tiers: any[]) {
 }
 
 const QD_SELECT = {
-  id:         true,
-  articleId:  true,
-  variantId:  true,
-  categoryId: true,
-  brand:      true,
-  isActive:   true,
-  sortOrder:  true,
-  deletedAt:  true,
-  createdAt:  true,
-  updatedAt:  true,
+  id:             true,
+  articleId:      true,
+  variantId:      true,
+  categoryId:     true,
+  brand:          true,
+  groupId:        true,
+  isActive:       true,
+  isStackable:    true,
+  evaluationMode: true,
+  applyOn:        true,
+  sortOrder:      true,
+  deletedAt:      true,
+  createdAt:      true,
+  updatedAt:      true,
   article:  { select: { id: true, code: true, name: true } },
   variant:  { select: { id: true, code: true, name: true } },
   category: { select: { id: true, name: true } },
+  group:    { select: { id: true, name: true } },
   tiers:    { select: { id: true, minQty: true, type: true, value: true }, orderBy: { minQty: "asc" as const } },
 } as const;
 
@@ -60,12 +65,16 @@ export async function createQuantityDiscount(jewelryId: string, data: any) {
   return prisma.quantityDiscount.create({
     data: {
       jewelryId,
-      articleId:  data.articleId  || null,
-      variantId:  data.variantId  || null,
-      categoryId: data.categoryId || null,
-      brand:      data.brand      || null,
-      isActive:   data.isActive !== false,
-      sortOrder:  Number(data.sortOrder ?? 0),
+      articleId:      data.articleId      || null,
+      variantId:      data.variantId      || null,
+      categoryId:     data.categoryId     || null,
+      brand:          data.brand          || null,
+      groupId:        data.groupId        || null,
+      isActive:       data.isActive !== false,
+      isStackable:    data.isStackable !== false,
+      evaluationMode: data.evaluationMode || "LINE",
+      applyOn:        data.applyOn        || "TOTAL",
+      sortOrder:      Number(data.sortOrder ?? 0),
       tiers: {
         create: (data.tiers as any[]).map((t: any) => ({
           minQty: t.minQty,
@@ -93,8 +102,12 @@ export async function updateQuantityDiscount(id: string, jewelryId: string, data
       ...(data.variantId  !== undefined ? { variantId:  data.variantId  || null } : {}),
       ...(data.categoryId !== undefined ? { categoryId: data.categoryId || null } : {}),
       ...(data.brand      !== undefined ? { brand:      data.brand      || null } : {}),
-      ...(data.isActive   !== undefined ? { isActive:   !!data.isActive }         : {}),
-      ...(data.sortOrder  !== undefined ? { sortOrder:  Number(data.sortOrder) }  : {}),
+      ...(data.groupId    !== undefined ? { groupId:    data.groupId    || null } : {}),
+      ...(data.isActive       !== undefined ? { isActive:       !!data.isActive }              : {}),
+      ...(data.isStackable    !== undefined ? { isStackable:    !!data.isStackable }           : {}),
+      ...(data.evaluationMode !== undefined ? { evaluationMode: data.evaluationMode || "LINE" } : {}),
+      ...(data.applyOn        !== undefined ? { applyOn:        data.applyOn        || "TOTAL" } : {}),
+      ...(data.sortOrder      !== undefined ? { sortOrder:      Number(data.sortOrder) }       : {}),
       ...(data.tiers !== undefined ? {
         tiers: {
           deleteMany: {},

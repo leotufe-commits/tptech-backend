@@ -9,7 +9,10 @@
     "seed": "tsx prisma/seed.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate:deploy": "prisma migrate deploy",
-    "prisma:migrate:dev": "prisma migrate dev"
+    "prisma:migrate:dev": "prisma migrate dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "prisma": {
     "schema": "prisma/schema.prisma",
@@ -41,7 +44,9 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.0.0",
     "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.2",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.2"
   }
 }

@@ -5,6 +5,10 @@ import * as variantAttrService from "./article-variant-attributes.service.js";
 import { toPublicUploadUrl } from "../../lib/uploads/localUploads.js";
 import type { Request } from "express";
 import { resolveSalePrice } from "../../lib/sale-pricing.utils.js";
+import { resolveFinalSalePrice } from "../../lib/pricing-engine/pricing-engine.js";
+import { getCheckoutPreview } from "../payments/payments.service.js";
+// ↑ resolveSalePrice: endpoint legacy /sale-price (string-based output para compat frontend)
+// ↑ resolveFinalSalePrice: endpoint /pricing-preview (Decimal nativo, steps completos)
 
 function s(v: any) { return String(v ?? "").trim(); }
 function assert(cond: any, msg: string) { if (!cond) { const e: any = new Error(msg); e.status = 400; throw e; } }
@@ -30,6 +34,11 @@ export async function list(req: any, res: Response) {
     preferredSupplierId: s(req.query.preferredSupplierId) || undefined,
     isFavorite: req.query.isFavorite === "true" ? true : undefined,
     showInActive: req.query.showInActive === "true" || req.query.showInactive === "true",
+    groupId:  s(req.query.groupId)  || undefined,
+    brand:    s(req.query.brand)    || undefined,
+    hasVariants: req.query.hasVariants === "true" ? true : undefined,
+    sortKey: s(req.query.sortKey) || undefined,
+    sortDir: s(req.query.sortDir) === "desc" ? "desc" : undefined,
     ...(page > 0 ? { page, pageSize } : { skip, take: pageSize }),
   }));
 }
@@ -206,7 +215,7 @@ export async function setVariantAttributeValues(req: any, res: Response) {
   const variantId = s(req.params?.variantId);
   assert(req.user?.jewelryId, "Tenant inválido.");
   assert(id && variantId, "Ids inválidos.");
-  const values = req.body?.values ?? req.body;
+  const values = Array.isArray(req.body) ? req.body : (req.body?.values ?? []);
   assert(Array.isArray(values), "Se esperaba { values: [...] } o un array.");
   return res.json(await variantAttrService.setVariantAttributeValues(id, variantId, req.user.jewelryId, values));
 }
@@ -407,3 +416,109 @@ export async function getSalePrice(req: any, res: Response) {
   return res.json(result);
 }
 
+
+// ===========================================================================
+// Pricing preview — devuelve pasos detallados del motor de precios
+// ===========================================================================
+
+/** Convierte cualquier Prisma.Decimal en string dentro de un objeto meta. */
+function serializeMeta(meta?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!meta) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (v == null)                                    out[k] = v;
+    else if (typeof v === "object" && "toFixed" in v) out[k] = (v as any).toString();
+    else                                              out[k] = v;
+  }
+  return out;
+}
+
+export async function getPricingPreview(req: any, res: Response) {
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  const articleId = s(req.params?.id);
+  assert(articleId, "Id de artículo inválido.");
+
+  const clientId              = s(req.query.clientId)              || undefined;
+  const variantId             = s(req.query.variantId)             || null;
+  const quantity              = parseFloat(String(req.query.quantity ?? "1")) || 1;
+  const paymentMethodId       = s(req.query.paymentMethodId)       || undefined;
+  const installmentsQty       = parseInt(String(req.query.installmentsQty ?? "0"), 10) || 0;
+  const priceListIdOverride   = s(req.query.priceListId)           || null;
+  const quantityDiscountIds   = s(req.query.quantityDiscountIds)
+    ? s(req.query.quantityDiscountIds).split(",").map((id: string) => id.trim()).filter(Boolean)
+    : undefined;
+
+  const result = await resolveFinalSalePrice(req.user.jewelryId, {
+    articleId,
+    variantId,
+    clientId,
+    quantity,
+    priceListIdOverride,
+    quantityDiscountIds,
+  });
+
+  const fmt = (v: any) => v != null ? v.toFixed(4) : null;
+
+  // Impuestos de compra sobre el costo
+  const costTaxResult = await service.computePurchaseTaxes(
+    req.user.jewelryId,
+    articleId,
+    result.unitCost ?? null,
+  );
+
+  // Capa de checkout: aplica ajuste de pago sobre el total con impuestos × cantidad
+  // El pago siempre se calcula DESPUÉS de impuestos (totalWithTax), no sobre el precio neto.
+  let checkoutResult = null;
+  if (result.unitPrice != null && (paymentMethodId || installmentsQty >= 1)) {
+    const baseForPayment = result.totalWithTax ?? result.unitPrice;
+    const commercialAmount = baseForPayment.times(quantity).toNumber();
+    checkoutResult = await getCheckoutPreview(
+      req.user.jewelryId,
+      commercialAmount,
+      paymentMethodId,
+      installmentsQty,
+    );
+  }
+
+  return res.json({
+    unitPrice:               fmt(result.unitPrice),
+    basePrice:               fmt(result.basePrice),
+    quantityDiscountAmount:  fmt(result.quantityDiscountAmount),
+    promotionDiscountAmount: fmt(result.promotionDiscountAmount),
+    discountAmount:          result.discountAmount.gt(0) ? result.discountAmount.toFixed(4) : null,
+    priceSource:             result.priceSource,
+    baseSource:              result.baseSource,
+    appliedPriceListId:      result.appliedPriceListId,
+    appliedPriceListName:    result.appliedPriceListName,
+    appliedPromotionId:      result.appliedPromotionId,
+    appliedPromotionName:    result.appliedPromotionName,
+    appliedDiscountId:       result.appliedDiscountId,
+    marginPercent:           fmt(result.marginPercent),
+    unitCost:                fmt(result.unitCost),
+    unitMargin:              fmt(result.unitMargin),
+    costPartial:             result.costPartial,
+    costMode:                result.costMode,
+    partial:                 result.partial,
+    stackingMode:            result.stackingMode,
+    steps: result.steps.map(step => ({
+      key:     step.key,
+      label:   step.label,
+      status:  step.status,
+      value:   step.value != null ? step.value.toFixed(4) : null,
+      message: step.message,
+      meta:    serializeMeta(step.meta),
+    })),
+    alerts: result.alerts,
+    policy: result.policy,
+    checkoutResult,
+    metalHechuraBreakdown: result.metalHechuraBreakdown ?? null,
+    taxAmount:             fmt(result.taxAmount),
+    taxBreakdown:          result.taxBreakdown ?? [],
+    totalWithTax:          fmt(result.totalWithTax),
+    taxExemptByEntity:     result.taxExemptByEntity ?? false,
+    costBase:              costTaxResult.costBase,
+    costTaxAmount:         costTaxResult.costTaxAmount,
+    costWithTax:           costTaxResult.costWithTax,
+    costTaxBreakdown:      costTaxResult.costTaxBreakdown,
+  });
+}

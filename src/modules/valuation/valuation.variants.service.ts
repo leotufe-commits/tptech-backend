@@ -520,12 +520,25 @@ export async function deleteMetalVariant(jewelryId: string, variantId: string) {
     throw err;
   }
 
-  const quotesCount = await prisma.metalQuote.count({
+  // MetalQuote es historial de precios (onDelete: Cascade en schema) — no bloquea el borrado.
+  // Verificar relaciones que sí implican uso activo de la variante.
+  const movLineCount = await prisma.inventoryMovementLine.count({
     where: { variantId: v.id },
   });
-  if (quotesCount > 0) {
+  if (movLineCount > 0) {
     const err: any = new Error(
-      `No se puede eliminar la variante: tiene ${quotesCount} cotización(es).`
+      `No se puede eliminar la variante: está usada en ${movLineCount} línea(s) de movimiento de inventario.`
+    );
+    err.status = 409;
+    throw err;
+  }
+
+  const compositionCount = await prisma.articleMetalComposition.count({
+    where: { variantId: v.id },
+  });
+  if (compositionCount > 0) {
+    const err: any = new Error(
+      `No se puede eliminar la variante: está usada en ${compositionCount} composición(es) de artículo.`
     );
     err.status = 409;
     throw err;

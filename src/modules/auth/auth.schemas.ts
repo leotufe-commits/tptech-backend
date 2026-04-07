@@ -47,6 +47,8 @@ export const registerSchema = z.object({
 
   street: z.string().min(1),
   number: z.string().min(1),
+  floor: z.string().optional().default(""),
+  apartment: z.string().optional().default(""),
   city: z.string().min(1),
   province: z.string().min(1),
   postalCode: z.string().min(1),
@@ -99,6 +101,8 @@ export const updateJewelrySchema = z.object({
 
   street: z.string().optional(),
   number: z.string().optional(),
+  floor: z.string().optional(),
+  apartment: z.string().optional(),
   city: z.string().optional(),
   province: z.string().optional(),
   postalCode: z.string().optional(),

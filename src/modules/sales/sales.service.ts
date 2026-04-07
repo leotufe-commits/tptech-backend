@@ -1,6 +1,10 @@
 import { prisma } from "../../lib/prisma.js";
 import { Prisma } from "@prisma/client";
 import { computeCostPrice } from "../../lib/article-cost.utils.js";
+import { evaluatePricingPolicy, resolveFinalSalePrice, computeLineTaxes } from "../../lib/pricing-engine/pricing-engine.js";
+import type { CheckoutResult } from "../../lib/pricing-engine/pricing-engine.js";
+import { getCheckoutPreview } from "../payments/payments.service.js";
+import { buildBalanceBreakdownFromPrice } from "../../lib/pricing-engine/pricing-engine.balance.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function err(msg: string, status = 400): never {
@@ -102,6 +106,7 @@ const SALE_DETAIL_SELECT = {
       unitMargin: true,
       totalMargin: true,
       marginPercent: true,
+      breakdownSnapshot: true,
       sortOrder: true,
       article: { select: { id: true, code: true, name: true, mainImageUrl: true } },
       variant: { select: { id: true, code: true, name: true } },
@@ -427,7 +432,7 @@ export async function confirmSale(
       discountAmount: true,
       taxAmount: true,
       total: true,
-      client: { select: { id: true, displayName: true, code: true, documentType: true, documentNumber: true, ivaCondition: true } },
+      client: { select: { id: true, displayName: true, code: true, documentType: true, documentNumber: true, ivaCondition: true, balanceType: true, taxExempt: true, taxApplyOnOverride: true, taxOverrides: { where: { isActive: true }, select: { taxId: true, overrideMode: true, applyOn: true, isActive: true } } } },
       lines: {
         select: {
           id: true,
@@ -444,6 +449,21 @@ export async function confirmSale(
 
   if (!sale) err("Venta no encontrada.", 404);
   if (sale.status !== "DRAFT") err("La venta ya fue confirmada o anulada.");
+
+  // ── Política de precios — pre-check antes de tocar nada ──────────────────
+  const policyBlocks = await evaluatePricingPolicy(jewelryId, sale.lines.map(l => ({
+    articleId: l.articleId,
+    variantId: l.variantId ?? null,
+    unitPrice:  l.unitPrice,
+  })));
+
+  if (policyBlocks.length > 0) {
+    const allBlockingCodes = [...new Set(policyBlocks.flatMap(b => b.blockingAlerts))];
+    const e: any = new Error("La venta no puede confirmarse: hay artículos con alertas de política de precios.");
+    e.status = 422;
+    e.blockingAlerts = allBlockingCodes;
+    throw e;
+  }
 
   // Decrement stock if warehouseId is set — con pre-check para prevenir negativo
   if (sale.warehouseId) {
@@ -520,6 +540,7 @@ export async function confirmSale(
       hechuraPrice: true,
       hechuraPriceMode: true,
       mermaPercent: true,
+      manualTaxIds: true,
       category: { select: { mermaPercent: true } },
       costComposition: {
         select: { type: true, quantity: true, unitValue: true, currencyId: true, mermaPercent: true, metalVariantId: true },
@@ -531,36 +552,142 @@ export async function confirmSale(
   });
   const articleCostMap = new Map(articleCostData.map((a) => [a.id, a]));
 
-  // Compute and persist cost snapshot for each line (allow null — no blocking)
+  // Compute and persist cost + tax snapshot for each line (allow null — no blocking)
+  const lineTaxAmounts: number[] = [];
+
   await Promise.all(
     sale.lines.map(async (line) => {
       const artCost = articleCostMap.get(line.articleId);
-      if (!artCost) return; // article not found — skip, leave null
+      if (!artCost) { lineTaxAmounts.push(0); return; }
 
       const costResult = await computeCostPrice(jewelryId, artCost as any);
-      if (costResult.value == null) return; // partial/incomplete — leave null
 
-      const qty       = new Prisma.Decimal(line.quantity.toString());
+      // ── Impuestos por línea ──────────────────────────────────────────────
+      const clientTaxExempt          = (sale.client as any)?.taxExempt ?? false;
+      const clientTaxApplyOnOverride = (sale.client as any)?.taxApplyOnOverride ?? null;
+      const clientTaxOverrides       = (sale.client as any)?.taxOverrides ?? null;
+      const taxIds: string[] = clientTaxExempt ? [] : ((artCost as any).manualTaxIds ?? []);
+      const unitPriceDec = new Prisma.Decimal(line.unitPrice.toString());
+      const discPct      = parseFloat(line.discountPct.toString());
+      // Reconstruir precio base (antes de descuento) para applyOn=SUBTOTAL_BEFORE_DISCOUNT
+      const basePriceDec = discPct > 0
+        ? unitPriceDec.div(new Prisma.Decimal(String(1 - discPct / 100)))
+        : unitPriceDec;
+
+      const { taxBreakdown, taxAmount } = await computeLineTaxes(
+        jewelryId,
+        taxIds,
+        unitPriceDec,
+        basePriceDec,
+        null, // metalHechuraBreakdown no disponible en confirm — se estima desde costBreakdown
+        costResult.breakdown ?? null,
+        clientTaxApplyOnOverride,
+        clientTaxOverrides,
+      );
+
+      const lineTaxAmt = parseFloat(taxAmount.toString());
+      const qty        = parseFloat(line.quantity.toString());
+      lineTaxAmounts.push(lineTaxAmt * qty);
+
+      // ── Costo y margen ───────────────────────────────────────────────────
+      if (costResult.value == null) {
+        // Guardar solo impuestos si el costo no está disponible
+        if (lineTaxAmt > 0) {
+          await prisma.saleLine.update({
+            where: { id: line.id },
+            data: {
+              taxAmount:   taxAmount,
+              taxSnapshot: taxBreakdown.length > 0 ? (taxBreakdown as any) : Prisma.JsonNull,
+            } as any,
+          });
+        }
+        return;
+      }
+
+      const qtyDec    = new Prisma.Decimal(line.quantity.toString());
       const unitCost  = new Prisma.Decimal(costResult.value.toString());
-      const unitPrice = new Prisma.Decimal(line.unitPrice.toString());
       const lineTot   = new Prisma.Decimal(line.lineTotal.toString());
-      const totalCost = unitCost.mul(qty);
+      const totalCost     = unitCost.mul(qtyDec);
       const totalMargin   = lineTot.sub(totalCost);
-      const unitMargin    = unitPrice.sub(unitCost);
+      const unitMargin    = unitPriceDec.sub(unitCost);
       const marginPercent = lineTot.gt(0) ? totalMargin.div(lineTot).mul(100) : new Prisma.Decimal(0);
 
       await prisma.saleLine.update({
         where: { id: line.id },
         data: {
-          unitCost:      unitCost,
-          totalCost:     totalCost,
-          unitMargin:    unitMargin,
-          totalMargin:   totalMargin,
-          marginPercent: marginPercent,
+          unitCost:          unitCost,
+          totalCost:         totalCost,
+          unitMargin:        unitMargin,
+          totalMargin:       totalMargin,
+          marginPercent:     marginPercent,
+          breakdownSnapshot: costResult.breakdown ?? null,
+          taxAmount:         lineTaxAmt > 0 ? taxAmount : null,
+          taxSnapshot:       taxBreakdown.length > 0 ? (taxBreakdown as any) : Prisma.JsonNull,
         } as any,
       });
     })
   );
+
+  // ── Actualizar totales de impuestos en el comprobante ──────────────────────
+  const saleTaxTotal = lineTaxAmounts.reduce((s, v) => s + v, 0);
+  if (saleTaxTotal > 0) {
+    const subtotalNum      = parseFloat(sale.subtotal.toString());
+    const discountAmtNum   = parseFloat(sale.discountAmount.toString());
+    const newTotal = Math.round((subtotalNum - discountAmtNum + saleTaxTotal) * 100) / 100;
+    await prisma.sale.update({
+      where: { id },
+      data: {
+        taxAmount: Math.round(saleTaxTotal * 100) / 100,
+        total:     newTotal,
+      },
+    });
+  }
+
+  // ── Cuenta corriente: crear EntityBalanceEntry por línea ─────────────────
+  if (sale.clientId && sale.client) {
+    const clientBalanceType = (sale.client as any).balanceType as "UNIFIED" | "BREAKDOWN" ?? "UNIFIED";
+
+    // Re-fetch lines WITH breakdownSnapshot (computed in previous step)
+    const updatedLines = await prisma.saleLine.findMany({
+      where: { saleId: id },
+      select: { id: true, lineTotal: true, breakdownSnapshot: true },
+    });
+
+    const balanceEntryData = updatedLines.map((line) => {
+      const isBreakdown = clientBalanceType === "BREAKDOWN" && line.breakdownSnapshot != null;
+
+      if (isBreakdown) {
+        const bd = buildBalanceBreakdownFromPrice(line.breakdownSnapshot as any);
+        return {
+          entityId:          sale.clientId!,
+          jewelryId,
+          role:              "CLIENT" as const,
+          entryType:         "INVOICE" as const,
+          amount:            new Prisma.Decimal(0),     // metal no tiene equivalente dinerario directo
+          currency:          "BASE",
+          documentRef:       id,
+          createdBy:         userId ?? "",
+          breakdownSnapshot: bd as any,
+        };
+      } else {
+        return {
+          entityId:          sale.clientId!,
+          jewelryId,
+          role:              "CLIENT" as const,
+          entryType:         "INVOICE" as const,
+          amount:            new Prisma.Decimal(line.lineTotal.toString()),
+          currency:          "BASE",
+          documentRef:       id,
+          createdBy:         userId ?? "",
+          breakdownSnapshot: null,
+        };
+      }
+    });
+
+    if (balanceEntryData.length > 0) {
+      await prisma.entityBalanceEntry.createMany({ data: balanceEntryData as any });
+    }
+  }
 
   // Build client snapshot
   const clientSnapshot = sale.client
@@ -784,4 +911,142 @@ export async function cajaDaySummary(jewelryId: string, date: string) {
       paidAt: p.paidAt,
     })),
   };
+}
+
+// ─── Sale Preview ─────────────────────────────────────────────────────────────
+// Resuelve precios + checkout sin persistir nada.
+// Fuente única de verdad para el total en Ventas.
+
+export type SalePreviewLineInput = {
+  articleId: string;
+  variantId?: string | null;
+  quantity: number;
+};
+
+export type SalePreviewInput = {
+  lines: SalePreviewLineInput[];
+  clientId?: string | null;
+  paymentMethodId?: string | null;
+  installmentsQty?: number;
+};
+
+export type SalePreviewLine = {
+  articleId:            string;
+  variantId:            string | null;
+  quantity:             number;
+  unitPrice:            number | null;
+  lineSubtotal:         number | null;
+  priceSource:          string;
+  appliedPriceListId:   string | null;
+  appliedPriceListName: string | null;
+  appliedPromotionId:   string | null;
+  appliedPromotionName: string | null;
+  appliedDiscountId:    string | null;
+  unitCost:             number | null;
+  costPartial:          boolean;
+  costMode:             string;
+  policy: {
+    canConfirm:     boolean;
+    blockingAlerts: string[];
+  };
+};
+
+export type SalePreviewResult = {
+  lines:         SalePreviewLine[];
+  subtotal:      number;
+  checkoutResult: CheckoutResult | null;
+  total:         number;
+};
+
+export async function previewSale(
+  jewelryId: string,
+  input: SalePreviewInput,
+): Promise<SalePreviewResult> {
+  const { lines, clientId, paymentMethodId, installmentsQty = 0 } = input;
+
+  // ── Precalcular totales por categoría / marca / grupo ─────────────────────
+  // Se usan cuando un QuantityDiscount tiene evaluationMode CATEGORY_TOTAL,
+  // BRAND_TOTAL o GROUP_TOTAL: la cantidad efectiva es la suma de todas las
+  // líneas del comprobante que pertenecen al mismo alcance.
+  const articleIds = [...new Set(lines.map(l => l.articleId))];
+  const articleMeta = articleIds.length > 0
+    ? await prisma.article.findMany({
+        where: { id: { in: articleIds }, jewelryId, deletedAt: null },
+        select: { id: true, categoryId: true, brand: true, groupId: true },
+      })
+    : [];
+  const metaMap = new Map(articleMeta.map(a => [a.id, a]));
+
+  const categoryTotals = new Map<string, number>();
+  const brandTotals    = new Map<string, number>();
+  const groupTotals    = new Map<string, number>();
+  for (const line of lines) {
+    const m = metaMap.get(line.articleId);
+    if (!m) continue;
+    if (m.categoryId) categoryTotals.set(m.categoryId, (categoryTotals.get(m.categoryId) ?? 0) + line.quantity);
+    if (m.brand)      brandTotals.set(m.brand,          (brandTotals.get(m.brand)          ?? 0) + line.quantity);
+    if (m.groupId)    groupTotals.set(m.groupId,         (groupTotals.get(m.groupId)         ?? 0) + line.quantity);
+  }
+
+  const resolvedLines = await Promise.all(
+    lines.map(async (line): Promise<SalePreviewLine> => {
+      const m = metaMap.get(line.articleId);
+      const pricing = await resolveFinalSalePrice(jewelryId, {
+        articleId: line.articleId,
+        variantId: line.variantId ?? null,
+        clientId:  clientId ?? undefined,
+        quantity:  line.quantity,
+        categoryTotal: m?.categoryId ? categoryTotals.get(m.categoryId) : undefined,
+        brandTotal:    m?.brand      ? brandTotals.get(m.brand)         : undefined,
+        groupTotal:    m?.groupId    ? groupTotals.get(m.groupId)       : undefined,
+      });
+
+      const n2 = (v: any) =>
+        v != null && typeof v === "object" && "toNumber" in v
+          ? (v as any).toNumber()
+          : v != null ? parseFloat(String(v)) : null;
+
+      const unitPrice = n2(pricing.unitPrice);
+      const lineSubtotal =
+        unitPrice != null
+          ? Math.round(unitPrice * line.quantity * 100) / 100
+          : null;
+
+      return {
+        articleId:            line.articleId,
+        variantId:            line.variantId ?? null,
+        quantity:             line.quantity,
+        unitPrice,
+        lineSubtotal,
+        priceSource:          pricing.priceSource,
+        appliedPriceListId:   pricing.appliedPriceListId,
+        appliedPriceListName: pricing.appliedPriceListName,
+        appliedPromotionId:   pricing.appliedPromotionId,
+        appliedPromotionName: pricing.appliedPromotionName,
+        appliedDiscountId:    pricing.appliedDiscountId,
+        unitCost:             n2(pricing.unitCost),
+        costPartial:          pricing.costPartial,
+        costMode:             pricing.costMode,
+        policy:               pricing.policy,
+      };
+    }),
+  );
+
+  const subtotal = Math.round(
+    resolvedLines.reduce((s, l) => s + (l.lineSubtotal ?? 0), 0) * 100,
+  ) / 100;
+
+  const checkoutResult =
+    subtotal > 0 && (paymentMethodId || installmentsQty >= 1)
+      ? await getCheckoutPreview(
+          jewelryId,
+          subtotal,
+          paymentMethodId ?? undefined,
+          installmentsQty,
+        )
+      : null;
+
+  const total = checkoutResult ? checkoutResult.finalAmount : subtotal;
+
+  return { lines: resolvedLines, subtotal, checkoutResult, total };
 }

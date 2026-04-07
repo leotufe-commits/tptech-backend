@@ -87,6 +87,15 @@ async function getMyJewelry(req: Request) {
 }
 
 /* =========================================================
+   GET /company/me
+========================================================= */
+export async function getMyJewelryProfile(req: Request, res: Response) {
+  const fresh = await getMyJewelry(req);
+  if (!fresh) return res.status(404).json({ message: "Jewelry no encontrada." });
+  return res.json({ jewelry: { ...fresh.jewelry, attachments: fresh.attachments } });
+}
+
+/* =========================================================
    PATCH /company/me
 ========================================================= */
 export async function updateMyJewelry(req: Request, res: Response) {
@@ -118,6 +127,8 @@ export async function updateMyJewelry(req: Request, res: Response) {
       phoneNumber: data.phoneNumber ?? undefined,
       street: data.street ?? undefined,
       number: data.number ?? undefined,
+      floor: data.floor ?? undefined,
+      apartment: data.apartment ?? undefined,
       city: data.city ?? undefined,
       province: data.province ?? undefined,
       postalCode: data.postalCode ?? undefined,
@@ -137,6 +148,18 @@ export async function updateMyJewelry(req: Request, res: Response) {
       emailWebsite:          data.emailWebsite       ?? undefined,
       emailInstagram:        data.emailInstagram     ?? undefined,
       emailFooter:           data.emailFooter        ?? undefined,
+      // ────────────────────────────────────────────────────────────────────
+
+      // ── Política de alertas de precio ───────────────────────────────────
+      pricingLowMarginWarningPercent: "pricingLowMarginWarningPercent" in data
+        ? (data.pricingLowMarginWarningPercent != null ? data.pricingLowMarginWarningPercent : null)
+        : undefined,
+      pricingLowMarginBlockPercent: "pricingLowMarginBlockPercent" in data
+        ? (data.pricingLowMarginBlockPercent != null ? data.pricingLowMarginBlockPercent : null)
+        : undefined,
+      pricingBlockLossSale:            typeof data.pricingBlockLossSale            === "boolean" ? data.pricingBlockLossSale            : undefined,
+      pricingBlockZeroOrNegativePrice: typeof data.pricingBlockZeroOrNegativePrice === "boolean" ? data.pricingBlockZeroOrNegativePrice : undefined,
+      pricingBlockPartialData:         typeof data.pricingBlockPartialData         === "boolean" ? data.pricingBlockPartialData         : undefined,
       // ────────────────────────────────────────────────────────────────────
     },
   });

@@ -1,5 +1,7 @@
 import { prisma } from "../../lib/prisma.js";
 import type { PaymentMethodType, PaymentAdjustmentType } from "@prisma/client";
+import { resolveCheckoutPrice } from "../../lib/pricing-engine/pricing-engine.js";
+import type { CheckoutResult } from "../../lib/pricing-engine/pricing-engine.js";
 
 function s(v: any) { return String(v ?? "").trim(); }
 
@@ -164,6 +166,75 @@ export async function deletePaymentMethod(id: string, jewelryId: string) {
     await prisma.paymentMethod.updateMany({ where: { jewelryId, deletedAt: null }, data: { isFavorite: false } });
   }
   return prisma.paymentMethod.update({ where: { id }, data: { deletedAt: new Date(), isActive: false }, select: { id: true } });
+}
+
+// ---------------------------------------------------------------------------
+// Checkout preview — resuelve capa de pago sobre un monto dado
+// ---------------------------------------------------------------------------
+
+type PmForCheckout = {
+  name: string;
+  adjustmentType: string;
+  adjustmentValue: any;
+  installmentPlans: { installments: number; interestRate: any }[];
+};
+
+function buildCheckoutResult(
+  pm: PmForCheckout | null,
+  amount: number,
+  installmentsQty: number,
+): CheckoutResult {
+  let paymentMethod: { adjustmentType: "PERCENTAGE" | "FIXED"; adjustmentValue: number; name: string } | undefined;
+
+  if (pm) {
+    const plan = installmentsQty >= 1
+      ? pm.installmentPlans.find((p) => p.installments === installmentsQty)
+      : undefined;
+    const baseAdj  = pm.adjustmentType !== "NONE" ? parseFloat(pm.adjustmentValue ?? "0") || 0 : 0;
+    const planRate = plan ? parseFloat(plan.interestRate) || 0 : 0;
+
+    if (pm.adjustmentType === "PERCENTAGE" && (baseAdj + planRate) !== 0) {
+      paymentMethod = { adjustmentType: "PERCENTAGE", adjustmentValue: baseAdj + planRate, name: pm.name };
+    } else if (pm.adjustmentType === "FIXED_AMOUNT" && baseAdj !== 0) {
+      paymentMethod = { adjustmentType: "FIXED", adjustmentValue: baseAdj, name: pm.name };
+    } else if (planRate !== 0) {
+      paymentMethod = { adjustmentType: "PERCENTAGE", adjustmentValue: planRate, name: pm.name };
+    }
+  }
+
+  return resolveCheckoutPrice({
+    unitPrice: amount,
+    paymentMethod,
+    installments: installmentsQty >= 1 ? { quantity: installmentsQty } : undefined,
+  });
+}
+
+export async function getCheckoutPreview(
+  jewelryId: string,
+  amount: number,
+  paymentMethodId: string | undefined,
+  installmentsQty: number,
+): Promise<CheckoutResult | null> {
+  if (!paymentMethodId && installmentsQty < 1) return null;
+
+  let pm: PmForCheckout | null = null;
+  if (paymentMethodId) {
+    pm = await prisma.paymentMethod.findFirst({
+      where: { id: paymentMethodId, jewelryId, deletedAt: null, isActive: true },
+      select: {
+        name: true,
+        adjustmentType: true,
+        adjustmentValue: true,
+        installmentPlans: {
+          where: { isActive: true },
+          select: { installments: true, interestRate: true },
+        },
+      },
+    });
+    if (!pm) return null;
+  }
+
+  return buildCheckoutResult(pm, amount, installmentsQty);
 }
 
 async function generateCode(jewelryId: string, name: string): Promise<string> {

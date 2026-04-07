@@ -5,6 +5,7 @@ import type {
   RoundingTarget,
   RoundingMode,
   RoundingDirection,
+  RoundingApplyOn,
 } from "@prisma/client";
 
 function s(v: any) {
@@ -29,6 +30,7 @@ const VALID_MODES: PriceListMode[] = ["MARGIN_TOTAL", "METAL_HECHURA", "COST_PER
 const VALID_RT: RoundingTarget[] = ["NONE", "METAL", "FINAL_PRICE"];
 const VALID_RM: RoundingMode[] = ["NONE", "INTEGER", "DECIMAL_1", "DECIMAL_2", "TEN", "HUNDRED"];
 const VALID_RD: RoundingDirection[] = ["NEAREST", "UP", "DOWN"];
+const VALID_RAO: RoundingApplyOn[] = ["PRICE", "NET", "TOTAL"];
 
 const PL_SELECT = {
   id: true,
@@ -50,6 +52,7 @@ const PL_SELECT = {
   roundingTarget: true,
   roundingMode: true,
   roundingDirection: true,
+  roundingApplyOn: true,
   roundingValueMetal: true,
   roundingValueHechura: true,
   validFrom: true,
@@ -80,6 +83,10 @@ function parsePriceListData(data: any) {
     ? data.roundingDirection
     : "NEAREST") as RoundingDirection;
 
+  const roundingApplyOn = (VALID_RAO.includes(data?.roundingApplyOn)
+    ? data.roundingApplyOn
+    : "TOTAL") as RoundingApplyOn;
+
   if (roundingTarget === "NONE") {
     roundingMode = "NONE";
     roundingDirection = "NEAREST";
@@ -96,8 +103,20 @@ function parsePriceListData(data: any) {
     roundingTarget !== "NONE" ? toDecOrNull(data?.roundingValueHechura) : null;
 
   const marginTotal = mode === "MARGIN_TOTAL" ? toDecOrNull(data?.marginTotal) : null;
-  const marginMetal = mode === "METAL_HECHURA" ? toDecOrNull(data?.marginMetal) : null;
-  const marginHechura = mode === "METAL_HECHURA" ? toDecOrNull(data?.marginHechura) : null;
+  // MARGIN_TOTAL (unified mode): replicate the value into marginMetal/marginHechura so the
+  // pricing engine can treat it the same way as METAL_HECHURA internally.
+  const marginMetal =
+    mode === "METAL_HECHURA"
+      ? toDecOrNull(data?.marginMetal)
+      : mode === "MARGIN_TOTAL"
+      ? toDecOrNull(data?.marginTotal)
+      : null;
+  const marginHechura =
+    mode === "METAL_HECHURA"
+      ? toDecOrNull(data?.marginHechura)
+      : mode === "MARGIN_TOTAL"
+      ? toDecOrNull(data?.marginTotal)
+      : null;
   const costPerGram = mode === "COST_PER_GRAM" ? toDecOrNull(data?.costPerGram) : null;
 
   const validFrom = data?.validFrom ? new Date(data.validFrom) : null;
@@ -121,6 +140,7 @@ function parsePriceListData(data: any) {
     roundingTarget,
     roundingMode,
     roundingDirection,
+    roundingApplyOn,
     roundingValueMetal,
     roundingValueHechura,
     validFrom,
@@ -316,6 +336,7 @@ export async function clonePriceList(id: string, jewelryId: string) {
       roundingTarget: original.roundingTarget,
       roundingMode: original.roundingMode,
       roundingDirection: original.roundingDirection,
+      roundingApplyOn: original.roundingApplyOn,
       roundingValueMetal: original.roundingValueMetal ?? undefined,
       roundingValueHechura: original.roundingValueHechura ?? undefined,
       validFrom: original.validFrom,

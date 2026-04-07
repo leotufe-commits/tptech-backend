@@ -122,6 +122,8 @@ export async function listUsers(req: Request, res: Response) {
         phoneNumber: true,
         street: true,
         number: true,
+        floor: true,
+        apartment: true,
         city: true,
         province: true,
         postalCode: true,
@@ -173,6 +175,8 @@ export async function listUsers(req: Request, res: Response) {
       phoneNumber: u.phoneNumber,
       street: u.street,
       number: u.number,
+      floor: u.floor,
+      apartment: u.apartment,
       city: u.city,
       province: u.province,
       postalCode: u.postalCode,
@@ -217,6 +221,8 @@ export async function getUser(req: Request, res: Response) {
 
       street: true,
       number: true,
+      floor: true,
+      apartment: true,
       city: true,
       province: true,
       postalCode: true,
@@ -445,6 +451,8 @@ export async function updateUserProfile(req: Request, res: Response) {
 
     street?: string;
     number?: string;
+    floor?: string;
+    apartment?: string;
     city?: string;
     province?: string;
     postalCode?: string;
@@ -496,6 +504,8 @@ export async function updateUserProfile(req: Request, res: Response) {
 
   if ("street" in body) setOpt("street", body.street);
   if ("number" in body) setOpt("number", body.number);
+  if ("floor" in body) setOpt("floor", body.floor);
+  if ("apartment" in body) setOpt("apartment", body.apartment);
   if ("city" in body) setOpt("city", body.city);
   if ("province" in body) setOpt("province", body.province);
   if ("postalCode" in body) setOpt("postalCode", body.postalCode);
@@ -533,6 +543,8 @@ export async function updateUserProfile(req: Request, res: Response) {
 
       street: true,
       number: true,
+      floor: true,
+      apartment: true,
       city: true,
       province: true,
       postalCode: true,

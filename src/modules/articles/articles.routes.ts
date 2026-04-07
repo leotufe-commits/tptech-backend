@@ -26,7 +26,8 @@ router.get("/lookup", asyncHandler(controller.lookupByBarcode));
 router.get("/brands", asyncHandler(controller.listBrands));
 
 // Sale price resolution (antes de /:id para no colisionar)
-router.get("/:id/sale-price", asyncHandler(controller.getSalePrice));
+router.get("/:id/sale-price",       asyncHandler(controller.getSalePrice));
+router.get("/:id/pricing-preview",  asyncHandler(controller.getPricingPreview));
 
 // Import
 router.get("/import/template", asyncHandler(controller.getImportTemplate));

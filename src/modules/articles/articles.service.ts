@@ -235,6 +235,10 @@ async function resolveBarcode(opts: {
     // si customBarcode es null o "" → barcode = null (limpiar)
   }
 
+  // Normalizar: string vacío no es barcode válido → null
+  // (cubre el caso donde s(customBarcode) devuelve "" tras trim de espacios)
+  if (barcode === "") barcode = null;
+
   if (barcode) {
     validateBarcode(barcode, barcodeType);
     await assertBarcodeUnique(opts.jewelryId, barcode, opts.excludeArticleId, opts.excludeVariantId);
@@ -297,14 +301,27 @@ const ARTICLE_LIST_SELECT = {
   showInStore: true,
   unitOfMeasure: true,
   reorderPoint: true,
+  dimensionLength: true,
+  dimensionWidth: true,
+  dimensionHeight: true,
+  dimensionUnit: true,
+  weight: true,
+  weightUnit: true,
+  minSaleQuantity: true,
+  maxSaleQuantity: true,
+  defaultQuantity: true,
+  inventoryAccount: true,
   mainImageUrl: true,
   isFavorite: true,
   isActive: true,
   useManualSalePrice: true,
   createdAt: true,
   updatedAt: true,
+  groupId: true,
+  groupOrder: true,
   category:          { select: { id: true, name: true, mermaPercent: true } },
   preferredSupplier: { select: { id: true, code: true, displayName: true } },
+  group:             { select: { id: true, name: true, slug: true } },
   costComposition: {
     select: {
       type:           true,
@@ -315,6 +332,9 @@ const ARTICLE_LIST_SELECT = {
       mermaPercent:   true,
       metalVariantId: true,
       sortOrder:      true,
+      lineAdjKind:    true,
+      lineAdjType:    true,
+      lineAdjValue:   true,
       currency: {
         select: { id: true, code: true, symbol: true },
       },
@@ -391,14 +411,27 @@ const ARTICLE_DETAIL_SELECT = {
   showInStore: true,
   unitOfMeasure: true,
   reorderPoint: true,
+  dimensionLength: true,
+  dimensionWidth: true,
+  dimensionHeight: true,
+  dimensionUnit: true,
+  weight: true,
+  weightUnit: true,
+  minSaleQuantity: true,
+  maxSaleQuantity: true,
+  defaultQuantity: true,
+  inventoryAccount: true,
   mainImageUrl: true,
   isFavorite: true,
   isActive: true,
   notes: true,
   createdAt: true,
   updatedAt: true,
+  groupId: true,
+  groupOrder: true,
   category:          { select: { id: true, name: true, mermaPercent: true } },
   preferredSupplier: { select: { id: true, code: true, displayName: true } },
+  group:             { select: { id: true, name: true, slug: true } },
   compositions: {
     select: {
       id: true,
@@ -429,6 +462,8 @@ const ARTICLE_DETAIL_SELECT = {
       hechuraPriceOverride: true,
       priceOverride: true,
       costPrice: true,
+      reorderPoint: true,
+      openingStock: true,
       imageUrl: true,
       notes: true,
       isActive: true,
@@ -493,6 +528,9 @@ const ARTICLE_DETAIL_SELECT = {
       mermaPercent: true,
       catalogItemId: true,
       sortOrder: true,
+      lineAdjKind:  true,
+      lineAdjType:  true,
+      lineAdjValue: true,
       currency: { select: { id: true, code: true, symbol: true } },
       metalVariant: {
         select: {
@@ -521,6 +559,7 @@ const VARIANT_SELECT = {
   priceOverride: true,
   costPrice: true,
   reorderPoint: true,
+  openingStock: true,
   imageUrl: true,
   notes: true,
   isActive: true,
@@ -639,7 +678,10 @@ function computeArticleCostBase(
         const mermaFactor = new Prisma.Decimal(1).add(
           new Prisma.Decimal(line.mermaPercent?.toString() ?? "0").div(100)
         );
-        total = total.add(qty.mul(mermaFactor).mul(quote));
+        let lineCost = qty.mul(mermaFactor).mul(quote);
+        lineCost = applyAdj(lineCost, line.lineAdjKind, line.lineAdjType, line.lineAdjValue);
+        if (lineCost.lt(new Prisma.Decimal(0))) lineCost = new Prisma.Decimal(0);
+        total = total.add(lineCost);
       } else {
         const unitVal = new Prisma.Decimal(line.unitValue?.toString() ?? "0");
         let lineValue = qty.mul(unitVal);
@@ -648,6 +690,8 @@ function computeArticleCostBase(
           if (!rate) return null;
           lineValue = lineValue.mul(rate);
         }
+        lineValue = applyAdj(lineValue, line.lineAdjKind, line.lineAdjType, line.lineAdjValue);
+        if (lineValue.lt(new Prisma.Decimal(0))) lineValue = new Prisma.Decimal(0);
         total = total.add(lineValue);
       }
     }
@@ -657,8 +701,17 @@ function computeArticleCostBase(
   const mode: string = row.costCalculationMode ?? "MANUAL";
 
   if (mode === "MANUAL") {
-    // costPrice se persiste ya ajustado (draftToPayload envía computeManualFinalCost).
-    // No aplicar applyAdj para evitar doble ajuste.
+    if (row.manualBaseCost != null) {
+      // Nuevo flujo: manualBaseCost + ajuste global (igual que modoManual en pricing-engine.cost.ts)
+      let val = new Prisma.Decimal(row.manualBaseCost.toString());
+      if (row.manualCurrencyId && row.manualCurrencyId !== baseCurrencyId) {
+        const rate = rateMap.get(row.manualCurrencyId);
+        if (!rate) return null;
+        val = val.mul(rate);
+      }
+      return applyAdj(val, row.manualAdjustmentKind, row.manualAdjustmentType, row.manualAdjustmentValue);
+    }
+    // Fallback legacy: costPrice ya fue persistido como valor ajustado (draftToPayload).
     if (row.costPrice == null) return null;
     let val = new Prisma.Decimal(row.costPrice.toString());
     if (row.manualCurrencyId && row.manualCurrencyId !== baseCurrencyId) {
@@ -765,7 +818,8 @@ async function batchLoadStockSummary(
 // 3 queries paralelas al inicio, resto en memoria.
 // ===========================================================================
 type NoClientPriceResult = {
-  resolvedSalePrice:   string | null;
+  resolvedSalePrice:        string | null;
+  resolvedSalePriceWithTax: string | null;
   resolvedPriceSource: "PROMOTION" | "PRICE_LIST_CATEGORY" | "PRICE_LIST_GENERAL" | "MANUAL_OVERRIDE" | "MANUAL_FALLBACK" | "NONE";
   resolvedPriceName:   string | null;
 };
@@ -809,8 +863,14 @@ async function batchResolveSalePricesNoClient(
   const articleIds      = rows.map((r) => r.id);
   const uniqueCatIds    = [...new Set(rows.map((r: any) => r.categoryId).filter(Boolean) as string[])];
 
-  // ── 3 queries paralelas ──────────────────────────────────────────────────
-  const [promotions, categories, generalPL] = await Promise.all([
+  // Collect unique tax IDs for sale price tax calculation
+  const saleTaxIds = new Set<string>();
+  for (const row of rows) {
+    for (const tid of row.manualTaxIds ?? []) saleTaxIds.add(tid);
+  }
+
+  // ── queries paralelas ────────────────────────────────────────────────────
+  const [promotions, categories, generalPL, taxes] = await Promise.all([
     prisma.promotion.findMany({
       where: {
         jewelryId, isActive: true, deletedAt: null,
@@ -839,6 +899,12 @@ async function batchResolveSalePricesNoClient(
       select: PL_LIST_SELECT,
       orderBy: { sortOrder: "asc" },
     }),
+    saleTaxIds.size > 0
+      ? prisma.tax.findMany({
+          where: { id: { in: Array.from(saleTaxIds) }, deletedAt: null, appliesOnSale: true },
+          select: { id: true, rate: true, fixedAmount: true, calculationType: true },
+        })
+      : Promise.resolve([]),
   ]);
 
   // Indexar listas por categoría
@@ -850,9 +916,19 @@ async function batchResolveSalePricesNoClient(
 
   const validGeneralPL = generalPL && _isPLValidNow(generalPL as any) ? generalPL : null;
 
+  // Indexar impuestos
+  const taxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
+  for (const t of taxes) {
+    taxMap.set(t.id, {
+      rate:            new Prisma.Decimal((t.rate ?? 0).toString()),
+      fixedAmount:     new Prisma.Decimal((t.fixedAmount ?? 0).toString()),
+      calculationType: t.calculationType,
+    });
+  }
+
   // ── Resolver por artículo (en memoria) ───────────────────────────────────
   for (const row of rows) {
-    const none: NoClientPriceResult = { resolvedSalePrice: null, resolvedPriceSource: "NONE", resolvedPriceName: null };
+    const none: NoClientPriceResult = { resolvedSalePrice: null, resolvedSalePriceWithTax: null, resolvedPriceSource: "NONE", resolvedPriceName: null };
 
     // CostBreakdown mínimo: value + totalGrams (para COST_PER_GRAM)
     const costValue = row.computedCostBase != null ? new D(row.computedCostBase) : null;
@@ -930,10 +1006,16 @@ async function batchResolveSalePricesNoClient(
       finalName   = activePromo.name;
     }
 
+    const rowTaxIds = row.manualTaxIds ?? [];
+    const priceWithTax = rowTaxIds.length > 0
+      ? applyTaxes(finalPrice, rowTaxIds, taxMap)
+      : null;
+
     result.set(row.id, {
-      resolvedSalePrice:   finalPrice.toFixed(4),
-      resolvedPriceSource: finalSource,
-      resolvedPriceName:   finalName,
+      resolvedSalePrice:        finalPrice.toFixed(4),
+      resolvedSalePriceWithTax: priceWithTax != null ? priceWithTax.toFixed(4) : null,
+      resolvedPriceSource:      finalSource,
+      resolvedPriceName:        finalName,
     });
   }
 
@@ -1013,7 +1095,7 @@ async function batchComputeCosts(
   const taxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
   if (taxIds.size > 0) {
     const taxes = await prisma.tax.findMany({
-      where: { id: { in: Array.from(taxIds) }, deletedAt: null },
+      where: { id: { in: Array.from(taxIds) }, deletedAt: null, appliesOnPurchase: true, isRecoverable: false },
       select: { id: true, rate: true, fixedAmount: true, calculationType: true },
     });
     for (const t of taxes) {
@@ -1051,6 +1133,22 @@ async function batchComputeCosts(
 // ===========================================================================
 // List
 // ===========================================================================
+const ARTICLE_SORT_MAP: Record<string, (dir: "asc" | "desc") => object> = {
+  name:             (d) => ({ name: d }),
+  code:             (d) => ({ code: d }),
+  sku:              (d) => ({ sku: d }),
+  brand:            (d) => ({ brand: d }),
+  manufacturer:     (d) => ({ manufacturer: d }),
+  category:         (d) => ({ category: { name: d } }),
+  supplier:         (d) => ({ preferredSupplier: { displayName: d } }),
+  group:            (d) => ({ group: { name: d } }),
+  updatedAt:        (d) => ({ updatedAt: d }),
+  isReturnable:     (d) => ({ isReturnable: d }),
+  showInStore:      (d) => ({ showInStore: d }),
+  isFavorite:       (d) => ({ isFavorite: d }),
+  costMode:         (d) => ({ costCalculationMode: d }),
+};
+
 export async function listArticles(
   jewelryId: string,
   opts: {
@@ -1065,15 +1163,21 @@ export async function listArticles(
     barcode?: string;
     sku?: string;
     preferredSupplierId?: string;
+    groupId?: string;
+    brand?: string;
+    hasVariants?: boolean;
     skip?: number;
     take?: number;
     page?: number;
     pageSize?: number;
+    sortKey?: string;
+    sortDir?: "asc" | "desc";
   }
 ) {
   const {
     q, categoryId, articleType, status, stockMode, isFavorite,
     showInActive, showInStore, barcode, sku, preferredSupplierId,
+    groupId, brand, hasVariants,
   } = opts;
 
   // Soporte page/pageSize (prioridad) ó skip/take (legacy)
@@ -1093,6 +1197,9 @@ export async function listArticles(
   if (preferredSupplierId)  where.preferredSupplierId = preferredSupplierId;
   if (barcode)              where.barcode = barcode; // búsqueda exacta por barcode
   if (sku)                  where.sku = { contains: sku, mode: "insensitive" };
+  if (groupId)              where.groupId = groupId;
+  if (brand)                where.brand = { contains: brand, mode: "insensitive" };
+  if (hasVariants === true) where.variants = { some: { deletedAt: null } };
 
   if (q) {
     where.OR = [
@@ -1105,11 +1212,16 @@ export async function listArticles(
     ];
   }
 
+  const sortDir = opts.sortDir === "desc" ? "desc" : "asc";
+  const orderBy = (opts.sortKey && ARTICLE_SORT_MAP[opts.sortKey])
+    ? ARTICLE_SORT_MAP[opts.sortKey](sortDir)
+    : { name: "asc" };
+
   const [rows, total] = await Promise.all([
     prisma.article.findMany({
       where,
       select: ARTICLE_LIST_SELECT,
-      orderBy: { name: "asc" },
+      orderBy,
       skip,
       take,
     }),
@@ -1143,12 +1255,183 @@ export async function listArticles(
       : null;
     return {
       ...r,
-      resolvedSalePrice:   p?.resolvedSalePrice   ?? null,
-      resolvedPriceSource: p?.resolvedPriceSource  ?? "NONE",
-      resolvedPriceName:   p?.resolvedPriceName    ?? null,
+      resolvedSalePrice:        p?.resolvedSalePrice        ?? null,
+      resolvedSalePriceWithTax: p?.resolvedSalePriceWithTax ?? null,
+      resolvedPriceSource:      p?.resolvedPriceSource      ?? "NONE",
+      resolvedPriceName:        p?.resolvedPriceName        ?? null,
       stockData: stockEntry,
     };
   });
+
+  // Enriquecer variantes con precios/costos con impuestos
+  const allTaxIds = new Set<string>();
+  for (const r of enrichedRows) {
+    for (const tid of ((r as any).manualTaxIds ?? []) as string[]) allTaxIds.add(tid);
+  }
+  if (allTaxIds.size > 0) {
+    const taxRecords = await prisma.tax.findMany({
+      where: { id: { in: [...allTaxIds] }, deletedAt: null },
+      select: {
+        id: true, rate: true, fixedAmount: true,
+        calculationType: true, appliesOnSale: true,
+        appliesOnPurchase: true, isRecoverable: true,
+      },
+    });
+    const saleTaxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
+    const costTaxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
+    for (const t of taxRecords) {
+      const entry = {
+        rate:        new Prisma.Decimal(t.rate?.toString()        ?? "0"),
+        fixedAmount: new Prisma.Decimal(t.fixedAmount?.toString() ?? "0"),
+        calculationType: t.calculationType,
+      };
+      if (t.appliesOnSale) saleTaxMap.set(t.id, entry);
+      if (t.appliesOnPurchase && !t.isRecoverable) costTaxMap.set(t.id, entry);
+    }
+    for (const row of enrichedRows as any[]) {
+      if (!row.variants?.length) continue;
+      const taxIds: string[] = row.manualTaxIds ?? [];
+      if (taxIds.length === 0) continue;
+      row.variants = row.variants.map((vv: any) => ({
+        ...vv,
+        priceOverrideWithTax: vv.priceOverride != null
+          ? applyTaxes(new Prisma.Decimal(vv.priceOverride.toString()), taxIds, saleTaxMap).toFixed(4)
+          : null,
+        costPriceWithTax: vv.costPrice != null
+          ? applyTaxes(new Prisma.Decimal(vv.costPrice.toString()), taxIds, costTaxMap).toFixed(4)
+          : null,
+      }));
+    }
+  }
+
+  // ── Indicadores de beneficios: promociones activas y descuentos por cantidad ──
+  {
+    const now = new Date();
+    const articleIds  = enrichedRows.map((r) => r.id);
+    const catIds      = [...new Set(enrichedRows.map((r) => (r as any).categoryId).filter(Boolean) as string[])];
+    const brands      = [...new Set(enrichedRows.map((r) => (r as any).brand).filter((b) => typeof b === "string" && b.length > 0) as string[])];
+    const variantIds  = enrichedRows.flatMap((r) => ((r as any).variants ?? []).map((v: any) => v.id as string));
+
+    const [activePromos, activeQDs] = await Promise.all([
+      prisma.promotion.findMany({
+        where: {
+          jewelryId,
+          isActive: true,
+          deletedAt: null,
+          AND: [
+            { OR: [{ validFrom: null }, { validFrom: { lte: now } }] },
+            { OR: [{ validTo:   null }, { validTo:   { gte: now } }] },
+          ],
+        },
+        select: {
+          id: true, name: true, type: true, value: true, scope: true,
+          articles:   { select: { articleId: true } },
+          variants:   { select: { variantId: true } },
+          categories: { select: { categoryId: true } },
+          brands:     { select: { brand: true } },
+        },
+      }),
+      prisma.quantityDiscount.findMany({
+        where: { jewelryId, isActive: true, deletedAt: null },
+        select: {
+          id: true, articleId: true, variantId: true, categoryId: true, brand: true,
+          tiers: { select: { minQty: true, type: true, value: true }, orderBy: { minQty: "asc" }, take: 1 },
+        },
+      }),
+    ]);
+
+    // Mapas auxiliares para resolución en memoria
+    const catToArticleIds = new Map<string, string[]>();
+    for (const r of enrichedRows) {
+      const cid = (r as any).categoryId as string | null;
+      if (cid) {
+        if (!catToArticleIds.has(cid)) catToArticleIds.set(cid, []);
+        catToArticleIds.get(cid)!.push(r.id);
+      }
+    }
+    const variantToArticleId = new Map<string, string>();
+    for (const r of enrichedRows) {
+      for (const v of ((r as any).variants ?? []) as any[]) {
+        variantToArticleId.set(v.id as string, r.id);
+      }
+    }
+
+    const promoSet    = new Set<string>();
+    const promoSumMap = new Map<string, string>();
+    const qdSet       = new Set<string>();
+    const qdSumMap    = new Map<string, string>();
+
+    function fmtPromo(p: { name: string; type: string; value: { toString(): string } }): string {
+      const val = p.type === "PERCENTAGE" ? `-${p.value}%` : `-$${p.value}`;
+      return `${p.name} · ${val}`;
+    }
+    function fmtQD(tiers: Array<{ minQty: { toString(): string }; type: string; value: { toString(): string } }>): string {
+      const t = tiers[0];
+      if (!t) return "Descuento por cantidad";
+      const val = t.type === "PERCENTAGE" ? `-${t.value}%` : `-$${t.value}`;
+      return `Desde ${t.minQty} u. → ${val}`;
+    }
+    function addPromo(aid: string, promo: { name: string; type: string; value: { toString(): string } }): void {
+      promoSet.add(aid);
+      if (!promoSumMap.has(aid)) promoSumMap.set(aid, fmtPromo(promo));
+    }
+    function addQD(aid: string, qd: { tiers: Array<{ minQty: { toString(): string }; type: string; value: { toString(): string } }> }): void {
+      qdSet.add(aid);
+      if (!qdSumMap.has(aid)) qdSumMap.set(aid, fmtQD(qd.tiers));
+    }
+
+    for (const promo of activePromos) {
+      if (promo.scope === "ALL") {
+        for (const r of enrichedRows) addPromo(r.id, promo);
+      } else if (promo.scope === "ARTICLE") {
+        for (const pa of promo.articles) {
+          if (articleIds.includes(pa.articleId)) addPromo(pa.articleId, promo);
+        }
+      } else if (promo.scope === "CATEGORY") {
+        const scopeCats = new Set(promo.categories.map((pc) => pc.categoryId));
+        for (const cid of scopeCats) {
+          for (const aid of catToArticleIds.get(cid) ?? []) addPromo(aid, promo);
+        }
+      } else if (promo.scope === "BRAND") {
+        const scopeBrands = new Set(promo.brands.map((pb) => pb.brand));
+        for (const r of enrichedRows) {
+          const b = (r as any).brand as string;
+          if (b && scopeBrands.has(b)) addPromo(r.id, promo);
+        }
+      } else if (promo.scope === "VARIANT") {
+        const scopeVars = new Set(promo.variants.map((pv) => pv.variantId));
+        for (const vid of scopeVars) {
+          const aid = variantToArticleId.get(vid);
+          if (aid) addPromo(aid, promo);
+        }
+      }
+    }
+
+    for (const qd of activeQDs) {
+      if (qd.articleId) {
+        if (articleIds.includes(qd.articleId)) addQD(qd.articleId, qd);
+      } else if (qd.variantId) {
+        const aid = variantToArticleId.get(qd.variantId);
+        if (aid) addQD(aid, qd);
+      } else if (qd.categoryId) {
+        for (const aid of catToArticleIds.get(qd.categoryId) ?? []) addQD(aid, qd);
+      } else if (qd.brand) {
+        for (const r of enrichedRows) {
+          if ((r as any).brand === qd.brand) addQD(r.id, qd);
+        }
+      } else {
+        // Sin alcance específico → aplica a todos
+        for (const r of enrichedRows) addQD(r.id, qd);
+      }
+    }
+
+    for (const row of enrichedRows as any[]) {
+      row.hasActivePromotion      = promoSet.has(row.id);
+      row.hasQuantityDiscount     = qdSet.has(row.id);
+      row.promotionSummary        = promoSumMap.get(row.id) ?? null;
+      row.quantityDiscountSummary = qdSumMap.get(row.id)   ?? null;
+    }
+  }
 
   const totalPages = Math.max(1, Math.ceil(total / take));
   return { rows: enrichedRows, total, skip, take, page, pageSize: take, totalPages };
@@ -1175,27 +1458,66 @@ export async function getArticle(articleId: string, jewelryId: string) {
   // Calcular costo computado según el modo de cálculo
   const costResult = await computeCostPrice(jewelryId, article as any);
 
+  // ── Impuestos: fetch enriquecido con nombre (para display en tab Costos) ─
+  const taxIdsForDetail: string[] = (article as any).manualTaxIds ?? [];
+  const taxDetails = taxIdsForDetail.length > 0
+    ? await prisma.tax.findMany({
+        where: { id: { in: taxIdsForDetail }, deletedAt: null, appliesOnPurchase: true, isRecoverable: false },
+        select: { id: true, name: true, rate: true, fixedAmount: true, calculationType: true },
+      })
+    : [];
+
   // Aplicar impuestos para obtener computedCostWithTax.
   // Mismo criterio que batchComputeCosts() — los impuestos son capa de lectura, nunca se persisten.
   let computedCostWithTaxStr: string | null = null;
   if (costResult.value != null) {
-    const costBase     = costResult.value as Prisma.Decimal;
-    const taxIds: string[] = (article as any).manualTaxIds ?? [];
-    if (taxIds.length > 0) {
-      const taxObjects = await prisma.tax.findMany({
-        where: { id: { in: taxIds }, deletedAt: null },
-        select: { id: true, rate: true, fixedAmount: true, calculationType: true },
-      });
-      const taxMap = new Map(taxObjects.map((t) => [t.id, {
+    const costBase = costResult.value as Prisma.Decimal;
+    if (taxDetails.length > 0) {
+      const taxMap = new Map(taxDetails.map((t) => [t.id, {
         rate:            new Prisma.Decimal((t.rate ?? 0).toString()),
         fixedAmount:     new Prisma.Decimal((t.fixedAmount ?? 0).toString()),
         calculationType: t.calculationType,
       }]));
-      computedCostWithTaxStr = applyTaxes(costBase, taxIds, taxMap).toFixed(4);
+      computedCostWithTaxStr = applyTaxes(costBase, taxIdsForDetail, taxMap).toFixed(4);
     } else {
       computedCostWithTaxStr = costBase.toFixed(4);
     }
   }
+
+  // ── Enriquecer líneas de costo con valores actuales (para tab Costos) ────
+  const costLinesForDetail: any[] = (article as any).costComposition ?? [];
+
+  const baseCurrencyForDetail = await prisma.currency.findFirst({
+    where: { jewelryId, isBase: true, deletedAt: null },
+    select: { id: true, code: true, symbol: true },
+  });
+
+  const metalVarIdsForDetail = [...new Set(
+    costLinesForDetail
+      .filter((l: any) => l.type === "METAL" && l.metalVariantId)
+      .map((l: any) => l.metalVariantId as string),
+  )];
+
+  const metalQuoteCurrentMap = new Map<string, { price: string; effectiveAt: string }>();
+  if (metalVarIdsForDetail.length > 0 && baseCurrencyForDetail) {
+    const quotes = await prisma.metalQuote.findMany({
+      where: { variantId: { in: metalVarIdsForDetail }, currencyId: baseCurrencyForDetail.id },
+      orderBy: { effectiveAt: "desc" },
+      select: { variantId: true, price: true, effectiveAt: true },
+    });
+    for (const q of quotes) {
+      if (!metalQuoteCurrentMap.has(q.variantId))
+        metalQuoteCurrentMap.set(q.variantId, { price: q.price.toFixed(6), effectiveAt: q.effectiveAt.toISOString() });
+    }
+  }
+
+  const costLineCurrentValues = costLinesForDetail.map((line: any) => {
+    if (line.type === "METAL" && line.metalVariantId) {
+      const q = metalQuoteCurrentMap.get(line.metalVariantId) ?? null;
+      return { currentUnitValue: q?.price ?? null, source: q ? "METAL_QUOTE" : "NO_REFERENCE", quotedAt: q?.effectiveAt ?? null };
+    }
+    return { currentUnitValue: line.unitValue?.toString() ?? null, source: "REGISTERED", quotedAt: null };
+  });
 
   // Calcular precio de venta usando la lista de precios correspondiente
   const plResult = await resolvePriceList(jewelryId, { categoryId: (article as any).categoryId });
@@ -1251,6 +1573,10 @@ export async function getArticle(articleId: string, jewelryId: string) {
     computedSalePrice,
     effectiveSalePrice,
     effectivePriceSource,
+    // Enriquecimiento para tab Costos
+    baseCurrency:          baseCurrencyForDetail,
+    taxDetails,
+    costLineCurrentValues,
   };
 }
 
@@ -1316,6 +1642,8 @@ export async function createArticle(jewelryId: string, data: any) {
     jewelry:             { connect: { id: jewelryId } },
     ...(data?.categoryId          ? { category:          { connect: { id: data.categoryId } } }          : {}),
     ...(data?.preferredSupplierId ? { preferredSupplier: { connect: { id: data.preferredSupplierId } } } : {}),
+    ...(data?.groupId             ? { group:             { connect: { id: data.groupId } } }             : {}),
+    groupOrder:          Number(data?.groupOrder ?? 0),
     code,
     name:                s(data.name),
     description:         s(data?.description),
@@ -1351,6 +1679,16 @@ export async function createArticle(jewelryId: string, data: any) {
     showInStore:         !!data?.showInStore,
     unitOfMeasure:       s(data?.unitOfMeasure),
     reorderPoint:        data?.reorderPoint != null ? data.reorderPoint : null,
+    dimensionLength:     data?.dimensionLength != null ? data.dimensionLength : null,
+    dimensionWidth:      data?.dimensionWidth  != null ? data.dimensionWidth  : null,
+    dimensionHeight:     data?.dimensionHeight != null ? data.dimensionHeight : null,
+    dimensionUnit:       s(data?.dimensionUnit) || "cm",
+    weight:              data?.weight     != null ? data.weight     : null,
+    weightUnit:          s(data?.weightUnit),
+    minSaleQuantity:     data?.minSaleQuantity  != null ? data.minSaleQuantity  : null,
+    maxSaleQuantity:     data?.maxSaleQuantity  != null ? data.maxSaleQuantity  : null,
+    defaultQuantity:     data?.defaultQuantity  != null ? data.defaultQuantity  : null,
+    inventoryAccount:    s(data?.inventoryAccount),
     isFavorite:          !!data?.isFavorite,
     notes:               s(data?.notes),
   };
@@ -1372,6 +1710,9 @@ export async function createArticle(jewelryId: string, data: any) {
           metalVariantId: l.type === "METAL" ? (l.metalVariantId ?? null) : null,
           catalogItemId: l.catalogItemId ?? null,
           sortOrder:     l.sortOrder ?? idx,
+          lineAdjKind:   l.lineAdjKind  ?? "",
+          lineAdjType:   l.lineAdjType  ?? "",
+          lineAdjValue:  l.lineAdjValue ?? null,
         })),
       });
     }
@@ -1470,6 +1811,10 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
     ...(data?.preferredSupplierId !== undefined
       ? { preferredSupplier: data.preferredSupplierId ? { connect: { id: data.preferredSupplierId } } : { disconnect: true } }
       : {}),
+    ...(data?.groupId !== undefined
+      ? { group: data.groupId ? { connect: { id: data.groupId } } : { disconnect: true } }
+      : {}),
+    ...(data?.groupOrder !== undefined ? { groupOrder: Number(data.groupOrder) } : {}),
     name:               s(data.name),
     description:        s(data?.description),
     articleType:        VALID_ARTICLE_TYPES.has(data?.articleType) ? data.articleType : undefined,
@@ -1504,6 +1849,16 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
     showInStore:        data?.showInStore !== undefined ? !!data.showInStore : undefined,
     unitOfMeasure:      data?.unitOfMeasure !== undefined ? s(data.unitOfMeasure) : undefined,
     reorderPoint:       data?.reorderPoint !== undefined ? (data.reorderPoint ?? null) : undefined,
+    dimensionLength:    data?.dimensionLength !== undefined ? (data.dimensionLength ?? null) : undefined,
+    dimensionWidth:     data?.dimensionWidth  !== undefined ? (data.dimensionWidth  ?? null) : undefined,
+    dimensionHeight:    data?.dimensionHeight !== undefined ? (data.dimensionHeight ?? null) : undefined,
+    dimensionUnit:      data?.dimensionUnit   !== undefined ? (s(data.dimensionUnit) || "cm") : undefined,
+    weight:             data?.weight      !== undefined ? (data.weight      ?? null) : undefined,
+    weightUnit:         data?.weightUnit  !== undefined ? s(data.weightUnit)          : undefined,
+    minSaleQuantity:    data?.minSaleQuantity  !== undefined ? (data.minSaleQuantity  ?? null) : undefined,
+    maxSaleQuantity:    data?.maxSaleQuantity  !== undefined ? (data.maxSaleQuantity  ?? null) : undefined,
+    defaultQuantity:    data?.defaultQuantity  !== undefined ? (data.defaultQuantity  ?? null) : undefined,
+    inventoryAccount:   data?.inventoryAccount !== undefined ? s(data.inventoryAccount) : undefined,
     isFavorite:         data?.isFavorite !== undefined ? !!data.isFavorite : undefined,
     notes:              data?.notes !== undefined ? s(data.notes) : undefined,
   };
@@ -1532,6 +1887,9 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
             metalVariantId: l.type === "METAL" ? (l.metalVariantId ?? null) : null,
             catalogItemId: l.catalogItemId ?? null,
             sortOrder:     l.sortOrder ?? idx,
+            lineAdjKind:   l.lineAdjKind  ?? "",
+            lineAdjType:   l.lineAdjType  ?? "",
+            lineAdjValue:  l.lineAdjValue ?? null,
           })),
         });
       }
@@ -1738,6 +2096,7 @@ export async function createVariant(articleId: string, jewelryId: string, data: 
       priceOverride:       data?.priceOverride != null ? data.priceOverride : null,
       costPrice:           data?.costPrice != null ? data.costPrice : null,
       reorderPoint:        data?.reorderPoint != null ? data.reorderPoint : null,
+      openingStock:        data?.openingStock != null ? data.openingStock : null,
       imageUrl:            s(data?.imageUrl),
       notes:               s(data?.notes),
       sortOrder:           typeof data?.sortOrder === "number" ? data.sortOrder : 0,
@@ -2415,6 +2774,9 @@ export type CostLineInput = {
   metalVariantId?: string | null;
   catalogItemId?: string | null;
   sortOrder?: number;
+  lineAdjKind?: string | null;
+  lineAdjType?: string | null;
+  lineAdjValue?: number | null;
 };
 
 /** Reemplaza todas las líneas de costo del artículo (operación atómica). */
@@ -2455,6 +2817,9 @@ export async function setCostLines(
           metalVariantId: l.type === "METAL" ? (l.metalVariantId ?? null) : null,
           catalogItemId:  l.catalogItemId ?? null,
           sortOrder:      l.sortOrder ?? idx,
+          lineAdjKind:    l.lineAdjKind  ?? "",
+          lineAdjType:    l.lineAdjType  ?? "",
+          lineAdjValue:   l.lineAdjValue ?? null,
         })),
       });
     }
@@ -2462,4 +2827,95 @@ export async function setCostLines(
 
   // Devolver artículo actualizado con costo computado
   return getArticle(articleId, jewelryId);
+}
+
+// ===========================================================================
+// computePurchaseTaxes — impuestos de compra sobre el costo de un artículo
+// Usado por getPricingPreview para enriquecer el response con datos de costo.
+// ===========================================================================
+export type PurchaseTaxBreakdownItem = {
+  taxId:           string;
+  name:            string;
+  calculationType: string;
+  rate:            number | null;
+  fixedAmount:     number | null;
+  taxAmount:       number;
+};
+
+export type PurchaseTaxResult = {
+  costBase:         string | null;  // costo sin impuestos (formateado)
+  costTaxAmount:    string | null;  // suma de impuestos de compra
+  costWithTax:      string | null;  // costBase + costTaxAmount
+  costTaxBreakdown: PurchaseTaxBreakdownItem[];
+};
+
+export async function computePurchaseTaxes(
+  jewelryId: string,
+  articleId: string,
+  costBaseDecimal: Prisma.Decimal | null,
+): Promise<PurchaseTaxResult> {
+  const empty: PurchaseTaxResult = {
+    costBase:         costBaseDecimal != null ? costBaseDecimal.toFixed(4) : null,
+    costTaxAmount:    null,
+    costWithTax:      costBaseDecimal != null ? costBaseDecimal.toFixed(4) : null,
+    costTaxBreakdown: [],
+  };
+
+  if (costBaseDecimal == null) return empty;
+
+  // Leer manualTaxIds del artículo
+  const art = await prisma.article.findFirst({
+    where: { id: articleId, jewelryId, deletedAt: null },
+    select: { manualTaxIds: true },
+  });
+  if (!art || !art.manualTaxIds?.length) return empty;
+
+  // Cargar impuestos de compra (no recuperables)
+  const taxes = await prisma.tax.findMany({
+    where: {
+      id:                { in: art.manualTaxIds },
+      deletedAt:         null,
+      appliesOnPurchase: true,
+      isRecoverable:     false,
+    },
+    select: { id: true, name: true, rate: true, fixedAmount: true, calculationType: true },
+  });
+  if (!taxes.length) return empty;
+
+  // Aplicar cada impuesto y construir breakdown
+  const breakdown: PurchaseTaxBreakdownItem[] = [];
+  let totalTax = new Prisma.Decimal(0);
+
+  for (const t of taxes) {
+    const rate        = new Prisma.Decimal((t.rate ?? 0).toString());
+    const fixedAmt    = new Prisma.Decimal((t.fixedAmount ?? 0).toString());
+    let taxAmt        = new Prisma.Decimal(0);
+
+    if (t.calculationType === "PERCENTAGE") {
+      taxAmt = costBaseDecimal.mul(rate.div(100));
+    } else if (t.calculationType === "FIXED_AMOUNT") {
+      taxAmt = fixedAmt;
+    } else if (t.calculationType === "PERCENTAGE_PLUS_FIXED") {
+      taxAmt = costBaseDecimal.mul(rate.div(100)).add(fixedAmt);
+    }
+
+    totalTax = totalTax.add(taxAmt);
+    breakdown.push({
+      taxId:           t.id,
+      name:            t.name,
+      calculationType: t.calculationType,
+      rate:            t.rate ?? null,
+      fixedAmount:     t.fixedAmount ?? null,
+      taxAmount:       taxAmt.toNumber(),
+    });
+  }
+
+  const costWithTax = costBaseDecimal.add(totalTax);
+
+  return {
+    costBase:         costBaseDecimal.toFixed(4),
+    costTaxAmount:    totalTax.gt(0) ? totalTax.toFixed(4) : null,
+    costWithTax:      costWithTax.toFixed(4),
+    costTaxBreakdown: breakdown,
+  };
 }

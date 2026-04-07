@@ -23,19 +23,26 @@ const VALID_CALC_TYPES: TaxCalculationType[] = ["PERCENTAGE", "FIXED_AMOUNT", "P
 const VALID_APPLY_ON: TaxApplyOn[] = ["TOTAL", "METAL", "HECHURA", "METAL_Y_HECHURA", "SUBTOTAL_AFTER_DISCOUNT", "SUBTOTAL_BEFORE_DISCOUNT"];
 
 function parseTaxData(data: any) {
-  const name = s(data?.name);
-  const code = s(data?.code);
+  const name             = s(data?.name);
+  const code             = s(data?.code);
   const taxType: TaxType = VALID_TAX_TYPES.includes(data?.taxType) ? data.taxType : "OTHER";
   const calculationType: TaxCalculationType = VALID_CALC_TYPES.includes(data?.calculationType) ? data.calculationType : "PERCENTAGE";
   const applyOn: TaxApplyOn = VALID_APPLY_ON.includes(data?.applyOn) ? data.applyOn : "TOTAL";
-  const rate = toDecimalOrNull(data?.rate);
-  const fixedAmount = toDecimalOrNull(data?.fixedAmount);
-  const includedInPrice = data?.includedInPrice === true;
-  const validFrom = data?.validFrom ? new Date(data.validFrom) : null;
-  const validTo = data?.validTo ? new Date(data.validTo) : null;
-  const sortOrder = Number(data?.sortOrder ?? 0) || 0;
-  const notes = s(data?.notes);
-  return { name, code, taxType, calculationType, applyOn, rate, fixedAmount, includedInPrice, validFrom, validTo, sortOrder, notes };
+  const rate             = toDecimalOrNull(data?.rate);
+  const fixedAmount      = toDecimalOrNull(data?.fixedAmount);
+  const includedInPrice  = data?.includedInPrice === true;
+  const appliesOnSale     = data?.appliesOnSale     !== false; // default true
+  const appliesOnPurchase = data?.appliesOnPurchase !== false; // default true
+  const isRecoverable     = data?.isRecoverable     === true;  // default false
+  const validFrom        = data?.validFrom ? new Date(data.validFrom) : null;
+  const validTo          = data?.validTo   ? new Date(data.validTo)   : null;
+  const sortOrder        = Number(data?.sortOrder ?? 0) || 0;
+  const notes            = s(data?.notes);
+  return {
+    name, code, taxType, calculationType, applyOn, rate, fixedAmount,
+    includedInPrice, appliesOnSale, appliesOnPurchase, isRecoverable,
+    validFrom, validTo, sortOrder, notes,
+  };
 }
 
 const SELECT = {
@@ -49,6 +56,9 @@ const SELECT = {
   fixedAmount: true,
   applyOn: true,
   includedInPrice: true,
+  appliesOnSale: true,
+  appliesOnPurchase: true,
+  isRecoverable: true,
   validFrom: true,
   validTo: true,
   isActive: true,
@@ -87,10 +97,8 @@ export async function createTax(jewelryId: string, data: any) {
   const parsed = parseTaxData(data);
   assert(parsed.name, "Nombre requerido.");
 
-  // Auto-generate code if empty
   const code = parsed.code || await generateTaxCode(jewelryId, parsed.name);
 
-  // Validate: PERCENTAGE needs rate, FIXED_AMOUNT needs fixedAmount
   if (parsed.calculationType === "PERCENTAGE" || parsed.calculationType === "PERCENTAGE_PLUS_FIXED") {
     assert(parsed.rate !== null, "Se requiere una tasa porcentual.");
   }
@@ -152,6 +160,9 @@ export async function cloneTax(id: string, jewelryId: string) {
       fixedAmount: original.fixedAmount,
       applyOn: original.applyOn,
       includedInPrice: original.includedInPrice,
+      appliesOnSale: original.appliesOnSale,
+      appliesOnPurchase: original.appliesOnPurchase,
+      isRecoverable: original.isRecoverable,
       validFrom: original.validFrom,
       validTo: original.validTo,
       sortOrder: original.sortOrder,

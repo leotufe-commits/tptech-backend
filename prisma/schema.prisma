@@ -17,6 +17,8 @@ model Jewelry {
   phoneNumber                String
   street                     String
   number                     String
+  floor                      String                     @default("")
+  apartment                  String                     @default("")
   city                       String
   province                   String
   postalCode                 String
@@ -35,6 +37,13 @@ model Jewelry {
   pinLockRequireOnUserSwitch Boolean                    @default(false)
   pinLockTimeoutSec          Int                        @default(120)
   defaultMermaPercent        Decimal?                   @db.Decimal(5, 2) // merma global del tenant
+
+  // ── Política de alertas de precio ─────────────────────────────────────────
+  pricingLowMarginWarningPercent  Decimal?  @db.Decimal(10, 4)
+  pricingLowMarginBlockPercent    Decimal?  @db.Decimal(10, 4)
+  pricingBlockLossSale            Boolean   @default(false)
+  pricingBlockZeroOrNegativePrice Boolean   @default(true)
+  pricingBlockPartialData         Boolean   @default(false)
 
   // ── Email branding (por joyería) ──────────────────────────────────────────
   // Bloque 1 — Identidad del correo
@@ -86,6 +95,9 @@ model Jewelry {
   quantityDiscounts          QuantityDiscount[]
   labelTemplates             LabelTemplate[]
   printerProfiles            PrinterProfile[]
+  purchases                  Purchase[]
+  purchasePayments           PurchasePayment[]
+  articleGroups              ArticleGroup[]
 
   @@index([createdAt])
   @@index([deletedAt])
@@ -243,6 +255,8 @@ model User {
   documentType               String                     @default("")
   notes                      String                     @default("")
   number                     String                     @default("")
+  floor                      String                     @default("")
+  apartment                  String                     @default("")
   phoneCountry               String                     @default("")
   phoneNumber                String                     @default("")
   postalCode                 String                     @default("")
@@ -273,6 +287,12 @@ model User {
   salesCreated               Sale[]                     @relation("SaleCreatedBy")
   salesConfirmed             Sale[]                     @relation("SaleConfirmedBy")
   salesCancelled             Sale[]                     @relation("SaleCancelledBy")
+  purchasesCreated           Purchase[]                 @relation("PurchaseCreatedBy")
+  purchasesConfirmed         Purchase[]                 @relation("PurchaseConfirmedBy")
+  purchasesCancelled         Purchase[]                 @relation("PurchaseCancelledBy")
+  purchasePaymentsCreated    PurchasePayment[]           @relation("PurchasePaymentCreatedBy")
+  crossSettlementsCreated    CrossSettlement[]           @relation("CrossSettlementCreatedBy")
+  crossSettlementsVoided     CrossSettlement[]           @relation("CrossSettlementVoidedBy")
 
   @@unique([jewelryId, email])
   @@index([jewelryId])
@@ -707,11 +727,14 @@ model Tax {
   calculationType TaxCalculationType @default(PERCENTAGE)
   rate            Decimal?           @db.Decimal(10, 4)
   fixedAmount     Decimal?           @db.Decimal(18, 2)
-  applyOn         TaxApplyOn         @default(TOTAL)
-  includedInPrice Boolean            @default(false)
-  validFrom       DateTime?
-  validTo         DateTime?
-  isActive        Boolean            @default(true)
+  applyOn           TaxApplyOn         @default(TOTAL)
+  includedInPrice   Boolean            @default(false)
+  appliesOnSale     Boolean            @default(true)  // se aplica al precio de venta
+  appliesOnPurchase Boolean            @default(true)  // se aplica al costo de compra
+  isRecoverable     Boolean            @default(false) // si true, no suma al costo (ej: IVA Crédito Fiscal)
+  validFrom         DateTime?
+  validTo           DateTime?
+  isActive          Boolean            @default(true)
   allowDocumentOverride Boolean            @default(false) // si true, el comprobante puede excepcionarlo con auditoría
   isFavorite            Boolean            @default(false)
   isSystem              Boolean            @default(false)
@@ -950,11 +973,12 @@ model PriceList {
   costPerGram     Decimal?        @db.Decimal(18, 6)
   surcharge       Decimal?        @db.Decimal(10, 4)
   minimumPrice    Decimal?        @db.Decimal(18, 2)
-  roundingTarget  RoundingTarget  @default(NONE)
-  roundingMode    RoundingMode    @default(NONE)
-  roundingDirection    RoundingDirection @default(NEAREST)
-  roundingValueMetal   Decimal?          @db.Decimal(18, 4)
-  roundingValueHechura Decimal?          @db.Decimal(18, 4)
+  roundingTarget    RoundingTarget   @default(NONE)
+  roundingMode      RoundingMode     @default(NONE)
+  roundingDirection RoundingDirection @default(NEAREST)
+  roundingApplyOn   RoundingApplyOn  @default(TOTAL)
+  roundingValueMetal   Decimal?      @db.Decimal(18, 4)
+  roundingValueHechura Decimal?      @db.Decimal(18, 4)
   validFrom       DateTime?
   validTo         DateTime?
   isFavorite      Boolean         @default(false)
@@ -1055,6 +1079,7 @@ enum CatalogType {
   ARTICLE_MANUFACTURER
   UNIT_OF_MEASURE
   MULTIPLIER_BASE
+  WEIGHT_UNIT
 }
 
 enum TaxType {
@@ -1140,6 +1165,12 @@ enum RoundingDirection {
   DOWN
 }
 
+enum RoundingApplyOn {
+  PRICE  // Sobre el precio de lista (antes de descuentos e impuestos) — DEFAULT
+  NET    // Sobre el precio neto final (después de descuentos, antes de impuestos)
+  TOTAL  // Sobre el total con impuestos (después de todos los cálculos)
+}
+
 /// ///////////////////////////
 /// ///////////////////////////
 enum EntityType {
@@ -1178,6 +1209,33 @@ enum BalanceEntryType {
   CREDIT_NOTE
   DEBIT_NOTE
   ADJUSTMENT
+  PURCHASE_INVOICE
+  SUPPLIER_PAYMENT
+  METAL_RETURN
+  CROSS_SETTLEMENT
+}
+
+enum CrossSettlementStatus {
+  CONFIRMED
+  VOIDED
+}
+
+enum CrossSettlementComponentType {
+  MONEY
+  METAL
+}
+
+enum PurchaseStatus {
+  DRAFT
+  CONFIRMED
+  PARTIALLY_PAID
+  PAID
+  CANCELLED
+}
+
+enum PurchasePaymentComponentType {
+  MONEY
+  METAL
 }
 
 enum CommercialRuleScope {
@@ -1261,6 +1319,10 @@ model CommercialEntity {
   commercialValueType CommercialValueType? // tipo de valor del beneficio/recargo por defecto
   commercialValue     Decimal?         @db.Decimal(14, 4) // valor del beneficio/recargo por defecto
 
+  // Configuración fiscal
+  taxExempt           Boolean          @default(false) // true = no se aplican impuestos a esta entidad
+  taxApplyOnOverride  TaxApplyOn?      // null = heredar la base del impuesto; valor = sobrescribir para todos sus impuestos
+
   // Estado y trazabilidad
   isActive            Boolean          @default(true)
   deletedAt           DateTime?
@@ -1286,8 +1348,11 @@ model CommercialEntity {
   relationsTo     EntityRelation[]      @relation("RelationTo")
   mergedFrom           CommercialEntity[]    @relation("EntityMerge")
   mergedInto           CommercialEntity?     @relation("EntityMerge", fields: [mergedIntoEntityId], references: [id], onDelete: SetNull)
-  preferredSupplierFor Article[]             @relation("ArticlePreferredSupplier")
-  salesAsClient        Sale[]                 @relation("SaleClient")
+  preferredSupplierFor       Article[]              @relation("ArticlePreferredSupplier")
+  salesAsClient              Sale[]                 @relation("SaleClient")
+  purchasesAsSupplier        Purchase[]             @relation("PurchaseSupplier")
+  purchasePaymentsAsSupplier PurchasePayment[]       @relation("PurchasePaymentSupplier")
+  crossSettlementsAsSupplier CrossSettlement[]       @relation("CrossSettlementSupplier")
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -1411,20 +1476,21 @@ model EntityTaxOverride {
 /// ///////////////////////////
 /// ///////////////////////////
 model EntityBalanceEntry {
-  id          String           @id @default(cuid())
-  entityId    String
-  jewelryId   String
-  role        EntityRole       @default(CLIENT)
-  entryType   BalanceEntryType @default(INVOICE)
-  amount      Decimal          @db.Decimal(14, 2)
-  currency    String           @default("ARS")
-  documentRef String           @default("") // referencia al comprobante origen
-  notes       String           @default("")
-  createdAt   DateTime         @default(now())
-  createdBy   String           @default("")
-  voidedAt    DateTime?
-  voidedBy    String?
-  voidReason  String           @default("")
+  id                String           @id @default(cuid())
+  entityId          String
+  jewelryId         String
+  role              EntityRole       @default(CLIENT)
+  entryType         BalanceEntryType @default(INVOICE)
+  amount            Decimal          @db.Decimal(14, 2)
+  currency          String           @default("ARS")
+  documentRef       String           @default("") // referencia al comprobante origen
+  notes             String           @default("")
+  createdAt         DateTime         @default(now())
+  createdBy         String           @default("")
+  voidedAt          DateTime?
+  voidedBy          String?
+  voidReason        String           @default("")
+  breakdownSnapshot Json?            // desglose metal+hechura cuando balanceType=BREAKDOWN
 
   entity CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Cascade)
 
@@ -1514,11 +1580,29 @@ model Article {
   unitOfMeasure       String           @default("")     // "unidad", "par", "set", etc.
   reorderPoint        Decimal?         @db.Decimal(14, 4) // stock mínimo para alerta de reposición
 
+  // ── Dimensiones físicas ─────────────────────────────────────────────────
+  dimensionLength     Decimal?         @db.Decimal(10, 4)
+  dimensionWidth      Decimal?         @db.Decimal(10, 4)
+  dimensionHeight     Decimal?         @db.Decimal(10, 4)
+  dimensionUnit       String           @default("cm")
+  weight              Decimal?         @db.Decimal(10, 4) // peso del artículo
+  weightUnit          String           @default("")       // unidad de peso (g, kg, oz, etc.)
+
+  // ── Cantidades de venta ─────────────────────────────────────────────────
+  minSaleQuantity     Decimal?         @db.Decimal(14, 4)
+  maxSaleQuantity     Decimal?         @db.Decimal(14, 4)
+  defaultQuantity     Decimal?         @db.Decimal(14, 4)
+
+  // ── Contabilidad ────────────────────────────────────────────────────────
+  inventoryAccount    String           @default("")       // cuenta contable de inventario (opcional)
+
   // ── Control y visibilidad ───────────────────────────────────────────────
   mainImageUrl        String           @default("")
   isFavorite          Boolean          @default(false)
   isActive            Boolean          @default(true)
   notes               String           @default("")
+  groupId             String?          // grupo comercial — afecta precios (scope GROUP en promociones y descuentos)
+  groupOrder          Int              @default(0)              // orden visual dentro del grupo
   deletedAt           DateTime?
   createdAt           DateTime         @default(now())
   updatedAt           DateTime         @updatedAt
@@ -1526,6 +1610,7 @@ model Article {
   jewelry           Jewelry                   @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
   category          ArticleCategory?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   preferredSupplier CommercialEntity?         @relation("ArticlePreferredSupplier", fields: [preferredSupplierId], references: [id], onDelete: SetNull)
+  group             ArticleGroup?             @relation(fields: [groupId], references: [id], onDelete: SetNull)
   compositions      ArticleMetalComposition[]
   variants          ArticleVariant[]
   attributeValues   ArticleAttributeValue[]
@@ -1533,6 +1618,7 @@ model Article {
   stock             ArticleStock[]
   movementLines     ArticleMovementLine[]
   saleLines         SaleLine[]
+  purchaseLines     PurchaseLine[]     @relation("PurchaseLineArticle")
   costComposition   ArticleCostLine[]
   costLineRefs      ArticleCostLine[]  @relation("CostLineRefArticle")
   promotionArticles PromotionArticle[] @relation("ArticlePromotions")
@@ -1548,6 +1634,33 @@ model Article {
   @@index([jewelryId, articleType])
   @@index([jewelryId, sku])
   @@index([jewelryId, barcode])
+  @@index([groupId])
+  @@index([deletedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Grupo comercial de artículos — capa de presentación para web/catálogo
+// ---------------------------------------------------------------------------
+model ArticleGroup {
+  id            String    @id @default(cuid())
+  jewelryId     String
+  name          String
+  slug          String
+  description   String    @default("")
+  mainImageUrl  String    @default("")
+  selectorLabel String    @default("")  // ej: "Ancho", "Talle"
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  jewelry          Jewelry            @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  articles         Article[]
+  promotionGroups  PromotionGroup[]
+  quantityDiscounts QuantityDiscount[] @relation("GroupQuantityDiscounts")
+
+  @@unique([jewelryId, slug])
+  @@index([jewelryId])
   @@index([deletedAt])
 }
 
@@ -1576,6 +1689,9 @@ model ArticleCostLine {
   mermaPercent   Decimal?                  @db.Decimal(5, 2)   // solo para type=METAL
   metalVariantId String?                                        // solo para type=METAL
   catalogItemId  String?                                        // para tipo PRODUCT/SERVICE: ID del artículo catálogo referenciado
+  lineAdjKind    String       @default("")                      // "" | "BONUS" | "SURCHARGE"
+  lineAdjType    String       @default("")                      // "" | "PERCENTAGE" | "FIXED_AMOUNT"
+  lineAdjValue   Decimal?                  @db.Decimal(14, 4)  // valor del ajuste por línea
   sortOrder      Int          @default(0)
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
@@ -1628,6 +1744,7 @@ model ArticleVariant {
 
   // ── Inventario ──────────────────────────────────────────────────────────
   reorderPoint         Decimal?    @db.Decimal(14, 4) // stock mínimo para alerta de reposición (por variante)
+  openingStock         Decimal?    @db.Decimal(14, 4) // existencia de apertura (stock inicial registrado al crear)
 
   // ── Visual y control ────────────────────────────────────────────────────
   imageUrl             String      @default("")
@@ -1642,6 +1759,7 @@ model ArticleVariant {
   stock             ArticleStock[]
   movementLines     ArticleMovementLine[]
   saleLines         SaleLine[]
+  purchaseLines     PurchaseLine[]     @relation("PurchaseLineVariant")
   promotionVariants PromotionVariant[]    @relation("VariantPromotions")
   quantityDiscounts QuantityDiscount[]   @relation("VariantQuantityDiscounts")
   attributeValues   ArticleVariantAttributeValue[]
@@ -2029,6 +2147,9 @@ model SaleLine {
   unitMargin    Decimal? @db.Decimal(14, 4) // unitPrice - unitCost (antes de descuento)
   totalMargin   Decimal? @db.Decimal(14, 2) // lineTotal - totalCost
   marginPercent Decimal? @db.Decimal(10, 4) // (totalMargin / lineTotal) × 100
+  breakdownSnapshot Json?                   // desglose Metal/Hechura al momento de confirmar
+  taxAmount     Decimal? @db.Decimal(14, 4) // impuesto unitario al momento de confirmar
+  taxSnapshot   Json?                        // desglose de impuestos al momento de confirmar
 
   sortOrder   Int     @default(0)
   createdAt   DateTime @default(now())
@@ -2074,12 +2195,21 @@ enum PromotionScope {
   VARIANT   // variantes específicas (via PromotionVariant)
   CATEGORY  // categorías de artículos (via PromotionCategory)
   BRAND     // marcas específicas (via PromotionBrand)
+  GROUP     // grupo de artículos (via PromotionGroup)
 }
 
 /// Tipo de ajuste de precio: descuento fijo o porcentual
 enum PromotionType {
   FIXED       // descuento en monto fijo (moneda base)
   PERCENTAGE  // descuento en porcentaje sobre el precio base
+}
+
+/// Modo de evaluación de la cantidad para descuentos por volumen.
+enum QuantityDiscountEvaluationMode {
+  LINE           // cantidad de la línea individual (comportamiento clásico)
+  CATEGORY_TOTAL // suma de cantidades de todas las líneas de la misma categoría en el comprobante
+  BRAND_TOTAL    // suma de cantidades de todas las líneas de la misma marca en el comprobante
+  GROUP_TOTAL    // suma de cantidades de todas las líneas del mismo grupo en el comprobante
 }
 
 /// Promoción especial por tiempo limitado o evento.
@@ -2089,12 +2219,14 @@ model Promotion {
   jewelryId     String
   name          String
   type          PromotionType
-  value         Decimal        @db.Decimal(14, 4) // monto o % de descuento
-  scope         PromotionScope @default(ALL)       // alcance de la promoción
+  value         Decimal           @db.Decimal(14, 4) // monto o % de descuento
+  scope         PromotionScope    @default(ALL)       // alcance de la promoción
+  applyOn       CommercialApplyOn @default(TOTAL)     // base de aplicación del descuento
   validFrom     DateTime?
   validTo       DateTime?
   untilStockEnd Boolean        @default(false)
   priority      Int            @default(0)        // menor número = mayor prioridad
+  isStackable   Boolean        @default(true)     // si false, no se acumula con descuentos por cantidad
   isActive      Boolean        @default(true)
   notes         String         @default("")
   deletedAt     DateTime?
@@ -2106,6 +2238,7 @@ model Promotion {
   variants   PromotionVariant[]
   categories PromotionCategory[]
   brands     PromotionBrand[]
+  groups     PromotionGroup[]
 
   @@index([jewelryId])
   @@index([scope])
@@ -2175,6 +2308,22 @@ model PromotionBrand {
   @@index([jewelryId])
 }
 
+/// Grupos de artículos a los que aplica una promoción (scope = GROUP).
+model PromotionGroup {
+  id          String @id @default(cuid())
+  promotionId String
+  groupId     String
+  jewelryId   String
+
+  promotion Promotion    @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  group     ArticleGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, groupId])
+  @@index([promotionId])
+  @@index([groupId])
+  @@index([jewelryId])
+}
+
 /// Descuento por volumen/cantidad mínima de compra.
 /// Aplica cuando la cantidad en la línea de venta supera el umbral.
 model QuantityDiscount {
@@ -2184,8 +2333,12 @@ model QuantityDiscount {
   variantId   String?       // solo si scope es variante específica
   categoryId  String?       // null cuando el alcance no es por categoría
   brand       String?       // null cuando el alcance no es por marca
-  isActive    Boolean   @default(true)
-  sortOrder   Int       @default(0)
+  groupId     String?       // null cuando el alcance no es por grupo
+  isActive        Boolean                        @default(true)
+  isStackable     Boolean                        @default(true)     // si false, no se acumula con promociones
+  evaluationMode  QuantityDiscountEvaluationMode @default(LINE)     // cómo se evalúa la cantidad
+  applyOn         CommercialApplyOn              @default(TOTAL)    // base de aplicación del descuento
+  sortOrder       Int                            @default(0)
   deletedAt   DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -2194,12 +2347,14 @@ model QuantityDiscount {
   article  Article?         @relation("ArticleQuantityDiscounts", fields: [articleId], references: [id], onDelete: SetNull)
   variant  ArticleVariant?  @relation("VariantQuantityDiscounts", fields: [variantId], references: [id], onDelete: SetNull)
   category ArticleCategory? @relation("CategoryQuantityDiscounts", fields: [categoryId], references: [id], onDelete: SetNull)
+  group    ArticleGroup?    @relation("GroupQuantityDiscounts", fields: [groupId], references: [id], onDelete: SetNull)
   tiers    QuantityDiscountTier[]
 
   @@index([jewelryId])
   @@index([articleId])
   @@index([variantId])
   @@index([categoryId])
+  @@index([groupId])
   @@index([deletedAt])
 }
 
@@ -2309,4 +2464,183 @@ model PrinterProfile {
 
   @@index([jewelryId])
   @@index([deletedAt])
+}
+
+/// ///////////////////////////
+/// COMPRAS A PROVEEDORES
+/// ///////////////////////////
+
+model Purchase {
+  id               String         @id @default(cuid())
+  jewelryId        String
+  code             String         // CMP-0001 — autogenerado
+  status           PurchaseStatus @default(DRAFT)
+
+  supplierId       String
+  supplierSnapshot Json?          // snapshot del proveedor al confirmar
+
+  subtotal         Decimal        @default(0) @db.Decimal(14, 2)
+  discountAmount   Decimal        @default(0) @db.Decimal(14, 2)
+  taxAmount        Decimal        @default(0) @db.Decimal(14, 2)
+  total            Decimal        @default(0) @db.Decimal(14, 2)
+  paidAmount       Decimal        @default(0) @db.Decimal(14, 2)
+
+  purchaseDate     DateTime       @default(now())
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  confirmedAt      DateTime?
+  cancelledAt      DateTime?
+  cancelNote       String         @default("")
+  notes            String         @default("")
+
+  createdById      String?
+  confirmedById    String?
+  cancelledById    String?
+
+  jewelry     Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  supplier    CommercialEntity @relation("PurchaseSupplier", fields: [supplierId], references: [id], onDelete: Restrict)
+  createdBy   User?            @relation("PurchaseCreatedBy", fields: [createdById], references: [id])
+  confirmedBy User?            @relation("PurchaseConfirmedBy", fields: [confirmedById], references: [id])
+  cancelledBy User?            @relation("PurchaseCancelledBy", fields: [cancelledById], references: [id])
+  lines              PurchaseLine[]
+  payments           PurchasePayment[]
+  crossSettlements   CrossSettlement[]  @relation("CrossSettlementPurchase")
+
+  @@unique([jewelryId, code])
+  @@index([jewelryId])
+  @@index([jewelryId, status])
+  @@index([jewelryId, purchaseDate])
+  @@index([supplierId])
+}
+
+model PurchaseLine {
+  id                String          @id @default(cuid())
+  purchaseId        String
+  jewelryId         String
+  articleId         String?
+  variantId         String?
+
+  articleName       String          @default("")
+  variantName       String          @default("")
+  sku               String          @default("")
+  barcode           String          @default("")
+
+  quantity          Decimal         @db.Decimal(14, 4)
+  unitCost          Decimal         @db.Decimal(14, 4)
+  lineTotal         Decimal         @db.Decimal(14, 2)
+
+  breakdownSnapshot Json?
+
+  sortOrder         Int             @default(0)
+  createdAt         DateTime        @default(now())
+
+  purchase  Purchase        @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  article   Article?        @relation("PurchaseLineArticle", fields: [articleId], references: [id], onDelete: SetNull)
+  variant   ArticleVariant? @relation("PurchaseLineVariant", fields: [variantId], references: [id], onDelete: SetNull)
+
+  @@index([purchaseId])
+  @@index([articleId])
+  @@index([variantId])
+  @@index([jewelryId])
+}
+
+model PurchasePayment {
+  id          String    @id @default(cuid())
+  purchaseId  String?   // null = pago general a proveedor, no asociado a compra específica
+  jewelryId   String
+  supplierId  String
+  paymentDate DateTime  @default(now())
+  note        String    @default("")
+  createdAt   DateTime  @default(now())
+  createdById String?
+  voidedAt    DateTime?
+  voidedBy    String?
+  voidReason  String    @default("")
+
+  jewelry     Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  purchase    Purchase?        @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  supplier    CommercialEntity @relation("PurchasePaymentSupplier", fields: [supplierId], references: [id], onDelete: Restrict)
+  createdBy   User?            @relation("PurchasePaymentCreatedBy", fields: [createdById], references: [id])
+  components  PurchasePaymentComponent[]
+
+  @@index([purchaseId])
+  @@index([supplierId])
+  @@index([jewelryId])
+}
+
+model PurchasePaymentComponent {
+  id            String                       @id @default(cuid())
+  paymentId     String
+  jewelryId     String
+  componentType PurchasePaymentComponentType
+  amount        Decimal?                     @db.Decimal(14, 2)
+  currency      String                       @default("ARS")
+  metalId       String?
+  variantId     String?
+  gramsOriginal Decimal?                     @db.Decimal(14, 6)
+  purity        Decimal?                     @db.Decimal(10, 6)
+  gramsPure     Decimal?                     @db.Decimal(14, 6)
+  createdAt     DateTime                     @default(now())
+
+  payment PurchasePayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+  @@index([jewelryId])
+  @@index([metalId])
+}
+
+// ---------------------------------------------------------------------------
+// CrossSettlement — cabecera auditable de liquidaciones cruzadas entre
+// componentes distintos de cuenta corriente (ej: USD cancela ARS, USD cancela Au)
+// ---------------------------------------------------------------------------
+model CrossSettlement {
+  id               String                     @id @default(cuid())
+  jewelryId        String
+  supplierId       String
+  targetPurchaseId String?
+  status           CrossSettlementStatus      @default(CONFIRMED)
+
+  // Componente entregado (lo que entrega el proveedor o pagamos nosotros)
+  fromComponentType  CrossSettlementComponentType
+  fromCurrency       String?
+  fromMetalId        String?
+  fromVariantId      String?
+  fromGramsOriginal  Decimal?  @db.Decimal(14, 6)
+  fromPurity         Decimal?  @db.Decimal(10, 6)
+  fromGramsPure      Decimal?  @db.Decimal(14, 6)
+  fromAmount         Decimal?  @db.Decimal(14, 2)
+
+  // Componente cancelado (la deuda que se liquida)
+  toComponentType  CrossSettlementComponentType
+  toCurrency       String?
+  toMetalId        String?
+  toVariantId      String?
+  toGramsOriginal  Decimal?  @db.Decimal(14, 6)
+  toPurity         Decimal?  @db.Decimal(10, 6)
+  toGramsPure      Decimal?  @db.Decimal(14, 6)
+  toAmount         Decimal?  @db.Decimal(14, 2)
+
+  // Conversión usada
+  fxRate            Decimal?  @db.Decimal(18, 8)
+  metalQuotePerGram Decimal?  @db.Decimal(18, 8)
+  quoteCurrency     String?
+
+  notes       String   @default("")
+  createdAt   DateTime @default(now())
+  confirmedAt DateTime?
+  voidedAt    DateTime?
+  voidReason  String   @default("")
+  createdById String?
+  voidedById  String?
+
+  supplier       CommercialEntity @relation("CrossSettlementSupplier", fields: [supplierId], references: [id], onDelete: Restrict)
+  targetPurchase Purchase?        @relation("CrossSettlementPurchase", fields: [targetPurchaseId], references: [id], onDelete: SetNull)
+  createdBy      User?            @relation("CrossSettlementCreatedBy", fields: [createdById], references: [id])
+  voidedBy       User?            @relation("CrossSettlementVoidedBy", fields: [voidedById], references: [id])
+
+  @@index([jewelryId])
+  @@index([supplierId])
+  @@index([targetPurchaseId])
+  @@index([createdAt])
+  @@index([voidedAt])
 }

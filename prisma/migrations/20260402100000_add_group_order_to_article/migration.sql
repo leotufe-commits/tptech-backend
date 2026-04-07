@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Article" ADD COLUMN "groupOrder" INTEGER NOT NULL DEFAULT 0;

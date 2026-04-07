@@ -4,6 +4,7 @@ import { requirePermission } from "../../middlewares/requirePermission.js";
 import { uploadJewelryFiles } from "../../middlewares/uploadJewelryFiles.js";
 
 import {
+  getMyJewelryProfile,
   updateMyJewelry,
   uploadMyJewelryLogo,
   uploadMyJewelryAttachments,
@@ -22,6 +23,7 @@ const requireCompanyEdit = requirePermission("COMPANY_SETTINGS", "EDIT");
 /* =========================
    PERFIL (DATOS)
 ========================= */
+router.get("/me", requireCompanyView, getMyJewelryProfile);
 router.patch("/me", requireCompanyEdit, updateMyJewelry);
 
 /* =========================

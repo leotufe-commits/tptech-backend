@@ -4,6 +4,7 @@ import * as controller from "./payments.controller.js";
 
 const router = Router();
 
+router.get("/checkout-preview", asyncHandler(controller.checkoutPreview));
 router.get("/", asyncHandler(controller.list));
 router.post("/", asyncHandler(controller.create));
 router.post("/:id/clone", asyncHandler(controller.clone));

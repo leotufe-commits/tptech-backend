@@ -15,6 +15,7 @@ const PROMO_SELECT = {
   validTo:      true,
   untilStockEnd: true,
   priority:     true,
+  isStackable:  true,
   isActive:     true,
   notes:        true,
   deletedAt:    true,
@@ -49,6 +50,13 @@ const PROMO_SELECT = {
   brands: {
     select: { brand: true },
   },
+  groups: {
+    select: {
+      groupId: true,
+      group: { select: { id: true, name: true } },
+    },
+  },
+  applyOn: true,
 } as const;
 
 export async function listPromotions(
@@ -89,6 +97,7 @@ export async function createPromotion(jewelryId: string, data: any) {
   const variantIds: string[] = data.variantIds  ?? [];
   const categoryIds: string[]= data.categoryIds ?? [];
   const brands: string[]     = data.brands      ?? [];
+  const groupIds: string[]   = data.groupIds    ?? [];
 
   return prisma.$transaction(async (tx) => {
     const promo = await tx.promotion.create({
@@ -98,10 +107,12 @@ export async function createPromotion(jewelryId: string, data: any) {
         type:          data.type,
         value:         data.value,
         scope,
+        applyOn:       data.applyOn ?? "TOTAL",
         validFrom:     data.validFrom  ? new Date(data.validFrom) : null,
         validTo:       data.validTo    ? new Date(data.validTo)   : null,
         untilStockEnd: !!data.untilStockEnd,
         priority:      Number(data.priority ?? 0),
+        isStackable:   data.isStackable !== false,
         isActive:      data.isActive !== false,
         notes:         data.notes ?? "",
       },
@@ -131,6 +142,12 @@ export async function createPromotion(jewelryId: string, data: any) {
         skipDuplicates: true,
       });
     }
+    if (groupIds.length > 0) {
+      await tx.promotionGroup.createMany({
+        data: groupIds.map((groupId) => ({ promotionId: promo.id, groupId, jewelryId })),
+        skipDuplicates: true,
+      });
+    }
 
     return tx.promotion.findUniqueOrThrow({ where: { id: promo.id }, select: PROMO_SELECT });
   });
@@ -152,6 +169,7 @@ export async function updatePromotion(id: string, jewelryId: string, data: any) 
         ...(data.validTo      !== undefined ? { validTo:       data.validTo   ? new Date(data.validTo)   : null } : {}),
         ...(data.untilStockEnd !== undefined ? { untilStockEnd: !!data.untilStockEnd      } : {}),
         ...(data.priority     !== undefined ? { priority:      Number(data.priority)     } : {}),
+        ...(data.isStackable  !== undefined ? { isStackable:   !!data.isStackable        } : {}),
         ...(data.isActive     !== undefined ? { isActive:      !!data.isActive           } : {}),
         ...(data.notes        !== undefined ? { notes:         data.notes                } : {}),
       },
@@ -163,18 +181,21 @@ export async function updatePromotion(id: string, jewelryId: string, data: any) 
       data.articleIds  !== undefined ||
       data.variantIds  !== undefined ||
       data.categoryIds !== undefined ||
-      data.brands      !== undefined;
+      data.brands      !== undefined ||
+      data.groupIds    !== undefined;
 
     if (hasJunctionUpdate) {
       await tx.promotionArticle.deleteMany({ where: { promotionId: id } });
       await tx.promotionVariant.deleteMany({ where: { promotionId: id } });
       await tx.promotionCategory.deleteMany({ where: { promotionId: id } });
       await tx.promotionBrand.deleteMany({ where: { promotionId: id } });
+      await tx.promotionGroup.deleteMany({ where: { promotionId: id } });
 
       const articleIds: string[]  = data.articleIds  ?? [];
       const variantIds: string[]  = data.variantIds  ?? [];
       const categoryIds: string[] = data.categoryIds ?? [];
       const brands: string[]      = data.brands      ?? [];
+      const groupIds: string[]    = data.groupIds    ?? [];
 
       if (articleIds.length > 0) {
         await tx.promotionArticle.createMany({
@@ -197,6 +218,12 @@ export async function updatePromotion(id: string, jewelryId: string, data: any) 
       if (brands.length > 0) {
         await tx.promotionBrand.createMany({
           data: brands.map((brand) => ({ promotionId: id, brand, jewelryId })),
+          skipDuplicates: true,
+        });
+      }
+      if (groupIds.length > 0) {
+        await tx.promotionGroup.createMany({
+          data: groupIds.map((groupId) => ({ promotionId: id, groupId, jewelryId })),
           skipDuplicates: true,
         });
       }

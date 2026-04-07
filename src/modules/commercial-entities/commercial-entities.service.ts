@@ -1,5 +1,6 @@
 import { prisma } from "../../lib/prisma.js";
 import type { EntityType, BalanceType, AddressType } from "@prisma/client";
+import { aggregateEntityBalance } from "./balance.utils.js";
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -80,6 +81,8 @@ const ENTITY_LIST_SELECT = {
   commercialRuleType: true,
   commercialValueType: true,
   commercialValue: true,
+  taxExempt: true,
+  taxApplyOnOverride: true,
   balanceType: true,
   isActive: true,
   sourceType: true,
@@ -277,21 +280,57 @@ export async function getEntity(id: string, jewelryId: string) {
   assert(id, "Id inválido.");
   assert(jewelryId, "Tenant inválido.");
 
-  const raw = await prisma.commercialEntity.findFirst({
-    where: { id, jewelryId, deletedAt: null },
-    select: {
-      ...ENTITY_DETAIL_SELECT,
-      _count: {
-        select: {
-          relationsFrom: { where: { deletedAt: null } },
-          relationsTo:   { where: { deletedAt: null } },
+  const [raw, balanceEntries] = await Promise.all([
+    prisma.commercialEntity.findFirst({
+      where: { id, jewelryId, deletedAt: null },
+      select: {
+        ...ENTITY_DETAIL_SELECT,
+        _count: {
+          select: {
+            relationsFrom: { where: { deletedAt: null } },
+            relationsTo:   { where: { deletedAt: null } },
+          },
         },
       },
-    },
-  });
+    }),
+    prisma.entityBalanceEntry.findMany({
+      where: { entityId: id, jewelryId },
+      select: {
+        id: true,
+        role: true,
+        entryType: true,
+        amount: true,
+        currency: true,
+        documentRef: true,
+        notes: true,
+        createdAt: true,
+        voidedAt: true,
+        breakdownSnapshot: true,
+      },
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
   assert(raw, "Entidad no encontrada.");
   const { _count, ...entity } = raw;
-  return { ...entity, hasRelations: (_count.relationsFrom + _count.relationsTo) > 0 };
+
+  // Calcular balance agregado
+  const balanceType = entity.balanceType as "UNIFIED" | "BREAKDOWN";
+  const balance = aggregateEntityBalance(
+    balanceEntries.map((e) => ({
+      amount:            e.amount,
+      voidedAt:          e.voidedAt,
+      breakdownSnapshot: e.breakdownSnapshot,
+    })),
+    balanceType,
+  );
+
+  return {
+    ...entity,
+    hasRelations: (_count.relationsFrom + _count.relationsTo) > 0,
+    balance,
+    balanceEntries,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +402,8 @@ export async function createEntity(jewelryId: string, data: any) {
         data?.commercialValue != null && data.commercialValue !== ""
           ? String(data.commercialValue)
           : null,
+      taxExempt: data?.taxExempt === true,
+      taxApplyOnOverride: data?.taxApplyOnOverride || null,
       notes: s(data?.notes),
       isActive: true,
       sourceType: "MANUAL",
@@ -445,6 +486,8 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
         data?.commercialValue != null && data.commercialValue !== ""
           ? String(data.commercialValue)
           : null,
+      taxExempt: data?.taxExempt === true,
+      taxApplyOnOverride: data?.taxApplyOnOverride || null,
       notes: s(data?.notes),
     },
     select: ENTITY_DETAIL_SELECT,
