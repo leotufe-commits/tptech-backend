@@ -393,10 +393,16 @@ export async function importPreview(req: any, res: Response) {
 
 export async function importCommit(req: any, res: Response) {
   assert(req.user?.jewelryId, "Tenant inválido.");
-  const { rows, mode = "create", role = "supplier", matchBy = "documentNumber" } = req.body ?? {};
+  const { rows, mode = "create", role = "supplier", matchBy = "documentNumber", fileName } = req.body ?? {};
   assert(Array.isArray(rows) && rows.length > 0, "rows debe ser un array no vacío.");
   assert(rows.length <= 500, "Máximo 500 filas por importación.");
   return res.json(
-    await importService.commitImport(req.user.jewelryId, rows, { mode, role, matchBy })
+    await importService.commitImport(req.user.jewelryId, rows, {
+      mode,
+      role,
+      matchBy,
+      userId:   req.user?.id,
+      fileName: fileName ? String(fileName) : "",
+    })
   );
 }

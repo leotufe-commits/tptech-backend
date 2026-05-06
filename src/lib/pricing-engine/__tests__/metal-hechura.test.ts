@@ -2,7 +2,7 @@
 // Tests para applyPriceList en modo METAL_HECHURA
 
 import { describe, it, expect } from "vitest";
-import { applyPriceList } from "../../pricing.utils.js";
+import { applyPriceList } from "../pricing-engine.pricelist.js";
 import { Prisma } from "@prisma/client";
 
 // ---------------------------------------------------------------------------

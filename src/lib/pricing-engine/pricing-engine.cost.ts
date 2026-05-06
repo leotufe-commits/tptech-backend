@@ -1,36 +1,27 @@
 // src/lib/pricing-engine/pricing-engine.cost.ts
 // Motor de cálculo de costo de artículo con trazabilidad por pasos.
 //
-// Modos (en orden de prioridad):
-//   COST_LINES          → ArticleCostLine (nueva arquitectura)
-//                         FIX 1: si falla → cae a MANUAL en vez de abortar
-//   MANUAL              → manualBaseCost (o legacy costPrice)
-//   MULTIPLIER          → multiplierQuantity × multiplierValue
-//   METAL_MERMA_HECHURA → composiciones metálicas + merma + hechura
-//                         FIX 2: hechura PER_GRAM usa gramos CON merma
+// Único modo: COST_LINES → ArticleCostLine (arquitectura final)
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma.js";
 import type {
   ArticleCostInput,
+  BatchCostContext,
   CostLineInput,
   CostResult,
-  PriceBreakdown,
-  PriceBreakdownAdjustment,
-  PriceBreakdownMetalItem,
   PricingStep,
 } from "./pricing-engine.types.js";
 import {
   getBaseCurrencyId,
   getExchangeRate,
-  normalizeToBaseCurrency,
 } from "./pricing-engine.currency.js";
 
 // ---------------------------------------------------------------------------
 // applyAdjustment — aplica bonus/recargo sobre un valor base
 // ---------------------------------------------------------------------------
 
-function applyAdjustment(
+export function applyAdjustment(
   base: Prisma.Decimal,
   kind?: string | null,
   adjType?: string | null,
@@ -51,9 +42,22 @@ function applyAdjustment(
 async function modoCostLines(
   jewelryId: string,
   lines: CostLineInput[],
-  steps: PricingStep[]
-): Promise<{ value: Prisma.Decimal | null; partial: boolean; metalCost: Prisma.Decimal; hechuraCost: Prisma.Decimal; totalGrams: Prisma.Decimal }> {
-  const baseCurrencyId = await getBaseCurrencyId(jewelryId);
+  steps: PricingStep[],
+  entityMermaMap: Map<string, number> = new Map(),
+  ctx?: BatchCostContext
+): Promise<{
+  value: Prisma.Decimal | null;
+  partial: boolean;
+  metalCost: Prisma.Decimal;
+  hechuraCost: Prisma.Decimal;
+  totalGrams: Prisma.Decimal;
+  metalGramsWithMerma: Prisma.Decimal;
+  /** Sprint 3 — Pureza efectiva si todas las líneas METAL usan la misma
+   *  variante con purity definida. null si hay heterogeneidad o no hay metal. */
+  metalPurity: Prisma.Decimal | null;
+}> {
+  // Moneda base: desde contexto o query
+  const baseCurrencyId = ctx?.baseCurrencyId ?? await getBaseCurrencyId(jewelryId);
   if (!baseCurrencyId) {
     steps.push({
       key: "COST_LINES_BASE_CURRENCY",
@@ -62,14 +66,76 @@ async function modoCostLines(
       value: null,
       message: "No se encontró moneda base configurada",
     });
-    return { value: null, partial: true, metalCost: new Prisma.Decimal(0), hechuraCost: new Prisma.Decimal(0), totalGrams: new Prisma.Decimal(0) };
+    return { value: null, partial: true, metalCost: new Prisma.Decimal(0), hechuraCost: new Prisma.Decimal(0), totalGrams: new Prisma.Decimal(0), metalGramsWithMerma: new Prisma.Decimal(0), metalPurity: null };
   }
 
   let total = new Prisma.Decimal(0);
   let metalTotal = new Prisma.Decimal(0);
   let hechuraTotal = new Prisma.Decimal(0);
   let gramsTotal = new Prisma.Decimal(0);
+  let gramsWithMermaTotal = new Prisma.Decimal(0);
   let hasAllPrices = true;
+
+  // saleFactor + cotizaciones de metal. Con ctx: desde el mapa pre-cargado.
+  // Sin ctx: batch query (evita N+1 en el loop).
+  // quote.price = finalSalePrice = suggestedPrice × saleFactor.
+  // Base correcta: suggestedPrice = quote.price / saleFactor.
+  let metalVariantSaleFactors: Map<string, Prisma.Decimal>;
+  let metalQuoteMap: Map<string, { price: Prisma.Decimal }>;
+  // Sprint 3 — purity por variantId (Decimal 0-1). null cuando la variante
+  // no tiene purity definida.
+  let metalVariantPurities: Map<string, Prisma.Decimal | null>;
+
+  if (ctx) {
+    // Sin queries: extraer desde contexto pre-cargado
+    metalVariantSaleFactors = new Map(
+      [...ctx.metalVariantData.entries()].map(([k, v]) => [k, v.saleFactor])
+    );
+    metalQuoteMap = new Map(
+      [...ctx.metalVariantData.entries()].map(([k, v]) => [k, { price: v.price }])
+    );
+    metalVariantPurities = new Map(
+      [...ctx.metalVariantData.entries()].map(([k, v]) => [k, v.purity ?? null])
+    );
+  } else {
+    // Batch fetch para artículo individual (evita N+1 en el loop)
+    metalVariantSaleFactors = new Map<string, Prisma.Decimal>();
+    metalQuoteMap = new Map<string, { price: Prisma.Decimal }>();
+    metalVariantPurities = new Map<string, Prisma.Decimal | null>();
+    const metalVariantIds = [...new Set(
+      lines.filter(l => l.type === "METAL" && l.metalVariantId).map(l => l.metalVariantId as string)
+    )];
+    if (metalVariantIds.length > 0) {
+      const [variantRows, quoteRows] = await Promise.all([
+        prisma.metalVariant.findMany({
+          where: { id: { in: metalVariantIds } },
+          select: { id: true, saleFactor: true, purity: true },
+        }),
+        prisma.metalQuote.findMany({
+          where: { variantId: { in: metalVariantIds }, currencyId: baseCurrencyId },
+          orderBy: { effectiveAt: "desc" },
+          select: { variantId: true, price: true },
+        }),
+      ]);
+      for (const v of variantRows) {
+        metalVariantSaleFactors.set(v.id, new Prisma.Decimal(v.saleFactor?.toString() ?? "1"));
+        metalVariantPurities.set(
+          v.id,
+          v.purity != null ? new Prisma.Decimal(v.purity.toString()) : null,
+        );
+      }
+      for (const q of quoteRows) {
+        if (!metalQuoteMap.has(q.variantId)) metalQuoteMap.set(q.variantId, { price: q.price });
+      }
+    }
+  }
+  // Sprint 3 — purity efectiva del documento. Si todas las líneas METAL usan
+  // variantes con la misma purity definida, lo exponemos para que la capa
+  // pricelist calcule pureGramsBase. Si hay heterogeneidad (mezcla 18K/22K,
+  // o alguna variante sin purity), null. POLICY.md §8.
+  let observedPurity: Prisma.Decimal | null = null;
+  let purityHeterogeneous = false;
+  let metalLinesSeen = 0;
 
   for (const line of lines) {
     const qty = new Prisma.Decimal(line.quantity?.toString() ?? "0");
@@ -87,11 +153,7 @@ async function modoCostLines(
         continue;
       }
 
-      const quote = await prisma.metalQuote.findFirst({
-        where: { variantId: line.metalVariantId, currencyId: baseCurrencyId },
-        orderBy: { effectiveAt: "desc" },
-        select: { price: true },
-      });
+      const quote = metalQuoteMap.get(line.metalVariantId);
 
       if (!quote) {
         hasAllPrices = false;
@@ -106,15 +168,45 @@ async function modoCostLines(
         continue;
       }
 
+      // Sprint 3 — registrar purity de esta línea para resolver `metalPurity`
+      // del documento al final del loop.
+      metalLinesSeen += 1;
+      const linePurity = metalVariantPurities.get(line.metalVariantId) ?? null;
+      if (linePurity == null) {
+        purityHeterogeneous = true;
+      } else if (observedPurity == null) {
+        observedPurity = linePurity;
+      } else if (!observedPurity.equals(linePurity)) {
+        purityHeterogeneous = true;
+      }
+
+      // Merma efectiva: override de entidad > merma de línea > 0
+      const entityMerma = line.metalVariantId ? entityMermaMap.get(line.metalVariantId) : undefined;
+      const effectiveMerma = entityMerma != null ? entityMerma : (line.mermaPercent ?? 0);
+      const mermaSource    = entityMerma != null ? "entity" : "line";
       const mermaFactor = new Prisma.Decimal(1).add(
-        new Prisma.Decimal(line.mermaPercent?.toString() ?? "0").div(100)
+        new Prisma.Decimal(effectiveMerma.toString()).div(100)
       );
-      const baseLineCost = qty.mul(mermaFactor).mul(new Prisma.Decimal(quote.price.toString()));
+
+      // Usar suggestedPrice = quote.price / saleFactor como base del costo.
+      // quote.price almacena finalSalePrice = suggestedPrice × saleFactor. Si el saleFactor
+      // fue usado también como mermaPercent (práctica habitual), multiplicar por mermaFactor
+      // sobre finalSalePrice duplicaría ese factor. Al dividir primero por saleFactor obtenemos
+      // la base "sin factor" y aplicamos la merma una sola vez. Con saleFactor=1 el resultado
+      // es idéntico al comportamiento anterior.
+      const saleFactor = metalVariantSaleFactors.get(line.metalVariantId) ?? new Prisma.Decimal(1);
+      const suggestedPrice = saleFactor.gt(0)
+        ? new Prisma.Decimal(quote.price.toString()).div(saleFactor)
+        : new Prisma.Decimal(quote.price.toString());
+
+      const gramsWithMerma = qty.mul(mermaFactor);
+      const baseLineCost = gramsWithMerma.mul(suggestedPrice);
       // Ajuste por línea ignorado para METAL (solo aplica a HECHURA/PRODUCT/SERVICE)
       const lineCost = baseLineCost.lt(0) ? new Prisma.Decimal(0) : baseLineCost;
       total = total.add(lineCost);
       metalTotal = metalTotal.add(lineCost);
       gramsTotal = gramsTotal.add(qty);
+      gramsWithMermaTotal = gramsWithMermaTotal.add(gramsWithMerma);
 
       steps.push({
         key: "COST_LINES_METAL",
@@ -122,16 +214,30 @@ async function modoCostLines(
         status: "ok",
         value: lineCost,
         meta: {
-          variantId: line.metalVariantId, qty: qty.toString(), merma: line.mermaPercent, quotePrice: quote.price.toString(),
+          variantId: line.metalVariantId, qty: qty.toString(), merma: effectiveMerma, mermaSource,
+          // quotePrice expone el precio base (suggestedPrice) sobre el que se aplica la merma,
+          // no el finalSalePrice. Esto permite que la fórmula del simulador sea coherente.
+          quotePrice: suggestedPrice.toFixed(6),
         },
       });
     } else {
+      // FASE 2 — `catalogVariantId` se acepta en el tipo y se persiste en
+      // `ArticleCostLine`, pero NO altera el costo del componente: el motor
+      // sigue usando `qty × unitValue` (el `unitValue` viene poblado desde el
+      // costo del padre referenciado al armar la composición). El `variantId`
+      // se usa exclusivamente para descontar stock de la variante correcta
+      // en confirmSale (ver sales.service.ts). Si en el futuro se necesita
+      // recomputar el costo del componente con `weightOverride` de la
+      // variante, se hace acá leyendo `line.catalogVariantId`.
       const unitVal = new Prisma.Decimal(line.unitValue?.toString() ?? "0");
       let lineValue = qty.mul(unitVal);
 
       let conversionMeta: Record<string, string> | undefined;
       if (line.currencyId && line.currencyId !== baseCurrencyId) {
-        const rateInfo = await getExchangeRate(line.currencyId);
+        // Tasa desde contexto pre-cargado (batch) o query individual
+        const rateInfo = ctx
+          ? ctx.rateMap.get(line.currencyId) ?? null
+          : await getExchangeRate(line.currencyId);
         if (!rateInfo) {
           hasAllPrices = false;
           steps.push({
@@ -176,6 +282,10 @@ async function modoCostLines(
         status: "ok",
         value: lineValue,
         meta: {
+          // Cantidad y valor unitario (en moneda original si hay conversión, en base si no)
+          // — usados por el frontend para mostrar la fórmula "qty × unitValue = value".
+          qty:        qty.toString(),
+          unitValue:  unitVal.toString(),
           ...(conversionMeta ?? {}),
           ...(lineLabel ? { lineLabel }  : {}),
           ...(refCode   ? { lineCode: refCode } : {}),
@@ -185,557 +295,385 @@ async function modoCostLines(
     }
   }
 
-  return { value: total, partial: !hasAllPrices, metalCost: metalTotal, hechuraCost: hechuraTotal, totalGrams: gramsTotal };
+  // Sprint 3 — purity efectiva: solo la exponemos si hay al menos una línea
+  // METAL y todas comparten la misma purity. Cualquier variante sin purity o
+  // con purity distinta neutraliza el campo (null).
+  const metalPurity: Prisma.Decimal | null =
+    metalLinesSeen > 0 && !purityHeterogeneous && observedPurity != null
+      ? observedPurity
+      : null;
+
+  return { value: total, partial: !hasAllPrices, metalCost: metalTotal, hechuraCost: hechuraTotal, totalGrams: gramsTotal, metalGramsWithMerma: gramsWithMermaTotal, metalPurity };
 }
 
 // ---------------------------------------------------------------------------
-// modoManual — MANUAL
+// calculateCostFromLines — API pública canónica para costo desde composición
+//
+// Único punto de entrada para cálculo de costo. Procesa líneas de tipo
+// METAL, HECHURA, PRODUCT, SERVICE y MANUAL. Artículos sin líneas devuelven
+// { value: null, partial: true }.
+//
+// Parámetros:
+//   jewelryId  — tenant ID (para cotizaciones de metal y moneda base)
+//   lines      — líneas de composición de costo (ArticleCostLine)
+//   adjustment — ajuste global sobre el total de líneas (opcional)
+//   ctx        — contexto pre-cargado para cálculo en batch (sin N+1 queries)
 // ---------------------------------------------------------------------------
 
-async function modoManual(
+export async function calculateCostFromLines(
   jewelryId: string,
-  article: ArticleCostInput,
-  steps: PricingStep[]
-): Promise<Prisma.Decimal | null> {
-  let val: Prisma.Decimal | null = null;
-
-  if (article.manualBaseCost != null) {
-    val = new Prisma.Decimal(article.manualBaseCost.toString());
-
-    // Convertir a base ANTES de aplicar ajuste (FIX: conversión primero)
-    if (article.manualCurrencyId) {
-      const baseCurrencyId = await getBaseCurrencyId(jewelryId);
-      if (baseCurrencyId && article.manualCurrencyId !== baseCurrencyId) {
-        const converted = await normalizeToBaseCurrency({
-          rawValue: val,
-          currencyId: article.manualCurrencyId,
-          baseCurrencyId,
-          stepKey: "MANUAL_CURRENCY",
-          stepLabel: "Conversión de moneda (costo manual)",
-          steps,
-        });
-        if (converted === null) return null;
-        val = converted;
-      }
-    }
-
-    // Aplicar ajuste sobre el valor ya convertido
-    val = applyAdjustment(
-      val,
-      article.manualAdjustmentKind,
-      article.manualAdjustmentType,
-      article.manualAdjustmentValue
-    );
-
-    steps.push({
-      key: "MANUAL_BASE_COST",
-      label: "Costo manual (base)",
-      status: "ok",
-      value: val,
-      meta: {
-        manualBaseCost: article.manualBaseCost?.toString(),
-        adjustmentKind: article.manualAdjustmentKind,
-      },
-    });
-  } else if (article.costPrice != null) {
-    // Fallback legacy: costPrice ya incluye ajuste
-    val = new Prisma.Decimal(article.costPrice.toString());
-    steps.push({
-      key: "MANUAL_COST_PRICE",
-      label: "Costo manual (legacy costPrice)",
-      status: "ok",
-      value: val,
-    });
-  } else {
-    steps.push({
-      key: "MANUAL_COST_PRICE",
-      label: "Costo manual",
-      status: "missing",
-      value: null,
-      message: "No hay costPrice ni manualBaseCost configurado",
-    });
-    return null;
-  }
-
-  return val;
-}
-
-// ---------------------------------------------------------------------------
-// modoMultiplier — MULTIPLIER
-// ---------------------------------------------------------------------------
-
-async function modoMultiplier(
-  jewelryId: string,
-  article: ArticleCostInput,
-  steps: PricingStep[]
-): Promise<Prisma.Decimal | null> {
-  if (article.multiplierValue == null || article.multiplierQuantity == null) {
-    steps.push({
-      key: "MULTIPLIER",
-      label: "Modo multiplicador",
-      status: "missing",
-      value: null,
-      message: "Faltan multiplierValue o multiplierQuantity",
-    });
-    return null;
-  }
-
-  let base = new Prisma.Decimal(article.multiplierQuantity.toString())
-    .mul(new Prisma.Decimal(article.multiplierValue.toString()));
-
-  if (article.multiplierCurrencyId) {
-    const baseCurrencyId = await getBaseCurrencyId(jewelryId);
-    if (baseCurrencyId && article.multiplierCurrencyId !== baseCurrencyId) {
-      const converted = await normalizeToBaseCurrency({
-        rawValue: base,
-        currencyId: article.multiplierCurrencyId,
-        baseCurrencyId,
-        stepKey: "MULTIPLIER_CURRENCY",
-        stepLabel: "Conversión de moneda (multiplicador)",
-        steps,
-      });
-      if (converted === null) return null;
-      base = converted;
-    }
-  }
-
-  const result = applyAdjustment(
-    base,
-    article.manualAdjustmentKind,
-    article.manualAdjustmentType,
-    article.manualAdjustmentValue
-  );
-
-  steps.push({
-    key: "MULTIPLIER",
-    label: "Modo multiplicador",
-    status: "ok",
-    value: result,
-    meta: {
-      qty: article.multiplierQuantity?.toString(),
-      value: article.multiplierValue?.toString(),
-      base: article.multiplierBase,
-    },
-  });
-
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// modoMetalMermaHechura — METAL_MERMA_HECHURA
-// FIX 2: hechura PER_GRAM usa gramos CON merma
-// ---------------------------------------------------------------------------
-
-async function modoMetalMermaHechura(
-  jewelryId: string,
-  article: ArticleCostInput,
-  steps: PricingStep[]
-): Promise<{ value: Prisma.Decimal | null; metalCost: Prisma.Decimal; hechuraCost: Prisma.Decimal; totalGrams: Prisma.Decimal; partial: boolean }> {
-  const compositions = article.compositions ?? [];
-  if (compositions.length === 0) {
-    steps.push({
-      key: "METAL_MERMA_HECHURA",
-      label: "Composición metálica",
-      status: "missing",
-      value: null,
-      message: "No hay composiciones metálicas configuradas",
-    });
-    return { value: null, metalCost: new Prisma.Decimal(0), hechuraCost: new Prisma.Decimal(0), totalGrams: new Prisma.Decimal(0), partial: true };
-  }
-
-  const baseCurrencyId = await getBaseCurrencyId(jewelryId);
-  if (!baseCurrencyId) {
-    steps.push({
-      key: "METAL_MERMA_BASE_CURRENCY",
-      label: "Moneda base del tenant",
-      status: "missing",
-      value: null,
-      message: "No se encontró moneda base configurada",
-    });
-    return { value: null, metalCost: new Prisma.Decimal(0), hechuraCost: new Prisma.Decimal(0), totalGrams: new Prisma.Decimal(0), partial: true };
-  }
-
-  // Merma efectiva: artículo → categoría → jewelry → 0
-  const jewelry = await prisma.jewelry.findUnique({
-    where: { id: jewelryId },
-    select: { defaultMermaPercent: true },
-  });
-  const rawMerma =
-    article.mermaPercent ??
-    article.category?.mermaPercent ??
-    jewelry?.defaultMermaPercent ??
-    0;
-  const mermaFactor = new Prisma.Decimal(1).add(
-    new Prisma.Decimal(rawMerma.toString()).div(100)
-  );
-
-  let metalCost = new Prisma.Decimal(0);
-  let totalBaseGrams = new Prisma.Decimal(0);
-  let totalGramsWithMerma = new Prisma.Decimal(0);
-  let hasAllPrices = true;
-
-  for (const comp of compositions) {
-    const quote = await prisma.metalQuote.findFirst({
-      where: { variantId: comp.variantId, currencyId: baseCurrencyId },
-      orderBy: { effectiveAt: "desc" },
-      select: { price: true },
-    });
-    if (!quote) {
-      hasAllPrices = false;
-      steps.push({
-        key: "METAL_QUOTE",
-        label: "Cotización de metal",
-        status: "missing",
-        value: null,
-        message: `Sin cotización para variante ${comp.variantId}`,
-        meta: { variantId: comp.variantId },
-      });
-      continue;
-    }
-
-    const grams = new Prisma.Decimal(comp.grams.toString());
-    const gramsConMerma = grams.mul(mermaFactor);
-    const lineCost = gramsConMerma.mul(new Prisma.Decimal(quote.price.toString()));
-    metalCost = metalCost.add(lineCost);
-    totalBaseGrams = totalBaseGrams.add(grams);
-    totalGramsWithMerma = totalGramsWithMerma.add(gramsConMerma);
-
-    steps.push({
-      key: "METAL_QUOTE",
-      label: "Cotización de metal",
-      status: "ok",
-      value: lineCost,
-      meta: {
-        variantId: comp.variantId,
-        grams: grams.toString(),
-        gramsConMerma: gramsConMerma.toString(),
-        price: quote.price.toString(),
-        merma: rawMerma,
-      },
-    });
-  }
-
-  // Hechura
-  let hechura = new Prisma.Decimal(0);
-  if (article.hechuraPrice != null) {
-    const hp = new Prisma.Decimal(article.hechuraPrice.toString());
-    if (article.hechuraPriceMode === "PER_GRAM") {
-      // FIX 2: usar gramos CON merma (consistente con metalCost)
-      hechura = hp.mul(totalGramsWithMerma);
-    } else {
-      hechura = hp;
-    }
-    steps.push({
-      key: "HECHURA",
-      label: "Hechura",
-      status: "ok",
-      value: hechura,
-      meta: {
-        mode: article.hechuraPriceMode,
-        price: article.hechuraPrice?.toString(),
-        gramsWithMerma: totalGramsWithMerma.toString(),
-      },
-    });
-  }
-
-  const base = metalCost.add(hechura);
-  const result = applyAdjustment(
-    base,
-    article.manualAdjustmentKind,
-    article.manualAdjustmentType,
-    article.manualAdjustmentValue
-  );
-
-  steps.push({
-    key: "METAL_MERMA_HECHURA_TOTAL",
-    label: "Total metal + merma + hechura",
-    status: hasAllPrices ? "ok" : "partial",
-    value: result,
-    meta: { metalCost: metalCost.toString(), hechura: hechura.toString(), merma: rawMerma },
-  });
-
-  return {
-    value: result,
-    metalCost,
-    hechuraCost: hechura,
-    totalGrams: totalBaseGrams,
-    partial: !hasAllPrices,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// resolveArticleCost — función principal del motor de costo
-// ---------------------------------------------------------------------------
-
-export async function resolveArticleCost(
-  jewelryId: string,
-  article: ArticleCostInput
+  lines: CostLineInput[],
+  adjustment?: {
+    kind?:  string | null;
+    type?:  string | null;
+    value?: any;
+  },
+  ctx?: BatchCostContext,
 ): Promise<CostResult> {
   const steps: PricingStep[] = [];
-  let base: CostResult;
 
-  // ── COST_LINES (prioridad máxima) ─────────────────────────────────────────
-  if (article.costComposition && article.costComposition.length > 0) {
-    const linesResult = await modoCostLines(jewelryId, article.costComposition, steps);
-
-    if (linesResult.value !== null) {
-      const adjusted = applyAdjustment(
-        linesResult.value,
-        article.manualAdjustmentKind,
-        article.manualAdjustmentType,
-        article.manualAdjustmentValue
-      );
-      steps.push({
-        key: "COST_LINES_FINAL",
-        label: "Total líneas de costo (con ajuste)",
-        status: linesResult.partial ? "partial" : "ok",
-        value: adjusted,
-        meta: {
-          adjustmentKind:  article.manualAdjustmentKind  ?? null,
-          adjustmentType:  article.manualAdjustmentType  ?? null,
-          adjustmentValue: article.manualAdjustmentValue != null ? String(article.manualAdjustmentValue) : null,
-          sumLines:        linesResult.value.toString(),
-        },
-      });
-      // Distribuir el ajuste global proporcionalmente entre metal y hechura
-      // para que costResult.hechuraCost siempre sea consistente con costResult.value.
-      const adjFactor = linesResult.value.gt(0)
-        ? adjusted.div(linesResult.value)
-        : new Prisma.Decimal(1);
-      base = {
-        value: adjusted,
-        mode: "COST_LINES",
-        partial: linesResult.partial,
-        steps,
-        metalCost:   linesResult.metalCost.mul(adjFactor),
-        hechuraCost: linesResult.hechuraCost.mul(adjFactor),
-        totalGrams: linesResult.totalGrams,
-      };
-    } else {
-      // FIX 1: COST_LINES falló → cae a MANUAL si hay datos disponibles
-      steps.push({
-        key: "COST_LINES_FALLBACK",
-        label: "COST_LINES sin datos → intenta MANUAL",
-        status: "skipped",
-        value: null,
-        message: "Sin cotizaciones o moneda base; se intenta modo MANUAL",
-      });
-
-      if (article.manualBaseCost != null || article.costPrice != null) {
-        const manualVal = await modoManual(jewelryId, article, steps);
-        base = {
-          value: manualVal,
-          mode: "COST_LINES→MANUAL",
-          partial: manualVal === null,
-          steps,
-        };
-      } else {
-        base = { value: null, mode: "COST_LINES", partial: true, steps };
-      }
-    }
-  } else {
-    const mode = article.costCalculationMode ?? "MANUAL";
-
-    // ── MANUAL ────────────────────────────────────────────────────────────────
-    if (mode === "MANUAL") {
-      const val = await modoManual(jewelryId, article, steps);
-      base = {
-        value: val,
-        mode: "MANUAL",
-        partial: val === null,
-        steps,
-      };
-
-    // ── MULTIPLIER ────────────────────────────────────────────────────────────
-    } else if (mode === "MULTIPLIER") {
-      const val = await modoMultiplier(jewelryId, article, steps);
-      base = {
-        value: val,
-        mode: "MULTIPLIER",
-        partial: val === null,
-        steps,
-      };
-
-    // ── METAL_MERMA_HECHURA ───────────────────────────────────────────────────
-    } else if (mode === "METAL_MERMA_HECHURA") {
-      const result = await modoMetalMermaHechura(jewelryId, article, steps);
-      base = {
-        value: result.value,
-        mode: "METAL_MERMA_HECHURA",
-        partial: result.partial || result.value === null,
-        steps,
-        metalCost: result.metalCost,
-        hechuraCost: result.hechuraCost,
-        totalGrams: result.totalGrams,
-      };
-
-    } else {
-      steps.push({
-        key: "UNKNOWN_MODE",
-        label: "Modo de cálculo",
-        status: "missing",
-        value: null,
-        message: `Modo desconocido: ${mode}`,
-      });
-      base = { value: null, mode, partial: false, steps };
-    }
+  if (!lines || lines.length === 0) {
+    steps.push({
+      key:     "COST_LINES_EMPTY",
+      label:   "Sin líneas de costo",
+      status:  "missing",
+      value:   null,
+      message: "No se proporcionaron líneas de costo",
+    });
+    return { value: null, mode: "COST_LINES", partial: true, steps };
   }
 
-  // ── Adjuntar breakdown Metal/Hechura cuando hay valor ─────────────────────
-  if (base.value !== null) {
-    const breakdown = await buildPriceBreakdown(article, base);
-    return { ...base, breakdown };
+  const linesResult = await modoCostLines(jewelryId, lines, steps, new Map(), ctx);
+
+  if (linesResult.value === null) {
+    return { value: null, mode: "COST_LINES", partial: true, steps };
   }
-  return base;
+
+  const adjusted = applyAdjustment(
+    linesResult.value,
+    adjustment?.kind,
+    adjustment?.type,
+    adjustment?.value,
+  );
+
+  steps.push({
+    key:    "COST_LINES_FINAL",
+    label:  "Total líneas de costo (con ajuste)",
+    status: linesResult.partial ? "partial" : "ok",
+    value:  adjusted,
+    meta: {
+      adjustmentKind:  adjustment?.kind  ?? null,
+      adjustmentType:  adjustment?.type  ?? null,
+      adjustmentValue: adjustment?.value != null ? String(adjustment.value) : null,
+      sumLines:        linesResult.value.toString(),
+    },
+  });
+
+  const adjFactor = linesResult.value.gt(0)
+    ? adjusted.div(linesResult.value)
+    : new Prisma.Decimal(1);
+
+  return {
+    value:               adjusted,
+    mode:                "COST_LINES",
+    partial:             linesResult.partial,
+    steps,
+    metalCost:           linesResult.metalCost.mul(adjFactor),
+    hechuraCost:         linesResult.hechuraCost.mul(adjFactor),
+    totalGrams:          linesResult.totalGrams,
+    metalGramsWithMerma: linesResult.metalGramsWithMerma,
+    // Sprint 3 — POLICY.md §8 — alimenta pureGramsBase en el motor de venta.
+    metalPurity:         linesResult.metalPurity,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// buildPriceBreakdown — construye el desglose Metal/Hechura desde CostResult
+// enrichCostMetalSteps — agrega metalName/variantName/variantSku/purity a cada
+// step COST_LINES_METAL. Llamado desde resolveFinalSalePrice y buildPriceBreakdown.
 // ---------------------------------------------------------------------------
 
-export async function buildPriceBreakdown(
-  article: ArticleCostInput,
-  costResult: CostResult
-): Promise<PriceBreakdown | null> {
-  if (costResult.value === null) return null;
-
-  const unified   = parseFloat(costResult.value.toString());
-  const metalTotal = costResult.metalCost  ? parseFloat(costResult.metalCost.toString())  : 0;
-  const hechuraBase = costResult.hechuraCost ? parseFloat(costResult.hechuraCost.toString()) : 0;
-
-  // ── Metal items desde steps ──────────────────────────────────────────────
-  const metalItems: PriceBreakdownMetalItem[] = [];
+export async function enrichCostMetalSteps(steps: PricingStep[]): Promise<void> {
   const variantIds: string[] = [];
-
-  for (const step of costResult.steps) {
-    if (step.status !== "ok" || step.value == null) continue;
-    const m = step.meta ?? {};
-    if (step.key === "COST_LINES_METAL") {
-      const vid = (m.variantId as string | null) ?? null;
-      if (vid) variantIds.push(vid);
-      metalItems.push({
-        variantId:    vid,
-        gramsOriginal: m.qty   ? parseFloat(String(m.qty))        : null,
-        unitValue:    m.quotePrice ? parseFloat(String(m.quotePrice)) : null,
-        totalValue:   parseFloat(step.value.toString()),
-      });
-    } else if (step.key === "METAL_QUOTE") {
-      const vid = (m.variantId as string | null) ?? null;
-      if (vid) variantIds.push(vid);
-      metalItems.push({
-        variantId:    vid,
-        gramsOriginal: m.grams ? parseFloat(String(m.grams)) : null,
-        unitValue:    m.price  ? parseFloat(String(m.price)) : null,
-        totalValue:   parseFloat(step.value.toString()),
-      });
-    }
+  for (const step of steps) {
+    if (step.key !== "COST_LINES_METAL" || !step.meta) continue;
+    const vId = String(step.meta.variantId ?? "");
+    if (vId) variantIds.push(vId);
   }
+  if (variantIds.length === 0) return;
 
-  // Enriquecer con pureza, metalId, variantName y metalName desde MetalVariant (batch)
-  if (variantIds.length > 0) {
-    const variantMap = new Map<string, { purity: number | null; metalId: string; variantName: string; metalName: string | null; metalSymbol: string | null }>();
-    const variantRows = await prisma.metalVariant.findMany({
-      where: { id: { in: variantIds } },
-      select: { id: true, name: true, purity: true, metalId: true, metal: { select: { id: true, name: true, symbol: true } } },
+  const variantRows = await prisma.metalVariant.findMany({
+    where: { id: { in: variantIds } },
+    select: {
+      id:        true,
+      name:      true,
+      sku:       true,
+      purity:    true,
+      saleFactor: true,
+      metalId:   true,
+      metal: { select: { name: true, symbol: true } },
+    },
+  });
+
+  type VariantInfo = {
+    purity:      number | null;
+    saleFactor:  number;
+    metalId:     string;
+    variantName: string;
+    variantSku:  string;
+    metalName:   string | null;
+    metalSymbol: string | null;
+  };
+  const variantMap = new Map<string, VariantInfo>();
+  for (const row of variantRows) {
+    variantMap.set(row.id, {
+      purity:      row.purity      != null ? parseFloat(row.purity.toString())      : null,
+      saleFactor:  row.saleFactor  != null ? parseFloat(row.saleFactor.toString())  : 1,
+      metalId:     row.metalId,
+      variantName: row.name,
+      variantSku:  row.sku,
+      metalName:   row.metal?.name   ?? null,
+      metalSymbol: row.metal?.symbol ?? null,
     });
-    for (const row of variantRows) {
-      variantMap.set(row.id, {
-        purity:       row.purity != null ? parseFloat(row.purity.toString()) : null,
-        metalId:      row.metalId,
-        variantName:  row.name,
-        metalName:    (row as any).metal?.name   ?? null,
-        metalSymbol:  (row as any).metal?.symbol ?? null,
-      });
-    }
-    for (const item of metalItems) {
-      if (!item.variantId) continue;
-      const v = variantMap.get(item.variantId);
-      if (!v) continue;
-      item.metalId = v.metalId;
-      if (v.purity != null) {
-        item.purity = v.purity;
-        item.gramsPure = item.gramsOriginal != null ? parseFloat((item.gramsOriginal * v.purity).toFixed(6)) : null;
-        item.gramsFineEquivalent = item.gramsPure;
-      }
-    }
-    // Enriquecer steps de metal con purity, gramsOriginal, gramsFineEquivalent, metalId, variantName, metalName
-    for (const step of costResult.steps) {
-      if ((step.key !== "COST_LINES_METAL" && step.key !== "METAL_QUOTE") || !step.meta) continue;
-      const vId = String(step.meta.variantId ?? "");
-      const v = variantMap.get(vId);
-      if (!v) continue;
-      const gramsOriginal: number | null = step.key === "METAL_QUOTE"
-        ? (step.meta.grams != null ? parseFloat(String(step.meta.grams)) : null)
-        : (step.meta.qty   != null ? parseFloat(String(step.meta.qty))   : null);
-      const gramsFineEquivalent: number | null =
-        gramsOriginal != null && v.purity != null
-          ? parseFloat((gramsOriginal * v.purity).toFixed(6))
-          : null;
-      step.meta = {
-        ...step.meta,
-        ...(v.metalId                   && { metalId: v.metalId }),
-        ...(v.variantName               && { variantName: v.variantName }),
-        ...(v.metalName                 && { metalName: v.metalName }),
-        ...(v.metalSymbol               && { metalSymbol: v.metalSymbol }),
-        ...(v.purity             != null && { purity: v.purity }),
-        ...(gramsOriginal        != null && { gramsOriginal }),
-        ...(gramsFineEquivalent  != null && { gramsFineEquivalent }),
-      };
+  }
+
+  for (const step of steps) {
+    if (step.key !== "COST_LINES_METAL" || !step.meta) continue;
+    const vId = String(step.meta.variantId ?? "");
+    const v = variantMap.get(vId);
+    if (!v) continue;
+    const gramsOriginal: number | null =
+      step.meta.qty != null ? parseFloat(String(step.meta.qty)) : null;
+    const rawMerma  = step.meta.merma != null ? parseFloat(String(step.meta.merma)) : 0;
+    const mermaMul  = 1 + rawMerma / 100;
+    const gramsFineEquivalent: number | null =
+      gramsOriginal != null && v.purity != null
+        ? parseFloat((gramsOriginal * v.purity * mermaMul).toFixed(6))
+        : null;
+    step.meta = {
+      ...step.meta,
+      metalId:     v.metalId,
+      variantName: v.variantName,
+      variantSku:  v.variantSku,
+      ...(v.metalName          && { metalName:   v.metalName }),
+      ...(v.metalSymbol        && { metalSymbol: v.metalSymbol }),
+      ...(v.purity      != null && { purity: v.purity }),
+      ...(v.saleFactor  !== 1   && { saleFactor: v.saleFactor }),
+      ...(gramsOriginal != null && { gramsOriginal }),
+      ...(gramsFineEquivalent != null && { gramsFineEquivalent }),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// buildBatchCostContext — pre-carga todos los datos necesarios para un batch
+// de artículos sin queries dentro del loop (evita N+1 en listArticles)
+// ---------------------------------------------------------------------------
+
+export async function buildBatchCostContext(
+  jewelryId: string,
+  articles: ArticleCostInput[]
+): Promise<BatchCostContext> {
+  // Recolectar todos los variantIds y currencyIds únicos del batch
+  const variantIdSet = new Set<string>();
+  const currencyIdSet = new Set<string>();
+
+  for (const a of articles) {
+    for (const l of (a.costComposition ?? [])) {
+      if (l.type === "METAL" && l.metalVariantId) variantIdSet.add(l.metalVariantId);
+      if (l.currencyId) currencyIdSet.add(l.currencyId);
     }
   }
 
-  // ── Hechura adjustments (bonificación / recargo aplicado al total) ────────
-  const adjustments: PriceBreakdownAdjustment[] = [];
-  const adjKind = article.manualAdjustmentKind;
-  if (adjKind && adjKind !== "") {
-    // El ajuste impacta en la diferencia entre (metal + hechuraBase) y el total
-    const baseBeforeAdj = metalTotal + hechuraBase;
-    const adjAmount = unified - baseBeforeAdj;
-    if (Math.abs(adjAmount) > 0.001) {
-      adjustments.push({
-        type:   adjKind === "BONUS" ? "BONUS" : "SURCHARGE",
-        label:  adjKind === "BONUS" ? "Bonificación" : "Recargo",
-        amount: adjAmount,
-      });
-    }
-  }
+  const variantIds    = [...variantIdSet];
+  const currencyIds   = [...currencyIdSet];
 
-  // ── Para modo MANUAL: extraer base y ajuste desde steps ──────────────────
-  if (metalTotal === 0 && metalItems.length === 0) {
-    // Todo es hechura; si hay ajuste, base es el valor antes del ajuste
-    const baseCostStep = costResult.steps.find(
-      s => s.key === "MANUAL_BASE_COST" && s.status === "ok" && s.value != null
+  // Query paralela: jewelry, metalVariant, metalQuote, currencyRate
+  const [jewelry, baseCurrencyRow, variantRows, rateRows] = await Promise.all([
+    prisma.jewelry.findUnique({
+      where: { id: jewelryId },
+      select: { defaultMermaPercent: true },
+    }),
+    prisma.currency.findFirst({
+      where: { jewelryId, isBase: true, deletedAt: null },
+      select: { id: true },
+    }),
+    variantIds.length > 0
+      ? prisma.metalVariant.findMany({
+          where: { id: { in: variantIds } },
+          select: { id: true, saleFactor: true, purity: true },
+        })
+      : Promise.resolve([]),
+    currencyIds.length > 0
+      ? prisma.currencyRate.findMany({
+          where: { currencyId: { in: currencyIds } },
+          orderBy: { createdAt: "desc" },
+          select: {
+            currencyId: true,
+            rate: true,
+            currency: { select: { code: true, symbol: true } },
+          },
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const baseCurrencyId = baseCurrencyRow?.id ?? "";
+
+  // metalVariant saleFactor map
+  const saleFactorMap = new Map<string, Prisma.Decimal>();
+  // Sprint 3 — purity por variantId (Decimal 0-1 o null).
+  const purityMap = new Map<string, Prisma.Decimal | null>();
+  for (const v of variantRows) {
+    saleFactorMap.set(v.id, new Prisma.Decimal(v.saleFactor?.toString() ?? "1"));
+    purityMap.set(
+      v.id,
+      (v as any).purity != null ? new Prisma.Decimal((v as any).purity.toString()) : null,
     );
-    if (baseCostStep?.meta?.manualBaseCost != null && adjustments.length === 0) {
-      const rawBase = parseFloat(String(baseCostStep.meta.manualBaseCost));
-      const adjAmt  = unified - rawBase;
-      if (Math.abs(adjAmt) > 0.001) {
-        adjustments.push({
-          type:   adjAmt < 0 ? "BONUS" : "SURCHARGE",
-          label:  adjAmt < 0 ? "Bonificación" : "Recargo",
-          amount: adjAmt,
-        });
-      }
+  }
+
+  // metalQuote por variante en moneda base (query separada, necesita baseCurrencyId)
+  let quoteRows: { variantId: string; price: Prisma.Decimal }[] = [];
+  if (variantIds.length > 0 && baseCurrencyId) {
+    quoteRows = await prisma.metalQuote.findMany({
+      where: { variantId: { in: variantIds }, currencyId: baseCurrencyId },
+      orderBy: { effectiveAt: "desc" },
+      select: { variantId: true, price: true },
+    });
+  }
+
+  // Construir metalVariantData: variantId → { price, saleFactor, purity }
+  const metalVariantData = new Map<string, { price: Prisma.Decimal; saleFactor: Prisma.Decimal; purity: Prisma.Decimal | null }>();
+  for (const q of quoteRows) {
+    if (!metalVariantData.has(q.variantId)) {
+      metalVariantData.set(q.variantId, {
+        price:      new Prisma.Decimal(q.price.toString()),
+        saleFactor: saleFactorMap.get(q.variantId) ?? new Prisma.Decimal(1),
+        purity:     purityMap.get(q.variantId) ?? null,
+      });
+    }
+  }
+  // Rellenar variantes sin cotización (para que saleFactorMap esté completa)
+  for (const v of variantRows) {
+    if (!metalVariantData.has(v.id)) {
+      metalVariantData.set(v.id, {
+        price:      new Prisma.Decimal(0),
+        saleFactor: saleFactorMap.get(v.id) ?? new Prisma.Decimal(1),
+        purity:     purityMap.get(v.id) ?? null,
+      });
     }
   }
 
-  const hechuraTotal = unified - metalTotal;
+  // rateMap: currencyId → { rate, code, symbol } (solo la tasa más reciente por moneda)
+  const rateMap = new Map<string, { rate: Prisma.Decimal; code: string; symbol: string }>();
+  for (const r of rateRows) {
+    if (!rateMap.has(r.currencyId)) {
+      rateMap.set(r.currencyId, {
+        rate:   new Prisma.Decimal(r.rate.toString()),
+        code:   r.currency.code,
+        symbol: r.currency.symbol,
+      });
+    }
+  }
 
   return {
-    mode: costResult.mode,
-    metal: {
-      items: metalItems,
-      total: metalTotal,
-    },
-    hechura: {
-      base: hechuraBase > 0 ? hechuraBase : (metalTotal === 0 ? unified : hechuraTotal),
-      adjustments,
-      total: hechuraTotal,
-    },
-    totals: {
-      metal:   metalTotal,
-      hechura: hechuraTotal,
-      unified,
-    },
+    baseCurrencyId,
+    defaultMermaPercent: jewelry?.defaultMermaPercent ?? 0,
+    metalVariantData,
+    rateMap,
+    // Cache lazy de metales por artículo (FASE 3 — scope METALS).
+    // Empieza vacío porque `ArticleCostInput` no incluye `id`; se popula
+    // on-demand desde `getArticleMetalVariantIds(...,ctx)` o vía
+    // `loadArticleMetalVariantsBatch` antes del loop.
+    articleMetalVariantsMap: new Map<string, string[]>(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// resolveVariantAwareWeight — resuelve el peso final respetando el override de variante
+// ---------------------------------------------------------------------------
+//
+// Regla (prioridad mayor → menor):
+//   1. variant.weightOverride != null → usarlo (incluyendo 0, que es válido)
+//   2. article.weight != null         → usarlo como fallback legacy
+//   3. null                           → sin peso disponible
+//
+// Notas:
+// - La comparación es != null (no "falsy"), por lo que 0 se trata como peso válido.
+// - El caller puede pasar cualquier tipo numérico; la función normaliza a Decimal.
+// - Esta función es pura: sin efectos secundarios ni queries.
+
+export function resolveVariantAwareWeight(
+  articleWeight: any,
+  variantWeightOverride?: any
+): Prisma.Decimal | null {
+  if (variantWeightOverride != null) {
+    return new Prisma.Decimal(variantWeightOverride.toString());
+  }
+  if (articleWeight != null) {
+    return new Prisma.Decimal(articleWeight.toString());
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// getArticleMetalVariantIds — set de variantes de metal del artículo
+// ---------------------------------------------------------------------------
+//
+// Retorna los `metalVariantId` distintos presentes en la composición de costo
+// del artículo (líneas tipo METAL). Usado por la evaluación de scope METALS
+// en promociones, cupones y descuentos por cantidad.
+//
+// v1: NO se propagan metales desde componentes de combos comerciales — solo
+// la composición DIRECTA del articleId pedido. Si el ctx ya pre-cargó el set,
+// se devuelve sin nueva query.
+
+export async function getArticleMetalVariantIds(
+  jewelryId: string,
+  articleId: string,
+  ctx?: BatchCostContext
+): Promise<string[]> {
+  if (ctx?.articleMetalVariantsMap?.has(articleId)) {
+    return ctx.articleMetalVariantsMap.get(articleId)!;
+  }
+  // Defensa contra mocks parciales de prisma en tests: si el cliente no
+  // expone `articleCostLine`, devolvemos []. En producción siempre existe.
+  if (!(prisma as any).articleCostLine?.findMany) return [];
+  const lines = await prisma.articleCostLine.findMany({
+    where: { jewelryId, articleId, type: "METAL", metalVariantId: { not: null } },
+    select: { metalVariantId: true },
+  });
+  const ids = [...new Set(
+    lines.map(l => l.metalVariantId).filter((v): v is string => !!v)
+  )];
+  if (ctx?.articleMetalVariantsMap) {
+    ctx.articleMetalVariantsMap.set(articleId, ids);
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// loadArticleMetalVariantsBatch — versión batch (1 query para N artículos)
+// ---------------------------------------------------------------------------
+// Útil cuando se procesa una lista grande de artículos (listados, ventas con
+// muchas líneas). El consumidor puede pasar el resultado a `BatchCostContext`
+// vía `articleMetalVariantsMap` para evitar `getArticleMetalVariantIds` lazy
+// dentro del loop.
+
+export async function loadArticleMetalVariantsBatch(
+  jewelryId: string,
+  articleIds: string[]
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (articleIds.length === 0) return out;
+  const lines = await prisma.articleCostLine.findMany({
+    where: { jewelryId, articleId: { in: articleIds }, type: "METAL", metalVariantId: { not: null } },
+    select: { articleId: true, metalVariantId: true },
+  });
+  for (const id of articleIds) out.set(id, []);
+  for (const l of lines) {
+    if (!l.metalVariantId) continue;
+    const arr = out.get(l.articleId) ?? [];
+    if (!arr.includes(l.metalVariantId)) arr.push(l.metalVariantId);
+    out.set(l.articleId, arr);
+  }
+  return out;
 }

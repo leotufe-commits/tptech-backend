@@ -17,6 +17,8 @@ const TEMPLATE_SELECT = {
   id: true, name: true, widthMm: true, heightMm: true,
   dpi: true, orientation: true, bgColor: true,
   isDefault: true, isActive: true, deletedAt: true, createdAt: true, updatedAt: true,
+  defaultPrinterProfileId: true,
+  defaultPrinterProfile: { select: { id: true, name: true, type: true } },
   elements: { select: ELEMENT_SELECT, orderBy: { sortOrder: "asc" as const } },
 } as const;
 
@@ -49,17 +51,26 @@ export async function createLabelTemplate(jewelryId: string, data: any) {
     });
   }
 
+  // Validar que la impresora predeterminada pertenece al tenant
+  if (data.defaultPrinterProfileId) {
+    const printer = await prisma.printerProfile.findFirst({
+      where: { id: data.defaultPrinterProfileId, jewelryId, deletedAt: null },
+    });
+    assert(printer, "Perfil de impresora no encontrado.", 404);
+  }
+
   return prisma.labelTemplate.create({
     data: {
       jewelryId,
-      name:        data.name.trim(),
-      widthMm:     data.widthMm,
-      heightMm:    data.heightMm,
-      dpi:         Number(data.dpi ?? 203),
-      orientation: data.orientation ?? "portrait",
-      bgColor:     data.bgColor ?? "#ffffff",
-      isDefault:   !!data.isDefault,
-      isActive:    data.isActive !== false,
+      name:                   data.name.trim(),
+      widthMm:                data.widthMm,
+      heightMm:               data.heightMm,
+      dpi:                    Number(data.dpi ?? 203),
+      orientation:            data.orientation ?? "portrait",
+      bgColor:                data.bgColor ?? "#ffffff",
+      isDefault:              !!data.isDefault,
+      isActive:               data.isActive !== false,
+      defaultPrinterProfileId: data.defaultPrinterProfileId ?? null,
     },
     select: TEMPLATE_SELECT,
   });
@@ -76,17 +87,26 @@ export async function updateLabelTemplate(id: string, jewelryId: string, data: a
     });
   }
 
+  // Validar que la impresora predeterminada pertenece al tenant
+  if (data.defaultPrinterProfileId) {
+    const printer = await prisma.printerProfile.findFirst({
+      where: { id: data.defaultPrinterProfileId, jewelryId, deletedAt: null },
+    });
+    assert(printer, "Perfil de impresora no encontrado.", 404);
+  }
+
   return prisma.labelTemplate.update({
     where: { id },
     data: {
-      ...(data.name        !== undefined ? { name:        data.name.trim() }         : {}),
-      ...(data.widthMm     !== undefined ? { widthMm:     data.widthMm }              : {}),
-      ...(data.heightMm    !== undefined ? { heightMm:    data.heightMm }             : {}),
-      ...(data.dpi         !== undefined ? { dpi:         Number(data.dpi) }          : {}),
-      ...(data.orientation !== undefined ? { orientation: data.orientation }          : {}),
-      ...(data.bgColor     !== undefined ? { bgColor:     data.bgColor }              : {}),
-      ...(data.isDefault   !== undefined ? { isDefault:   !!data.isDefault }          : {}),
-      ...(data.isActive    !== undefined ? { isActive:    !!data.isActive }            : {}),
+      ...(data.name                    !== undefined ? { name:                   data.name.trim() }          : {}),
+      ...(data.widthMm                 !== undefined ? { widthMm:                data.widthMm }               : {}),
+      ...(data.heightMm                !== undefined ? { heightMm:               data.heightMm }              : {}),
+      ...(data.dpi                     !== undefined ? { dpi:                    Number(data.dpi) }           : {}),
+      ...(data.orientation             !== undefined ? { orientation:            data.orientation }           : {}),
+      ...(data.bgColor                 !== undefined ? { bgColor:                data.bgColor }               : {}),
+      ...(data.isDefault               !== undefined ? { isDefault:              !!data.isDefault }           : {}),
+      ...(data.isActive                !== undefined ? { isActive:               !!data.isActive }             : {}),
+      ...("defaultPrinterProfileId" in data          ? { defaultPrinterProfileId: data.defaultPrinterProfileId ?? null } : {}),
     },
     select: TEMPLATE_SELECT,
   });

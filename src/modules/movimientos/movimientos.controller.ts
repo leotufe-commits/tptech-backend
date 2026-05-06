@@ -55,6 +55,24 @@ export async function create(req: any, res: Response) {
   return res.json(data);
 }
 
+export async function createOut(req: any, res: Response) {
+  const jewelryId = req.user?.jewelryId;
+  const userId = req.user?.id;
+  const body = req.body ?? {};
+
+  const data = await service.createMovement({
+    jewelryId,
+    userId,
+    warehouseId: s(body.warehouseId),
+    kind: "OUT",
+    note: s(body.note || ""),
+    effectiveAt: body.effectiveAt ? new Date(body.effectiveAt) : new Date(),
+    lines: Array.isArray(body.lines) ? body.lines : [],
+  });
+
+  return res.json(data);
+}
+
 export async function transfer(req: any, res: Response) {
   const jewelryId = req.user?.jewelryId;
   const userId = req.user?.id;

@@ -4,7 +4,7 @@
 
 import { prisma } from "../../lib/prisma.js";
 import type { CrossSettlement } from "@prisma/client";
-import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.balance.js";
+import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.js";
 
 // ---------------------------------------------------------------------------
 // Tipos de input

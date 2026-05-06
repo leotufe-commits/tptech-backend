@@ -1,5 +1,6 @@
 // src/modules/promotions/promotions.service.ts
 import { prisma } from "../../lib/prisma.js";
+import { validateMetalVariantIds } from "../../lib/metal-scope-validator.js";
 
 function assert(cond: any, msg: string, status = 400) {
   if (!cond) { const e: any = new Error(msg); e.status = status; throw e; }
@@ -56,6 +57,12 @@ const PROMO_SELECT = {
       group: { select: { id: true, name: true } },
     },
   },
+  metalVariants: {
+    select: {
+      metalVariantId: true,
+      metalVariant: { select: { id: true, name: true, sku: true, purity: true } },
+    },
+  },
   applyOn: true,
 } as const;
 
@@ -98,6 +105,13 @@ export async function createPromotion(jewelryId: string, data: any) {
   const categoryIds: string[]= data.categoryIds ?? [];
   const brands: string[]     = data.brands      ?? [];
   const groupIds: string[]   = data.groupIds    ?? [];
+
+  // Scope METALS: validar IDs antes de la transacción para fallar rápido y
+  // no dejar la promo creada con scope inválido. Para otros scopes, ignoramos
+  // metalVariantIds aunque el cliente los mande.
+  const metalVariantIds: string[] = scope === "METALS"
+    ? await validateMetalVariantIds(jewelryId, data.metalVariantIds)
+    : [];
 
   return prisma.$transaction(async (tx) => {
     const promo = await tx.promotion.create({
@@ -148,14 +162,30 @@ export async function createPromotion(jewelryId: string, data: any) {
         skipDuplicates: true,
       });
     }
+    if (metalVariantIds.length > 0) {
+      await tx.promotionMetalVariant.createMany({
+        data: metalVariantIds.map((metalVariantId) => ({ promotionId: promo.id, metalVariantId, jewelryId })),
+        skipDuplicates: true,
+      });
+    }
 
     return tx.promotion.findUniqueOrThrow({ where: { id: promo.id }, select: PROMO_SELECT });
   });
 }
 
 export async function updatePromotion(id: string, jewelryId: string, data: any) {
-  const existing = await prisma.promotion.findFirst({ where: { id, jewelryId, deletedAt: null } });
+  const existing = await prisma.promotion.findFirst({
+    where: { id, jewelryId, deletedAt: null },
+    select: { id: true, scope: true },
+  });
   assert(existing, "Promoción no encontrada.", 404);
+
+  // Scope efectivo después del update: el del payload si vino, sino el actual.
+  // Validamos METALS antes de la transacción para fallar rápido.
+  const effectiveScope = data.scope !== undefined ? data.scope : existing!.scope;
+  const metalVariantIds: string[] = effectiveScope === "METALS"
+    ? await validateMetalVariantIds(jewelryId, data.metalVariantIds)
+    : [];
 
   return prisma.$transaction(async (tx) => {
     await tx.promotion.update({
@@ -175,14 +205,16 @@ export async function updatePromotion(id: string, jewelryId: string, data: any) 
       },
     });
 
-    // Si se envían datos de alcance, reemplazar todas las tablas junction
+    // Si se envían datos de alcance, reemplazar todas las tablas junction.
+    // `metalVariantIds` también dispara el reset si vino en el payload.
     const hasJunctionUpdate =
-      data.scope       !== undefined ||
-      data.articleIds  !== undefined ||
-      data.variantIds  !== undefined ||
-      data.categoryIds !== undefined ||
-      data.brands      !== undefined ||
-      data.groupIds    !== undefined;
+      data.scope            !== undefined ||
+      data.articleIds       !== undefined ||
+      data.variantIds       !== undefined ||
+      data.categoryIds      !== undefined ||
+      data.brands           !== undefined ||
+      data.groupIds         !== undefined ||
+      data.metalVariantIds  !== undefined;
 
     if (hasJunctionUpdate) {
       await tx.promotionArticle.deleteMany({ where: { promotionId: id } });
@@ -190,6 +222,7 @@ export async function updatePromotion(id: string, jewelryId: string, data: any) 
       await tx.promotionCategory.deleteMany({ where: { promotionId: id } });
       await tx.promotionBrand.deleteMany({ where: { promotionId: id } });
       await tx.promotionGroup.deleteMany({ where: { promotionId: id } });
+      await tx.promotionMetalVariant.deleteMany({ where: { promotionId: id } });
 
       const articleIds: string[]  = data.articleIds  ?? [];
       const variantIds: string[]  = data.variantIds  ?? [];
@@ -227,6 +260,14 @@ export async function updatePromotion(id: string, jewelryId: string, data: any) 
           skipDuplicates: true,
         });
       }
+      // Solo se persisten variantes de metal cuando el scope final es METALS.
+      // Si el scope cambió a otra cosa, el deleteMany de arriba ya las limpió.
+      if (metalVariantIds.length > 0) {
+        await tx.promotionMetalVariant.createMany({
+          data: metalVariantIds.map((metalVariantId) => ({ promotionId: id, metalVariantId, jewelryId })),
+          skipDuplicates: true,
+        });
+      }
     }
 
     return tx.promotion.findUniqueOrThrow({ where: { id }, select: PROMO_SELECT });
@@ -237,4 +278,23 @@ export async function deletePromotion(id: string, jewelryId: string) {
   const existing = await prisma.promotion.findFirst({ where: { id, jewelryId, deletedAt: null } });
   assert(existing, "Promoción no encontrada.", 404);
   await prisma.promotion.update({ where: { id }, data: { deletedAt: new Date(), isActive: false } });
+}
+
+/**
+ * Toggle de activo/inactivo SIN pasar por `updatePromotion` ni el validator
+ * de scope. No exige `metalVariantIds` (caso uso típico: una promo METALS
+ * que se pausa temporalmente desde el listado, sin reabrir el modal de
+ * edición). Tenant-scoped.
+ */
+export async function togglePromotionActive(id: string, jewelryId: string) {
+  const existing = await prisma.promotion.findFirst({
+    where: { id, jewelryId, deletedAt: null },
+    select: { id: true, isActive: true },
+  });
+  assert(existing, "Promoción no encontrada.", 404);
+  return prisma.promotion.update({
+    where: { id },
+    data:  { isActive: !existing!.isActive },
+    select: PROMO_SELECT,
+  });
 }

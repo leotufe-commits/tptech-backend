@@ -839,6 +839,28 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
 }
 
 /* =========================
+   🎨 THEME PREFERENCE (ME)
+========================= */
+const VALID_THEMES = ["classic", "dark", "blue", "gray", "emerald"] as const;
+
+export async function updateMyTheme(req: Request, res: Response) {
+  const actorId = (req as any).userId as string;
+  const { theme } = req.body as { theme?: string };
+
+  const clean = String(theme ?? "").trim().toLowerCase();
+  if (!VALID_THEMES.includes(clean as any)) {
+    return res.status(400).json({ message: "Tema inválido." });
+  }
+
+  await prisma.user.update({
+    where: { id: actorId },
+    data: { themePreference: clean },
+  });
+
+  return res.json({ ok: true, theme: clean });
+}
+
+/* =========================
    ⭐ FAVORITE WAREHOUSE (ADMIN)
 ========================= */
 export async function updateUserFavoriteWarehouse(req: Request, res: Response) {

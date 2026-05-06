@@ -53,6 +53,8 @@ const PL_SELECT = {
   roundingMode: true,
   roundingDirection: true,
   roundingApplyOn: true,
+  roundingModeHechura: true,
+  roundingDirectionHechura: true,
   roundingValueMetal: true,
   roundingValueHechura: true,
   validFrom: true,
@@ -87,13 +89,27 @@ function parsePriceListData(data: any) {
     ? data.roundingApplyOn
     : "TOTAL") as RoundingApplyOn;
 
+  let roundingModeHechura = (VALID_RM.includes(data?.roundingModeHechura)
+    ? data.roundingModeHechura
+    : "NONE") as RoundingMode;
+
+  let roundingDirectionHechura = (VALID_RD.includes(data?.roundingDirectionHechura)
+    ? data.roundingDirectionHechura
+    : "NEAREST") as RoundingDirection;
+
   if (roundingTarget === "NONE") {
     roundingMode = "NONE";
     roundingDirection = "NEAREST";
+    roundingModeHechura = "NONE";
+    roundingDirectionHechura = "NEAREST";
   }
 
   if (roundingMode === "NONE") {
     roundingDirection = "NEAREST";
+  }
+
+  if (roundingModeHechura === "NONE") {
+    roundingDirectionHechura = "NEAREST";
   }
 
   // Los valores de redondeo solo aplican cuando hay un target activo
@@ -141,6 +157,8 @@ function parsePriceListData(data: any) {
     roundingMode,
     roundingDirection,
     roundingApplyOn,
+    roundingModeHechura,
+    roundingDirectionHechura,
     roundingValueMetal,
     roundingValueHechura,
     validFrom,
@@ -188,6 +206,48 @@ async function validateScopeRelations(jewelryId: string, d: ReturnType<typeof pa
   }
 }
 
+/**
+ * POLICY.md §1 R1.2 — Si el tenant tiene `documentRoundingEnabled = true` y
+ * un modo activo, las listas no pueden aplicar redondeo comercial propio.
+ * La combinación produce DOBLE REDONDEO (lista + documento) y rompe la
+ * paridad simulador ↔ factura.
+ *
+ * Configuraciones rechazadas cuando el tenant tiene redondeo de documento:
+ *   - roundingTarget = METAL  (cualquier modo / dirección)
+ *   - roundingApplyOn = PRICE con roundingMode ≠ NONE
+ *
+ * Configuraciones permitidas con tenant.documentRoundingEnabled = true:
+ *   - roundingTarget = NONE
+ *   - roundingTarget = FINAL_PRICE con roundingApplyOn = NET | TOTAL
+ *     (estas se difieren y son neutralizadas por suppressListDeferredRounding
+ *     en el motor — ver pricing-engine.sale.ts).
+ */
+async function validateRoundingPolicy(jewelryId: string, d: ReturnType<typeof parsePriceListData>) {
+  const tenant = await prisma.jewelry.findUnique({
+    where: { id: jewelryId },
+    select: { documentRoundingEnabled: true, documentRoundingMode: true },
+  });
+  // Sin redondeo de documento → cualquier configuración de lista vale.
+  if (!tenant?.documentRoundingEnabled || tenant.documentRoundingMode === "NONE") {
+    return;
+  }
+
+  assert(
+    d.roundingTarget !== "METAL",
+    "El redondeo del documento está activo en este tenant. " +
+    "Las listas no pueden usar 'roundingTarget = METAL' porque produciría doble redondeo. " +
+    "Usá 'NONE' o 'FINAL_PRICE' con applyOn = NET o TOTAL.",
+  );
+
+  const priceLevelRounding = d.roundingApplyOn === "PRICE" && d.roundingMode !== "NONE";
+  assert(
+    !priceLevelRounding,
+    "El redondeo del documento está activo en este tenant. " +
+    "Las listas no pueden usar 'roundingApplyOn = PRICE' con un modo distinto de NONE " +
+    "porque produciría doble redondeo. Usá applyOn = NET o TOTAL (se difieren al documento).",
+  );
+}
+
 export async function listPriceLists(jewelryId: string) {
   assert(jewelryId, "Tenant inválido.");
 
@@ -213,6 +273,7 @@ export async function createPriceList(jewelryId: string, data: any) {
   validateMargins(parsed.mode, parsed);
   validateDates(parsed);
   await validateScopeRelations(jewelryId, parsed);
+  await validateRoundingPolicy(jewelryId, parsed);
 
   const code = parsed.code || (await generateCode(jewelryId, parsed.name));
   const isActive = data?.isActive === false ? false : true;
@@ -272,6 +333,7 @@ export async function updatePriceList(id: string, jewelryId: string, data: any) 
   validateMargins(parsed.mode, parsed);
   validateDates(parsed);
   await validateScopeRelations(jewelryId, parsed);
+  await validateRoundingPolicy(jewelryId, parsed);
 
   const isActive = data?.isActive === false ? false : true;
   const isFavorite = isActive ? data?.isFavorite === true : false;
@@ -337,6 +399,8 @@ export async function clonePriceList(id: string, jewelryId: string) {
       roundingMode: original.roundingMode,
       roundingDirection: original.roundingDirection,
       roundingApplyOn: original.roundingApplyOn,
+      roundingModeHechura: original.roundingModeHechura,
+      roundingDirectionHechura: original.roundingDirectionHechura,
       roundingValueMetal: original.roundingValueMetal ?? undefined,
       roundingValueHechura: original.roundingValueHechura ?? undefined,
       validFrom: original.validFrom,

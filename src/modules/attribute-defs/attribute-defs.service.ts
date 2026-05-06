@@ -38,6 +38,7 @@ const DEF_SELECT = {
   defaultValue: true,
   // options select incluye codeExtension
   isActive: true,
+  sortOrder: true,
   deletedAt: true,
   createdAt: true,
   updatedAt: true,
@@ -103,7 +104,7 @@ export async function listAttributeDefs(jewelryId: string) {
   const rows = await prisma.articleAttributeDef.findMany({
     where: { jewelryId, deletedAt: null },
     select: DEF_SELECT,
-    orderBy: [{ name: "asc" }, { createdAt: "asc" }],
+    orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
   });
 
   return rows.map(mapDef);
@@ -126,6 +127,13 @@ export async function createAttributeDef(jewelryId: string, data: any) {
 
   const code = s(data?.code);
 
+  const maxRow = await prisma.articleAttributeDef.findFirst({
+    where: { jewelryId, deletedAt: null },
+    orderBy: { sortOrder: "desc" },
+    select: { sortOrder: true },
+  });
+  const nextSortOrder = (maxRow?.sortOrder ?? -1) + 1;
+
   const created = await prisma.articleAttributeDef.create({
     data: {
       jewelryId,
@@ -136,6 +144,7 @@ export async function createAttributeDef(jewelryId: string, data: any) {
       unit: s(data?.unit),
       defaultValue: s(data?.defaultValue),
       isActive: true,
+      sortOrder: nextSortOrder,
     },
     select: DEF_SELECT,
   });
@@ -312,6 +321,25 @@ export async function toggleDefOption(optionId: string, jewelryId: string) {
     data: { isActive: !opt.isActive },
     select: { id: true, isActive: true },
   });
+}
+
+/* =========================
+   REORDER DEFS
+========================= */
+export async function reorderAttributeDefs(ids: string[], jewelryId: string) {
+  assert(Array.isArray(ids) && ids.length > 0, "Lista de ids inválida.");
+  assert(jewelryId, "Tenant inválido.");
+
+  await prisma.$transaction(
+    ids.map((id, idx) =>
+      prisma.articleAttributeDef.updateMany({
+        where: { id, jewelryId, deletedAt: null },
+        data: { sortOrder: idx },
+      })
+    )
+  );
+
+  return { ok: true };
 }
 
 /* =========================

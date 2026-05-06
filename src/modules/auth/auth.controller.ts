@@ -5,16 +5,23 @@ import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 
 import { prisma } from "../../lib/prisma.js";
-import { sendResetEmail } from "../../lib/mailer.js";
+import { sendResetEmail, sendVerifyEmail } from "../../lib/mailer.js";
 import { createAuthTokenRecord, consumeAuthToken } from "../../lib/authTokenStore.js";
 import { auditLog } from "../../lib/auditLogger.js";
 import { buildAuthResponse } from "../../lib/authResponse.js";
 import { ensureGlobalPermissions, ensureSystemRoles, ensureSystemDefaults, ensureEmailBranding } from "../../lib/initTenantDefaults.js";
 import { UserStatus } from "@prisma/client";
 import type { Prisma } from "@prisma/client";
+import { OAuth2Client } from "google-auth-library";
 
-// ✅ Unificamos reset token/link en un solo lugar
-import { signResetToken, buildResetLink, verifyResetToken } from "../../lib/authTokens.js";
+import {
+  signResetToken,
+  buildResetLink,
+  verifyResetToken,
+  signVerifyEmailToken,
+  buildVerifyEmailLink,
+  verifyVerifyEmailToken,
+} from "../../lib/authTokens.js";
 
 /* =========================
    ENV / CONST
@@ -155,13 +162,40 @@ export async function me(req: Request, res: Response) {
 /* =========================
    REGISTER
 ========================= */
-/* =========================
-   REGISTER
-========================= */
 export async function register(req: Request, res: Response) {
   const data = req.body as any;
   const email = s(data.email).toLowerCase();
-  const hashed = await bcrypt.hash(String(data.password ?? ""), 10);
+  const rawGoogleCredential = s(data.googleCredential);
+
+  // ── Determinar si viene de Google ────────────────────────────────────────
+  let isGoogleFlow = false;
+  if (rawGoogleCredential) {
+    const googleClientId = process.env.GOOGLE_CLIENT_ID;
+    if (googleClientId) {
+      try {
+        const gClient = new OAuth2Client(googleClientId);
+        const ticket = await gClient.verifyIdToken({ idToken: rawGoogleCredential, audience: googleClientId });
+        const pl = ticket.getPayload();
+        if (pl?.email?.toLowerCase() === email && pl?.email_verified === true) {
+          isGoogleFlow = true;
+        }
+      } catch {
+        // credential de Google inválido → tratar como registro tradicional
+      }
+    }
+  }
+
+  // ── Validar password para registro tradicional ───────────────────────────
+  if (!isGoogleFlow && (!data.password || String(data.password).length < 6)) {
+    return res.status(400).json({ message: "La contraseña debe tener al menos 6 caracteres." });
+  }
+
+  const rawPassword = isGoogleFlow
+    ? crypto.randomBytes(32).toString("hex") // contraseña inutilizable — el user entra solo con Google
+    : String(data.password ?? "");
+
+  const hashed = await bcrypt.hash(rawPassword, 10);
+  const initialStatus = isGoogleFlow ? UserStatus.ACTIVE : UserStatus.PENDING;
 
   try {
     // timeout: 30s — el registro crea ~150 registros de defaults en una sola TX
@@ -186,13 +220,23 @@ export async function register(req: Request, res: Response) {
         },
       });
 
-      // 2️⃣ Crear almacén Principal automático
+      // 2️⃣ Crear almacén Principal automático con datos del perfil de empresa
       const principalWarehouse = await tx.warehouse.create({
         data: {
-          jewelryId: jewelry.id,
-          name: "Principal",
-          code: "PRINCIPAL",
-          isActive: true,
+          jewelryId:   jewelry.id,
+          name:        "Principal",
+          code:        "PRINCIPAL",
+          isActive:    true,
+          phoneCountry: jewelry.phoneCountry,
+          phoneNumber:  jewelry.phoneNumber,
+          street:       jewelry.street,
+          number:       jewelry.number,
+          floor:        jewelry.floor,
+          apartment:    jewelry.apartment,
+          postalCode:   jewelry.postalCode,
+          city:         jewelry.city,
+          province:     jewelry.province,
+          country:      jewelry.country,
         },
       });
 
@@ -202,7 +246,7 @@ export async function register(req: Request, res: Response) {
       await ensureSystemDefaults(tx, jewelry.id);
       await ensureEmailBranding(tx, jewelry, email);
 
-      // 4️⃣ Crear usuario OWNER con almacén favorito
+      // 4️⃣ Crear usuario OWNER
       const user = await tx.user.create({
         data: {
           email,
@@ -220,7 +264,7 @@ export async function register(req: Request, res: Response) {
           province: s(data.province),
           postalCode: s(data.postalCode),
           country: s(data.country),
-          status: UserStatus.ACTIVE,
+          status: initialStatus,
           jewelryId: jewelry.id,
           tokenVersion: 0,
           favoriteWarehouseId: principalWarehouse.id,
@@ -239,29 +283,45 @@ export async function register(req: Request, res: Response) {
       return { user: fullUser, jewelry };
     }, { timeout: 30_000 });
 
-    const token = signToken(
-      result.user.id,
-      result.user.jewelryId,
-      result.user.tokenVersion
-    );
-
-    setAuthCookie(req, res, token);
-
     auditLog(req, {
       action: "auth.register",
       success: true,
       userId: result.user.id,
       tenantId: result.user.jewelryId,
-      meta: { email },
+      meta: { email, via: isGoogleFlow ? "google" : "email" },
     });
 
-    return res.status(201).json(
-      buildAuthResponse({
-        user: { ...result.user, jewelry: result.jewelry },
-        token,
-        includeToken: true,
-      })
+    // ── Registro con Google → login inmediato ────────────────────────────
+    if (isGoogleFlow) {
+      const token = signToken(result.user.id, result.user.jewelryId, result.user.tokenVersion);
+      setAuthCookie(req, res, token);
+      return res.status(201).json(
+        buildAuthResponse({ user: { ...result.user, jewelry: result.jewelry }, token, includeToken: true })
+      );
+    }
+
+    // ── Registro tradicional → enviar email + responder sin sesión ───────
+    const jti = crypto.randomUUID();
+    const verifyToken = signVerifyEmailToken(result.user.id, jti, "48h");
+    const verifyLink  = buildVerifyEmailLink(verifyToken);
+    const expiresAt   = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
+    await createAuthTokenRecord({
+      type: "verify_email",
+      userId: result.user.id,
+      jti,
+      expiresAt,
+      emailSnapshot: email,
+      req,
+    });
+
+    // Email best-effort: no falla el registro si el mail falla
+    sendVerifyEmail(email, verifyLink).catch((err) =>
+      console.error("[register] Error enviando email de verificación:", err)
     );
+
+    return res.status(201).json({ ok: true, pendingVerification: true });
+
   } catch (e: any) {
     if (isPrismaUniqueError(e)) {
       const targets = prismaUniqueTargets(e);
@@ -275,7 +335,6 @@ export async function register(req: Request, res: Response) {
       }
     }
 
-    // Log detallado para diagnóstico — incluye el mensaje real del error
     console.error("[register] Error inesperado:", {
       message: e?.message,
       code:    e?.code,
@@ -342,11 +401,13 @@ export async function login(req: Request, res: Response) {
       tenantId: user.jewelryId,
       meta: { email, reason: user.status === UserStatus.BLOCKED ? "user_blocked" : "user_pending" },
     });
-    const loginBlockedMsg =
-      user.status === UserStatus.BLOCKED
-        ? "Tu cuenta está bloqueada. Contactá al administrador."
-        : "Tu cuenta está pendiente de activación. Revisá tu email para activarla.";
-    return res.status(403).json({ message: loginBlockedMsg });
+    if (user.status === UserStatus.BLOCKED) {
+      return res.status(403).json({ message: "Tu cuenta está bloqueada. Contactá al administrador." });
+    }
+    return res.status(403).json({
+      message: "Tu cuenta está pendiente de activación. Revisá tu email para activarla.",
+      code: "PENDING_VERIFICATION",
+    });
   }
 
   const ok = await bcrypt.compare(password, user.password);
@@ -566,6 +627,108 @@ export async function loginOptions(req: Request, res: Response) {
 
   const tenants = await fetchUsersForLoginOptions(rawEmail);
   return res.json({ email: rawEmail, tenants });
+}
+
+/* =========================
+   VERIFY EMAIL (con token de link)
+========================= */
+export async function verifyEmail(req: Request, res: Response) {
+  const token = String((req.query as any)?.token ?? "").trim();
+  if (!token) return res.status(400).json({ ok: false, reason: "missing", message: "Token requerido." });
+
+  try {
+    const { userId, jti } = verifyVerifyEmailToken(token);
+
+    const result = await consumeAuthToken({ userId, jti });
+
+    if (!result.ok) {
+      const msgMap: Record<string, string> = {
+        not_found:    "Token inválido.",
+        wrong_type:   "Token inválido.",
+        user_mismatch:"Token inválido.",
+        already_used: "Este link ya fue usado. Si tu cuenta está activa, podés iniciar sesión.",
+        expired:      "Este link expiró. Podés solicitar un nuevo email desde la pantalla de inicio de sesión.",
+        race:         "Token inválido.",
+      };
+      return res.status(401).json({ ok: false, reason: result.reason, message: msgMap[result.reason] ?? "Token inválido." });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, status: true, deletedAt: true, jewelryId: true },
+    });
+
+    if (!user || user.deletedAt) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado." });
+    }
+
+    if (user.status === UserStatus.BLOCKED) {
+      return res.status(403).json({ ok: false, message: "Tu cuenta está bloqueada. Contactá al administrador." });
+    }
+
+    if (user.status === UserStatus.ACTIVE) {
+      return res.json({ ok: true, alreadyVerified: true, message: "Tu cuenta ya estaba activa. Podés iniciar sesión." });
+    }
+
+    await prisma.user.update({ where: { id: userId }, data: { status: UserStatus.ACTIVE } });
+
+    auditLog(req, {
+      action: "auth.verify_email",
+      success: true,
+      userId: user.id,
+      tenantId: user.jewelryId,
+    });
+
+    return res.json({ ok: true, message: "Tu email fue verificado correctamente. Ya podés iniciar sesión." });
+  } catch {
+    return res.status(401).json({ ok: false, reason: "invalid", message: "Token inválido." });
+  }
+}
+
+/* =========================
+   RESEND VERIFICATION
+========================= */
+export async function resendVerification(req: Request, res: Response) {
+  const email = s((req.body as any)?.email).toLowerCase();
+
+  // Por seguridad: siempre 200 OK (no revelar si el email existe)
+  if (!email) return res.json({ ok: true });
+
+  const user = await prisma.user.findFirst({
+    where: { email, status: UserStatus.PENDING, deletedAt: null },
+    select: { id: true, jewelryId: true, email: true },
+    orderBy: { createdAt: "asc" },
+  });
+
+  if (user) {
+    const jti      = crypto.randomUUID();
+    const token    = signVerifyEmailToken(user.id, jti, "48h");
+    const link     = buildVerifyEmailLink(token);
+    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
+    await createAuthTokenRecord({
+      type: "verify_email",
+      userId: user.id,
+      jti,
+      expiresAt,
+      emailSnapshot: user.email,
+      req,
+    });
+
+    sendVerifyEmail(email, link).catch((err) =>
+      console.error("[resendVerification] Error enviando email:", err)
+    );
+
+    auditLog(req, {
+      action: "auth.resend_verification",
+      success: true,
+      userId: user.id,
+      tenantId: user.jewelryId,
+      meta: { email },
+    });
+  }
+
+  return res.json({ ok: true });
 }
 
 /* =========================

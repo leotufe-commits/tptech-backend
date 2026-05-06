@@ -76,6 +76,8 @@ const ENTITY_LIST_SELECT = {
   avatarUrl: true,
   priceListId: true,
   currencyId: true,
+  sellerId: true,
+  seller: { select: { id: true, displayName: true, firstName: true, lastName: true, email: true, isActive: true, isFavorite: true } },
   paymentTerm: true,
   commercialApplyOn: true,
   commercialRuleType: true,
@@ -87,6 +89,14 @@ const ENTITY_LIST_SELECT = {
   isActive: true,
   sourceType: true,
   mergedIntoEntityId: true,
+  // Conteo de mermas overrides activas. La merma del cliente es relacional
+  // (1 row por variante de metal en `EntityMermaOverride`), no un escalar.
+  // Si _count > 0, la entidad tiene merma personalizada; si es 0, "Global".
+  _count: {
+    select: {
+      mermaOverrides: { where: { deletedAt: null, isActive: true } },
+    },
+  },
   createdAt: true,
   updatedAt: true,
 } as const;
@@ -336,6 +346,29 @@ export async function getEntity(id: string, jewelryId: string) {
 // ---------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------
+// Vendedor por defecto — resuelve y valida `sellerId` recibido del cliente.
+// Devuelve:
+//   - el id si la variante existe en el tenant, no soft-deleted y activa,
+//   - null si el caller envió string vacío / null / undefined explícitamente.
+// Lanza 400 si el id no existe en el tenant o el vendedor está inactivo/borrado.
+// ---------------------------------------------------------------------------
+async function resolveDefaultSellerId(
+  jewelryId: string,
+  raw: unknown,
+): Promise<string | null> {
+  if (raw === undefined) return null;
+  const id = typeof raw === "string" ? raw.trim() : "";
+  if (!id) return null;
+  const seller = await prisma.seller.findFirst({
+    where: { id, jewelryId, deletedAt: null },
+    select: { id: true, isActive: true },
+  });
+  assert(seller, "El vendedor seleccionado no existe o pertenece a otro tenant.");
+  assert(seller!.isActive, "El vendedor seleccionado está inactivo.");
+  return seller!.id;
+}
+
+// ---------------------------------------------------------------------------
 export async function createEntity(jewelryId: string, data: any) {
   assert(jewelryId, "Tenant inválido.");
 
@@ -372,6 +405,8 @@ export async function createEntity(jewelryId: string, data: any) {
       ? String(data.creditLimitSupplier)
       : undefined;
 
+  const sellerId = await resolveDefaultSellerId(jewelryId, data?.sellerId);
+
   return prisma.commercialEntity.create({
     data: {
       jewelryId,
@@ -394,6 +429,7 @@ export async function createEntity(jewelryId: string, data: any) {
       creditLimitSupplier,
       priceListId: data?.priceListId || null,
       currencyId: data?.currencyId || null,
+      sellerId,
       paymentTerm: s(data?.paymentTerm),
       commercialApplyOn: data?.commercialApplyOn || null,
       commercialRuleType: data?.commercialRuleType || null,
@@ -457,6 +493,12 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
       ? String(data.creditLimitSupplier)
       : null;
 
+  // Vendedor por defecto: solo se actualiza si el caller mandó el campo. Si el
+  // payload no trae `sellerId`, preservamos el valor actual.
+  const sellerIdPatch = data?.sellerId === undefined
+    ? {}
+    : { sellerId: await resolveDefaultSellerId(jewelryId, data.sellerId) };
+
   return prisma.commercialEntity.update({
     where: { id },
     data: {
@@ -478,6 +520,7 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
       creditLimitSupplier,
       priceListId: data?.priceListId || null,
       currencyId: data?.currencyId || null,
+      ...sellerIdPatch,
       paymentTerm: s(data?.paymentTerm),
       commercialApplyOn: data?.commercialApplyOn || null,
       commercialRuleType: data?.commercialRuleType || null,

@@ -8,6 +8,7 @@ import { authLoginLimiter, authForgotLimiter, authResetLimiter, authRegisterLimi
 import * as Auth from "./auth.controller.js";
 import * as Pin from "./auth.pin.controller.js";
 import * as CompanyMe from "../company/company.controller.js";
+import { googleToken, googleTest } from "./auth.google.controller.js";
 
 import {
   registerSchema,
@@ -100,6 +101,10 @@ router.delete(
    AUTH PÚBLICO
 ========================= */
 
+/* ── Google OAuth ── */
+router.post("/google/token", googleToken);
+router.get("/google/test", googleTest); // TEMP: solo debugging
+
 router.post("/register", safeMw(authRegisterLimiter), validateBody(registerSchema), safeMw((Auth as any).register));
 
 /**
@@ -129,6 +134,8 @@ router.post(
 router.post("/reset-password", safeMw(authResetLimiter), validateBody(resetSchema), safeMw((Auth as any).resetPassword));
 
 router.get("/verify-token", safeMw((Auth as any).verifyToken));
+router.get("/verify-email", safeMw((Auth as any).verifyEmail));
+router.post("/resend-verification", safeMw(authForgotLimiter), safeMw((Auth as any).resendVerification));
 
 router.patch(
   "/me/change-password",

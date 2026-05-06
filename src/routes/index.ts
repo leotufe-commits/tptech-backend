@@ -37,6 +37,12 @@ import printerProfilesRouter from "../modules/printer-profiles/printer-profiles.
 import purchasesRoutes from "../modules/purchases/purchases.routes.js";
 import crossSettlementsRoutes from "../modules/cross-settlements/cross-settlements.routes.js";
 import articleGroupsRoutes from "../modules/article-groups/article-groups.routes.js";
+import documentTemplatesRoutes from "../modules/document-templates/document-templates.routes.js";
+import importBatchesRoutes from "../modules/import-batches/import-batches.routes.js";
+import salesChannelsRoutes from "../modules/sales-channels/sales-channels.routes.js";
+import couponsRoutes from "../modules/coupons/coupons.routes.js";
+import receiptsRoutes from "../modules/receipts/receipts.routes.js";
+import unitsRoutes from "../modules/units/units.routes.js";
 
 /* =====================
    ✅ DASHBOARD
@@ -53,7 +59,7 @@ router.use("/auth", authRoutes);
 /* =====================
    STORAGE
 ===================== */
-router.use("/storage", storageRoutes);
+router.use("/storage", requireAuth, storageRoutes);
 
 /* =====================
    PRIVADO
@@ -80,13 +86,24 @@ router.use("/label-templates",  labelTemplatesRouter);
 router.use("/printer-profiles", printerProfilesRouter);
 router.use("/purchases", requireAuth, purchasesRoutes);
 router.use("/cross-settlements", requireAuth, crossSettlementsRoutes);
-router.use("/article-groups", requireAuth, articleGroupsRoutes);
+router.use("/article-groups",       requireAuth, articleGroupsRoutes);
+router.use("/document-templates",   requireAuth, documentTemplatesRoutes);
+router.use("/import-batches",       requireAuth, importBatchesRoutes);
+router.use("/sales-channels",       requireAuth, salesChannelsRoutes);
+router.use("/coupons",             requireAuth, couponsRoutes);
+router.use("/receipts",            requireAuth, receiptsRoutes);
 
 /**
  * Catalogs
  * Base: /company/catalogs
  */
 router.use("/company/catalogs", requireAuth, catalogsRoutes);
+
+/**
+ * Units (Fase 3 — entidad unificada de unidades)
+ * Base: /company/units
+ */
+router.use("/company/units", requireAuth, unitsRoutes);
 
 /**
  * Permissions

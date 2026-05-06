@@ -36,23 +36,29 @@ const numInput = z.union([z.number(), z.string()]).transform((v) => {
 ========================= */
 export const registerSchema = z.object({
   email,
-  password,
+  // password es opcional cuando googleCredential está presente (registro con Google)
+  password: password.optional().or(z.literal("")).transform((v) => v ?? ""),
+  // credential de Google (ID token) — presente solo en registro vía Google
+  googleCredential: z.string().optional(),
 
   jewelryName: z.string().min(1),
-  firstName: z.string().min(1),
-  lastName: z.string().min(1),
+  // nombre/apellido opcionales: en flujo Google vienen del token; en manual el usuario los completa
+  firstName: z.string().optional().default(""),
+  lastName:  z.string().optional().default(""),
 
-  phoneCountry: z.string().min(1),
-  phoneNumber: z.string().min(1),
+  // teléfono obligatorio; prefijo con default
+  phoneCountry: z.string().optional().default("+54"),
+  phoneNumber:  z.string().min(1),
 
-  street: z.string().min(1),
-  number: z.string().min(1),
-  floor: z.string().optional().default(""),
-  apartment: z.string().optional().default(""),
-  city: z.string().min(1),
-  province: z.string().min(1),
-  postalCode: z.string().min(1),
-  country: z.string().min(1),
+  // dirección diferida al onboarding — vacía al registrarse
+  street:     z.string().optional().default(""),
+  number:     z.string().optional().default(""),
+  floor:      z.string().optional().default(""),
+  apartment:  z.string().optional().default(""),
+  city:       z.string().min(1),
+  province:   z.string().min(1),
+  postalCode: z.string().optional().default(""),
+  country:    z.string().min(1),
 });
 
 /* =========================

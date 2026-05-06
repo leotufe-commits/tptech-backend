@@ -9,6 +9,7 @@ const router = Router();
 ========================= */
 router.get("/", asyncHandler(controller.list));
 router.post("/", asyncHandler(controller.create));
+router.patch("/reorder", asyncHandler(controller.reorderDefs));
 router.put("/:id", asyncHandler(controller.update));
 router.patch("/:id/toggle", asyncHandler(controller.toggle));
 router.delete("/:id", asyncHandler(controller.remove));

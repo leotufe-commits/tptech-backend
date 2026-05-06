@@ -69,32 +69,54 @@ async function ensureAttributeDef(
 ): Promise<string> {
   const existing = await db.articleAttributeDef.findFirst({
     where: { jewelryId, code: def.code, deletedAt: null },
-    select: { id: true },
+    select: {
+      id: true,
+      options: { select: { label: true, sortOrder: true }, orderBy: { sortOrder: "asc" } },
+    },
   });
-  if (existing) return existing.id;
 
-  const created = await db.articleAttributeDef.create({
-    data: { jewelryId, name: def.name, code: def.code, inputType: def.inputType, isActive: true },
-    select: { id: true },
-  });
+  let defId: string;
+
+  if (existing) {
+    defId = existing.id;
+  } else {
+    const created = await db.articleAttributeDef.create({
+      data: { jewelryId, name: def.name, code: def.code, inputType: def.inputType, isActive: true },
+      select: { id: true },
+    });
+    defId = created.id;
+  }
+
+  // Agregar solo las opciones que aún no existen (idempotente por label)
+  const existingLabels = new Set<string>(
+    existing ? existing.options.map((o: { label: string }) => o.label) : []
+  );
+  const maxOrder: number = existing && existing.options.length > 0
+    ? Math.max(...existing.options.map((o: { sortOrder: number }) => o.sortOrder))
+    : -1;
+
+  let nextOrder = maxOrder + 1;
 
   for (let i = 0; i < def.options.length; i++) {
     const opt = def.options[i];
     const label = typeof opt === "string" ? opt : opt.label;
     const codeExtension = typeof opt === "string" ? "" : (opt.codeExtension ?? "");
+
+    if (existingLabels.has(label)) continue;
+
     await db.articleAttributeDefOption.create({
       data: {
-        definitionId: created.id,
+        definitionId: defId,
         label,
         value: label,
         codeExtension,
-        sortOrder: i,
+        sortOrder: existing ? nextOrder++ : i,
         isActive: true,
       },
     });
   }
 
-  return created.id;
+  return defId;
 }
 
 /**
@@ -202,10 +224,28 @@ async function ensureJewelryAttributes(
     name: "Color de Gemas",
     inputType: "SELECT",
     options: [
-      { label: "Cubic Zirconia", codeExtension: "CZ" },
-      { label: "Zafiro",         codeExtension: "ZF" },
-      { label: "Esmeralda",      codeExtension: "ES" },
-      { label: "Rubi",           codeExtension: "RB" },
+      // Piedras preciosas
+      { label: "Diamante",        codeExtension: "DI" },
+      { label: "Rubí",            codeExtension: "RB" },
+      { label: "Zafiro",          codeExtension: "ZF" },
+      { label: "Esmeralda",       codeExtension: "ES" },
+      // Semipreciosas más usadas en joyería
+      { label: "Cubic Zirconia",  codeExtension: "CZ" },
+      { label: "Amatista",        codeExtension: "AM" },
+      { label: "Aguamarina",      codeExtension: "AQ" },
+      { label: "Topacio Azul",    codeExtension: "TA" },
+      { label: "Topacio Blanco",  codeExtension: "TB" },
+      { label: "Citrino",         codeExtension: "CI" },
+      { label: "Cuarzo Rosa",     codeExtension: "QR" },
+      { label: "Granate",         codeExtension: "GR" },
+      { label: "Peridoto",        codeExtension: "PT" },
+      { label: "Tanzanita",       codeExtension: "TZ" },
+      { label: "Turquesa",        codeExtension: "TU" },
+      { label: "Ópalo",           codeExtension: "OP" },
+      { label: "Perla",           codeExtension: "PE" },
+      { label: "Ónix Negro",      codeExtension: "ON" },
+      { label: "Lapislázuli",     codeExtension: "LL" },
+      { label: "Alejandrita",     codeExtension: "AL" },
     ],
   });
 
@@ -385,6 +425,179 @@ async function ensureMetalWithVariants(
   }
 }
 
+/**
+ * Creates a default thermal printer profile for the tenant.
+ * Idempotent: returns the existing default profile id if already present.
+ */
+async function ensurePrinterProfile(db: any, jewelryId: string): Promise<string | null> {
+  const existing = await db.printerProfile.findFirst({
+    where: { jewelryId, isDefault: true, deletedAt: null },
+    select: { id: true },
+  });
+  if (existing) return existing.id;
+
+  const profile = await db.printerProfile.create({
+    data: {
+      jewelryId,
+      name:           "Impresora Térmica",
+      type:           "THERMAL",
+      dpi:            203,
+      pageWidthMm:    "58",
+      pageHeightMm:   "210",
+      marginTopMm:    "1",
+      marginLeftMm:   "1",
+      marginRightMm:  "1",
+      marginBottomMm: "1",
+      gapHMm:         "0",
+      gapVMm:         "2",
+      columns:        1,
+      offsetXMm:      "0",
+      offsetYMm:      "0",
+      isDefault:      true,
+      isActive:       true,
+    },
+    select: { id: true },
+  });
+  return profile.id;
+}
+
+type PresetElement = {
+  type: string;
+  fieldKey: string;
+  label?: string;
+  x: number; y: number;
+  width: number; height: number;
+  fontSize: number;
+  fontWeight: string;
+  align: string;
+};
+
+type PresetTemplate = {
+  name: string;
+  widthMm: number;
+  heightMm: number;
+  isDefault: boolean;
+  elements: PresetElement[];
+};
+
+const LABEL_PRESETS: PresetTemplate[] = [
+  {
+    name: "Plantilla A", widthMm: 58, heightMm: 40, isDefault: true,
+    elements: [
+      { type: "TEXT",    fieldKey: "article.name",     x: 2,  y: 2,  width: 54, height: 7,   fontSize: 8,  fontWeight: "bold",   align: "center" },
+      { type: "TEXT",    fieldKey: "variant.name",      x: 2,  y: 9,  width: 54, height: 5,   fontSize: 6,  fontWeight: "normal", align: "center" },
+      { type: "BARCODE", fieldKey: "article.barcode",   x: 3,  y: 14, width: 52, height: 14,  fontSize: 6,  fontWeight: "normal", align: "center" },
+      { type: "TEXT",    fieldKey: "article.code",      x: 2,  y: 28, width: 28, height: 5,   fontSize: 6,  fontWeight: "normal", align: "left"   },
+      { type: "TEXT",    fieldKey: "article.salePrice", x: 30, y: 28, width: 26, height: 5,   fontSize: 8,  fontWeight: "bold",   align: "right"  },
+      { type: "LINE",    fieldKey: "",                  x: 2,  y: 27, width: 54, height: 0.5, fontSize: 6,  fontWeight: "normal", align: "left"   },
+    ],
+  },
+  {
+    name: "Plantilla B", widthMm: 40, heightMm: 25, isDefault: false,
+    elements: [
+      { type: "TEXT",    fieldKey: "article.name",      x: 1,  y: 1,  width: 38, height: 5,  fontSize: 7,  fontWeight: "bold",   align: "center" },
+      { type: "TEXT",    fieldKey: "variant.name",       x: 1,  y: 6,  width: 20, height: 5,  fontSize: 8,  fontWeight: "bold",   align: "left",  label: "T:" },
+      { type: "TEXT",    fieldKey: "article.salePrice",  x: 21, y: 6,  width: 18, height: 5,  fontSize: 8,  fontWeight: "bold",   align: "right"  },
+      { type: "BARCODE", fieldKey: "article.barcode",    x: 2,  y: 12, width: 36, height: 10, fontSize: 5,  fontWeight: "normal", align: "center" },
+    ],
+  },
+  {
+    name: "Plantilla C", widthMm: 58, heightMm: 30, isDefault: false,
+    elements: [
+      { type: "TEXT", fieldKey: "article.name",      x: 2,  y: 2,  width: 54, height: 7,  fontSize: 8,  fontWeight: "bold",   align: "center"                },
+      { type: "TEXT", fieldKey: "article.salePrice", x: 2,  y: 9,  width: 54, height: 7,  fontSize: 11, fontWeight: "bold",   align: "center", label: "Precio: " },
+      { type: "TEXT", fieldKey: "article.code",      x: 2,  y: 22, width: 28, height: 5,  fontSize: 6,  fontWeight: "normal", align: "left"                  },
+      { type: "TEXT", fieldKey: "article.salePrice", x: 30, y: 22, width: 26, height: 5,  fontSize: 7,  fontWeight: "bold",   align: "right"                 },
+    ],
+  },
+];
+
+/**
+ * Creates the 3 preset label templates for the tenant.
+ * Idempotent: skips templates that already exist by name.
+ */
+async function ensureLabelTemplates(
+  db: any,
+  jewelryId: string,
+  defaultPrinterProfileId: string | null
+): Promise<void> {
+  for (const preset of LABEL_PRESETS) {
+    const existing = await db.labelTemplate.findFirst({
+      where: { jewelryId, name: preset.name, deletedAt: null },
+      select: { id: true },
+    });
+    if (existing) continue;
+
+    // Don't set isDefault if another default already exists
+    let isDefault = preset.isDefault;
+    if (isDefault) {
+      const hasDefault = await db.labelTemplate.findFirst({
+        where: { jewelryId, isDefault: true, deletedAt: null },
+        select: { id: true },
+      });
+      if (hasDefault) isDefault = false;
+    }
+
+    const template = await db.labelTemplate.create({
+      data: {
+        jewelryId,
+        name:                   preset.name,
+        widthMm:                String(preset.widthMm),
+        heightMm:               String(preset.heightMm),
+        dpi:                    203,
+        orientation:            "portrait",
+        bgColor:                "#ffffff",
+        isDefault,
+        isActive:               true,
+        defaultPrinterProfileId: defaultPrinterProfileId ?? null,
+      },
+      select: { id: true },
+    });
+
+    for (let i = 0; i < preset.elements.length; i++) {
+      const el = preset.elements[i];
+      await db.labelElement.create({
+        data: {
+          templateId:  template.id,
+          type:        el.type,
+          label:       el.label ?? "",
+          fieldKey:    el.fieldKey,
+          x:           String(el.x),
+          y:           String(el.y),
+          width:       String(el.width),
+          height:      String(el.height),
+          fontSize:    el.fontSize,
+          fontWeight:  el.fontWeight,
+          align:       el.align,
+          visible:     true,
+          sortOrder:   i,
+          configJson:  "{}",
+        },
+      });
+    }
+  }
+}
+
+/**
+ * Sets phoneFormat and documentFormat to sensible AR defaults on the Jewelry record.
+ * Only updates if the field is still at the DB default ("raw").
+ */
+async function ensureJewelryFormats(db: any, jewelryId: string): Promise<void> {
+  const current = await db.jewelry.findUnique({
+    where: { id: jewelryId },
+    select: { phoneFormat: true, documentFormat: true },
+  });
+  if (!current) return;
+
+  const updates: Record<string, string> = {};
+  if (current.phoneFormat    === "raw") updates.phoneFormat    = "national_ar";
+  if (current.documentFormat === "raw") updates.documentFormat = "cuit_cuil";
+
+  if (Object.keys(updates).length > 0) {
+    await db.jewelry.update({ where: { id: jewelryId }, data: updates });
+  }
+}
+
 /* ============================================================
    PUBLIC API
 ============================================================ */
@@ -479,9 +692,11 @@ export async function ensureSystemRoles(
  *   COUNTRY       (10 países)
  *   PROVINCE      (24 provincias argentinas)
  *   CITY          (10 ciudades principales)
+ *   PAYMENT_TERM, ARTICLE_BRAND, ARTICLE_MANUFACTURER, UNIT_OF_MEASURE
+ *   MULTIPLIER_BASE, WEIGHT_UNIT
  *
- * Taxes:          IVA 21%, IVA 10.5%
- * PaymentMethods: Efectivo, Transferencia
+ * Taxes:          IVA 21% (default), IVA 10.5%
+ * PaymentMethods: Efectivo (default), Transferencia, Tarjeta de Crédito (+ cuotas)
  * ShippingCarriers: Retiro en sucursal, Envío estándar
  *
  * Currencies:
@@ -494,14 +709,24 @@ export async function ensureSystemRoles(
  *   Cada variante genera MetalVariantValueHistory + MetalQuote en ARS.
  *
  * PriceLists:
- *   Lista Minorista — Valor Unificado (MARGIN_TOTAL 150%, isFavorite)
- *   Lista Mayorista — Valor Desglosado (METAL_HECHURA: metal 20% / hechura 50%)
- *   Lista Costo por Gramo (COST_PER_GRAM 120%)
+ *   Lista Minorista — Valor Unificado (MARGIN_TOTAL 85%, isFavorite)
+ *   Lista Mayorista — Valor Desglosado (METAL_HECHURA: metal 10% / hechura 50%)
  *
  * ArticleCategories: Anillos (+ 3 hijos) y Cadenas (+ 2 hijos)
  * ArticleAttributeDefs + assignments:
  *   Color de Oro → Anillos y Cadenas (inheritToChild: true)
  *   Color de Gemas → Anillos con piedras (inheritToChild: false)
+ *   Largo → Cadenas (inheritToChild: true)
+ *
+ * Formatos de campo:
+ *   phoneFormat = 'national_ar', documentFormat = 'cuit_cuil'
+ *
+ * Impresión:
+ *   PrinterProfile: "Impresora Térmica" — THERMAL, 203 DPI, 58mm (default)
+ *   LabelTemplates: Plantilla A (58×40mm, default), Plantilla B (40×25mm), Plantilla C (58×30mm)
+ *
+ * Entidades demo (solo si el tenant no tiene ninguna entidad comercial):
+ *   2 clientes + 2 proveedores de muestra
  *
  * Idempotente: safe to call multiple times.
  */
@@ -513,7 +738,7 @@ export async function ensureSystemDefaults(
 
   // ── CatalogItems ────────────────────────────────────────────────────────
   type CatalogType = "IVA_CONDITION" | "DOCUMENT_TYPE" | "PHONE_PREFIX" | "COUNTRY" | "PROVINCE" | "CITY"
-    | "PAYMENT_TERM" | "ARTICLE_BRAND" | "ARTICLE_MANUFACTURER" | "UNIT_OF_MEASURE" | "MULTIPLIER_BASE";
+    | "PAYMENT_TERM" | "ARTICLE_BRAND" | "ARTICLE_MANUFACTURER" | "UNIT_OF_MEASURE" | "MULTIPLIER_BASE" | "WEIGHT_UNIT";
 
   const catalogDefaults: { type: CatalogType; label: string; isFavorite?: boolean }[] = [
     // Tipos de documento
@@ -604,14 +829,8 @@ export async function ensureSystemDefaults(
     { type: "ARTICLE_MANUFACTURER", label: "Tercero"             },
     { type: "ARTICLE_MANUFACTURER", label: "Tuport - TPT"        },
 
-    // Unidades de medida
-    { type: "UNIT_OF_MEASURE", label: "Milimetros (mm)", isFavorite: true },
-    { type: "UNIT_OF_MEASURE", label: "Centimetros (cm)" },
-    { type: "UNIT_OF_MEASURE", label: "Metro (M)"        },
-
-    // Bases del multiplicador de costo
-    { type: "MULTIPLIER_BASE", label: "Gramos",  isFavorite: true },
-    { type: "MULTIPLIER_BASE", label: "Kilates" },
+    // Las unidades (de medida, peso y multiplicador) viven ahora en el modelo Unit.
+    // El seed correspondiente está en la migración del modelo Unit, no acá.
   ];
 
   // Un solo batch insert en lugar de N upserts individuales — mucho más rápido dentro de TX
@@ -628,9 +847,39 @@ export async function ensureSystemDefaults(
     skipDuplicates: true,
   });
 
+  // ── Units (modelo unificado) ─────────────────────────────────────────────
+  // QUANTITY / WEIGHT / LENGTH / VOLUME / OTHER. OTHER queda sin seeds.
+  const unitDefaults: { name: string; code: string; type: "QUANTITY" | "WEIGHT" | "LENGTH" | "VOLUME"; isFavorite?: boolean; sortOrder: number }[] = [
+    { name: "Unidad",     code: "UND",  type: "QUANTITY", isFavorite: true,  sortOrder: 0 },
+    { name: "Par",        code: "PAR",  type: "QUANTITY", sortOrder: 1 },
+    { name: "Pack",       code: "PACK", type: "QUANTITY", sortOrder: 2 },
+    { name: "Gramo",      code: "g",    type: "WEIGHT",   isFavorite: true,  sortOrder: 0 },
+    { name: "Kilogramo",  code: "kg",   type: "WEIGHT",   sortOrder: 1 },
+    { name: "Kilate",     code: "kt",   type: "WEIGHT",   sortOrder: 2 },
+    { name: "Milímetro",  code: "mm",   type: "LENGTH",   sortOrder: 0 },
+    { name: "Centímetro", code: "cm",   type: "LENGTH",   isFavorite: true,  sortOrder: 1 },
+    { name: "Metro",      code: "m",    type: "LENGTH",   sortOrder: 2 },
+    { name: "Mililitro",  code: "ml",   type: "VOLUME",   sortOrder: 0 },
+    { name: "Litro",      code: "l",    type: "VOLUME",   sortOrder: 1 },
+  ];
+  await anyDb.unit.createMany({
+    data: unitDefaults.map((u) => ({
+      jewelryId,
+      name:       u.name,
+      code:       u.code,
+      type:       u.type,
+      isFavorite: u.isFavorite ?? false,
+      isSystem:   true,
+      isActive:   true,
+      sortOrder:  u.sortOrder,
+    })),
+    skipDuplicates: true,
+  });
+
   // ── Taxes ────────────────────────────────────────────────────────────────
   const taxDefaults = [
-    { name: "IVA 21%", code: "IVA21", rate: "21", applyOn: "TOTAL" as const, isFavorite: true },
+    { name: "IVA 21%",   code: "IVA21",  rate: "21",   applyOn: "TOTAL" as const, isFavorite: true  },
+    { name: "IVA 10.5%", code: "IVA105", rate: "10.5", applyOn: "TOTAL" as const, isFavorite: false },
   ];
 
   for (const t of taxDefaults) {
@@ -829,7 +1078,8 @@ export async function ensureSystemDefaults(
     variants: [
       { name: "Oro 24 Kilates",        sku: "AU24K", purity: 1.0,   saleFactor: 1.0  },
       { name: "Oro 22 Kilates",        sku: "AU22K", purity: 0.9,   saleFactor: 1.0  },
-      { name: "Oro 18 Kilates",        sku: "AU18K", purity: 0.825, saleFactor: 1.0  },
+      // purity = pureza base 18/24 = 0.750; saleFactor = +10% operacional → efectiva 0.825
+      { name: "Oro 18 Kilates",        sku: "AU18K", purity: 0.750, saleFactor: 1.10 },
       { name: "Chafalonia 18 Kilates", sku: "CH18K", purity: 0.7,   saleFactor: 0.95 },
     ],
   });
@@ -838,7 +1088,8 @@ export async function ensureSystemDefaults(
     name: "Plata", symbol: "AG", referenceValue: PLATA_REF_VALUE, sortOrder: 2,
     variants: [
       { name: "Plata - Granalla", sku: "AG100", purity: 1.0,  saleFactor: 1.0 },
-      { name: "Plata 950",        sku: "AG950", purity: 0.95, saleFactor: 1.0 },
+      // purity efectiva = 1 por regla de negocio → precio = 100% del valor de referencia
+      { name: "Plata 950",        sku: "AG950", purity: 1.0,  saleFactor: 1.0 },
     ],
   });
 
@@ -849,6 +1100,13 @@ export async function ensureSystemDefaults(
       { name: "Platino 950",  sku: "PT950",  purity: 1.0, saleFactor: 1.2 },
     ],
   });
+
+  // ── Formatos de campo (phoneFormat / documentFormat) ────────────────────
+  await ensureJewelryFormats(anyDb, jewelryId);
+
+  // ── Perfil de impresora + plantillas de etiqueta ─────────────────────────
+  const defaultPrinterId = await ensurePrinterProfile(anyDb, jewelryId);
+  await ensureLabelTemplates(anyDb, jewelryId, defaultPrinterId);
 
   // ── Entidades demo (solo si no hay ninguna) ────────────────────────────────
   await ensureDemoEntities(anyDb, jewelryId);

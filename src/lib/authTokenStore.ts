@@ -15,7 +15,7 @@ async function cleanupExpiredAuthTokens() {
   try {
     await prisma.authToken.deleteMany({
       where: {
-        type: { in: ["reset", "invite"] },
+        type: { in: ["reset", "invite", "verify_email"] },
         OR: [{ expiresAt: { lt: new Date() } }, { usedAt: { not: null } }],
       },
     });
@@ -29,7 +29,7 @@ async function cleanupExpiredAuthTokens() {
 ========================= */
 
 export async function createAuthTokenRecord(args: {
-  type: "reset" | "invite";
+  type: "reset" | "invite" | "verify_email";
   userId: string;
   jti: string;
   expiresAt: Date;
@@ -85,7 +85,7 @@ export async function consumeAuthToken(args: { userId: string; jti: string }) {
   });
 
   if (!row) return { ok: false as const, reason: "not_found" as const };
-  if (!["reset", "invite"].includes(row.type)) return { ok: false as const, reason: "wrong_type" as const };
+  if (!["reset", "invite", "verify_email"].includes(row.type)) return { ok: false as const, reason: "wrong_type" as const };
   if (row.userId !== userId) return { ok: false as const, reason: "user_mismatch" as const };
   if (row.usedAt) return { ok: false as const, reason: "already_used" as const };
   if (row.expiresAt.getTime() < now.getTime()) return { ok: false as const, reason: "expired" as const };

@@ -92,14 +92,26 @@ async function getOrAssignEffectiveFavoriteWarehouseId(opts: {
 
 /* =========================
    LIST (for user)
-   - devuelve isFavorite
+   - devuelve isFavorite, stockGrams, stockPieces
    - auto-assign SOLO si hace falta
 ========================= */
 export async function listWarehousesForUser(jewelryId: string, userId: string) {
   assert(jewelryId, "Tenant inválido.");
   assert(userId, "Usuario inválido.");
 
-  const rows = await listWarehousesBase(jewelryId);
+  const [rows, metalStocks, articleStocks] = await Promise.all([
+    listWarehousesBase(jewelryId),
+    prisma.warehouseStock.groupBy({
+      by: ["warehouseId"],
+      where: { jewelryId },
+      _sum: { grams: true },
+    }),
+    prisma.articleStock.groupBy({
+      by: ["warehouseId"],
+      where: { jewelryId, quantity: { gt: 0 } },
+      _sum: { quantity: true },
+    }),
+  ]);
 
   const effectiveFavId = await getOrAssignEffectiveFavoriteWarehouseId({
     jewelryId,
@@ -107,9 +119,21 @@ export async function listWarehousesForUser(jewelryId: string, userId: string) {
     warehouses: rows.map((w) => ({ id: w.id, isActive: w.isActive })),
   });
 
+  const gramsMap = new Map<string, number>();
+  for (const s of metalStocks) {
+    gramsMap.set(s.warehouseId, Number(s._sum.grams ?? 0));
+  }
+
+  const piecesMap = new Map<string, number>();
+  for (const s of articleStocks) {
+    piecesMap.set(s.warehouseId, Number(s._sum.quantity ?? 0));
+  }
+
   return rows.map((w) => ({
     ...w,
     isFavorite: !!effectiveFavId && effectiveFavId === w.id,
+    stockGrams: gramsMap.get(w.id) ?? 0,
+    stockPieces: piecesMap.get(w.id) ?? 0,
   }));
 }
 
@@ -140,12 +164,15 @@ export async function createWarehouse(jewelryId: string, userId: string, data: a
       name,
       code,
 
+      email: s(data?.email ?? ""),
       phoneCountry: s(data?.phoneCountry ?? ""),
       phoneNumber: s(data?.phoneNumber ?? ""),
 
       attn: s(data?.attn ?? ""),
       street: s(data?.street ?? ""),
       number: s(data?.number ?? ""),
+      floor: s(data?.floor ?? ""),
+      apartment: s(data?.apartment ?? ""),
       city: s(data?.city ?? ""),
       province: s(data?.province ?? ""),
       postalCode: s(data?.postalCode ?? ""),
@@ -199,12 +226,15 @@ export async function updateWarehouse(id: string, jewelryId: string, data: any) 
       name,
       code: s(data?.code ?? ""),
 
+      email: s(data?.email ?? ""),
       phoneCountry: s(data?.phoneCountry ?? ""),
       phoneNumber: s(data?.phoneNumber ?? ""),
 
       attn: s(data?.attn ?? ""),
       street: s(data?.street ?? ""),
       number: s(data?.number ?? ""),
+      floor: s(data?.floor ?? ""),
+      apartment: s(data?.apartment ?? ""),
       city: s(data?.city ?? ""),
       province: s(data?.province ?? ""),
       postalCode: s(data?.postalCode ?? ""),
@@ -285,7 +315,7 @@ export async function deleteWarehouse(id: string, jewelryId: string) {
     assert(activeCount > 1, "No se puede eliminar el último almacén activo.");
   }
 
-  // 2) No eliminar si tiene movimientos (no anulados)
+  // 2) No eliminar si tiene movimientos de metales (no anulados)
   const movementsCount = await prisma.inventoryMovement.count({
     where: {
       jewelryId,
@@ -294,14 +324,35 @@ export async function deleteWarehouse(id: string, jewelryId: string) {
     },
   });
 
-  assert(movementsCount === 0, "No se puede eliminar: el almacén tiene movimientos registrados.");
+  assert(movementsCount === 0, "No se puede eliminar: el almacén tiene movimientos de metales registrados.");
+
+  // 2b) No eliminar si tiene movimientos de artículos (no anulados)
+  const articleMovementsCount = await prisma.articleMovement.count({
+    where: {
+      jewelryId,
+      voidedAt: null,
+      OR: [{ warehouseId: id }, { fromWarehouseId: id }, { toWarehouseId: id }],
+    },
+  });
+
+  assert(articleMovementsCount === 0, "No se puede eliminar: el almacén tiene movimientos de artículos registrados.");
 
   // 3) No eliminar si stock neto != 0 (gramos) según movimientos
   const netGrams = await getWarehouseNetGrams({ jewelryId, warehouseId: id });
 
   // tolerancia mínima para decimales
   const abs = Math.abs(netGrams);
-  assert(abs < 0.000001, "No se puede eliminar: el almacén tiene stock distinto de 0.");
+  assert(abs < 0.000001, "No se puede eliminar: el almacén tiene stock de metales distinto de 0.");
+
+  // 4) No eliminar si tiene stock de artículos terminados
+  const articleStockCount = await prisma.articleStock.count({
+    where: {
+      jewelryId,
+      warehouseId: id,
+      quantity: { gt: 0 },
+    },
+  });
+  assert(articleStockCount === 0, "No se puede eliminar: el almacén tiene stock de artículos registrado.");
 
   const deleted = await prisma.warehouse.update({
     where: { id },
@@ -455,4 +506,193 @@ export async function setFavoriteWarehouse(opts: {
   });
 
   return { ok: true, favoriteWarehouseId: warehouseId };
+}
+
+/* =========================
+   ARTICLE STOCK POR ALMACÉN
+   Devuelve ArticleStock con datos de artículo y variante
+   para mostrar el inventario de piezas terminadas.
+========================= */
+export async function getWarehouseArticleStock(id: string, jewelryId: string) {
+  assert(id, "Id inválido.");
+  assert(jewelryId, "Tenant inválido.");
+
+  const w = await prisma.warehouse.findFirst({
+    where: { id, jewelryId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(w, "Almacén no encontrado.");
+
+  return prisma.articleStock.findMany({
+    where: { warehouseId: id, jewelryId },
+    orderBy: [
+      { article: { name: "asc" as const } },
+      { variant: { name: "asc" as const } },
+    ],
+    select: {
+      id: true,
+      quantity: true,
+      reservedQty: true,
+      updatedAt: true,
+      article: {
+        select: {
+          id: true,
+          name: true,
+          code: true,
+          sku: true,
+          weight: true,
+          reorderPoint: true,
+          isActive: true,
+        },
+      },
+      variant: {
+        select: {
+          id: true,
+          name: true,
+          code: true,
+          sku: true,
+          weightOverride: true,
+          reorderPoint: true,
+          isActive: true,
+        },
+      },
+    },
+  });
+}
+
+/* =========================
+   METAL STOCK POR ALMACÉN
+   Agrega gramos por variante a partir de los movimientos activos.
+   Cubre IN / OUT / ADJUST / TRANSFER (desde y hacia el almacén).
+========================= */
+export async function getWarehouseMetalStock(id: string, jewelryId: string) {
+  assert(id, "Id inválido.");
+  assert(jewelryId, "Tenant inválido.");
+
+  const w = await prisma.warehouse.findFirst({
+    where: { id, jewelryId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(w, "Almacén no encontrado.");
+
+  const movements = await prisma.inventoryMovement.findMany({
+    where: {
+      jewelryId,
+      deletedAt: null,
+      OR: [
+        { warehouseId: id },
+        { fromWarehouseId: id },
+        { toWarehouseId: id },
+      ],
+    },
+    select: {
+      kind: true,
+      warehouseId: true,
+      fromWarehouseId: true,
+      toWarehouseId: true,
+      lines: {
+        select: {
+          variantId: true,
+          grams: true,
+          variant: {
+            select: {
+              id: true,
+              name: true,
+              sku: true,
+              metal: { select: { id: true, name: true } },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  const stockMap = new Map<string, { variantId: string; grams: number; variant: any }>();
+
+  for (const m of movements) {
+    for (const line of m.lines) {
+      const raw = Number(line.grams);
+      let delta = 0;
+
+      if      (m.kind === "IN"       && m.warehouseId     === id) delta =  raw;
+      else if (m.kind === "OUT"      && m.warehouseId     === id) delta = -raw;
+      else if (m.kind === "ADJUST"   && m.warehouseId     === id) delta =  raw; // signed
+      else if (m.kind === "TRANSFER" && m.fromWarehouseId === id) delta = -raw;
+      else if (m.kind === "TRANSFER" && m.toWarehouseId   === id) delta =  raw;
+
+      if (delta === 0) continue;
+
+      const key   = line.variantId;
+      const entry = stockMap.get(key);
+      if (entry) {
+        entry.grams = Math.round((entry.grams + delta) * 1_000_000) / 1_000_000;
+      } else {
+        stockMap.set(key, { variantId: line.variantId, grams: delta, variant: line.variant });
+      }
+    }
+  }
+
+  return Array.from(stockMap.values());
+}
+
+/* =========================
+   ATTACHMENTS
+========================= */
+export async function getWarehouseAttachments(id: string, jewelryId: string) {
+  assert(id, "Id inválido.");
+  assert(jewelryId, "Tenant inválido.");
+
+  return prisma.warehouseAttachment.findMany({
+    where: { warehouseId: id, jewelryId, deletedAt: null },
+    select: { id: true, filename: true, url: true, mimeType: true, size: true, createdAt: true },
+    orderBy: { createdAt: "asc" },
+  });
+}
+
+export async function addWarehouseAttachment(
+  id: string,
+  jewelryId: string,
+  data: { filename: string; url: string; mimeType: string; size: number }
+) {
+  assert(id, "Id inválido.");
+  assert(jewelryId, "Tenant inválido.");
+
+  const warehouse = await prisma.warehouse.findFirst({
+    where: { id, jewelryId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(warehouse, "Almacén no encontrado.");
+
+  return prisma.warehouseAttachment.create({
+    data: {
+      warehouseId: id,
+      jewelryId,
+      filename: data.filename,
+      url: data.url,
+      mimeType: data.mimeType,
+      size: data.size,
+    },
+    select: { id: true, filename: true, url: true, mimeType: true, size: true, createdAt: true },
+  });
+}
+
+export async function deleteWarehouseAttachment(
+  warehouseId: string,
+  attachmentId: string,
+  jewelryId: string
+) {
+  assert(warehouseId, "Id inválido.");
+  assert(jewelryId, "Tenant inválido.");
+
+  const att = await prisma.warehouseAttachment.findFirst({
+    where: { id: attachmentId, warehouseId, jewelryId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(att, "Adjunto no encontrado.");
+
+  return prisma.warehouseAttachment.update({
+    where: { id: attachmentId },
+    data: { deletedAt: new Date() },
+    select: { id: true },
+  });
 }

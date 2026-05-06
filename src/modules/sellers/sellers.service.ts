@@ -13,7 +13,7 @@ function assert(cond: any, msg: string): asserts cond {
 }
 
 const VALID_COMMISSION: CommissionType[] = ["NONE", "PERCENTAGE", "FIXED_AMOUNT"];
-const VALID_COMMISSION_BASE: CommissionBase[] = ["GROSS", "NET", "MARGIN"];
+const VALID_COMMISSION_BASE: CommissionBase[] = ["TOTAL", "TOTAL_AFTER_DISCOUNTS", "TOTAL_AFTER_PAYMENT", "METAL", "HECHURA", "METAL_Y_HECHURA", "HECHURA_AFTER_DISCOUNTS"];
 
 const SELLER_SELECT = {
   id: true,
@@ -118,7 +118,7 @@ export async function createSeller(jewelryId: string, data: any) {
 
   const commissionBase: CommissionBase = VALID_COMMISSION_BASE.includes(data?.commissionBase)
     ? data.commissionBase
-    : "NET";
+    : "TOTAL";
 
   const commissionValue =
     commissionType !== "NONE"
@@ -211,7 +211,7 @@ export async function updateSeller(id: string, jewelryId: string, data: any) {
 
   const commissionBase: CommissionBase = VALID_COMMISSION_BASE.includes(data?.commissionBase)
     ? data.commissionBase
-    : "NET";
+    : "TOTAL";
 
   const commissionValue =
     commissionType !== "NONE"

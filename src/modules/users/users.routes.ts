@@ -31,6 +31,7 @@ const requireUsersAdmin = requirePermission("USERS_ROLES", "ADMIN");
    /ME
 ========================================================= */
 router.patch("/me/favorite-warehouse", Core.updateMyFavoriteWarehouse);
+router.patch("/me/theme", Core.updateMyTheme);
 
 router.put("/me/quick-pin", Pin.updateMyQuickPin);
 router.delete("/me/quick-pin", Pin.removeMyQuickPin);

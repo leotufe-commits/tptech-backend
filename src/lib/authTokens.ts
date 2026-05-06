@@ -38,6 +38,41 @@ export function buildInviteLink(inviteToken: string) {
   return `${APP_URL}/accept-invite?token=${encodeURIComponent(inviteToken)}`;
 }
 
+export function buildVerifyEmailLink(verifyToken: string) {
+  return `${APP_URL}/verify-email?token=${encodeURIComponent(verifyToken)}`;
+}
+
+/** Firma token de verificación de email (tipo "verify_email") */
+export function signVerifyEmailToken(
+  userId: string,
+  jti: string,
+  expiresIn: jwt.SignOptions["expiresIn"]
+) {
+  return jwt.sign({ sub: userId, type: "verify_email", jti }, JWT_SECRET_SAFE, {
+    expiresIn,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  });
+}
+
+/** Verifica y parsea token de verificación de email */
+export function verifyVerifyEmailToken(token: string): { userId: string; jti: string } {
+  const raw = jwt.verify(token, JWT_SECRET_SAFE, {
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  }) as any;
+
+  const userId = String(raw?.sub || "").trim();
+  const type   = String(raw?.type || "").trim();
+  const jti    = String(raw?.jti || "").trim();
+
+  if (!userId) throw new Error("Token inválido (sin sub).");
+  if (type !== "verify_email") throw new Error("Token inválido (type).");
+  if (!jti) throw new Error("Token inválido (sin jti).");
+
+  return { userId, jti };
+}
+
 /** ✅ Verifica token reset y devuelve payload normalizado */
 export function verifyResetToken(token: string): { userId: string; jti: string } {
   const raw = jwt.verify(token, JWT_SECRET_SAFE, {

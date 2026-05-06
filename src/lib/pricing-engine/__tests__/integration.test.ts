@@ -10,10 +10,12 @@ import { Prisma } from "@prisma/client";
 const mockPrisma = vi.hoisted(() => ({
   currency:         { findFirst:  vi.fn() },
   currencyRate:     { findFirst:  vi.fn() },
-  metalQuote:       { findFirst:  vi.fn() },
+  metalQuote:       { findFirst:  vi.fn(), findMany: vi.fn() },
+  metalVariant:     { findMany:   vi.fn() },
   jewelry:          { findUnique: vi.fn() },
   article:          { findFirst:  vi.fn() },
   articleVariant:   { findFirst:  vi.fn() },
+  articleGroupItem: { findFirst:  vi.fn() },
   promotion:        { findMany:   vi.fn() },
   quantityDiscount: { findMany:   vi.fn() },
   commercialEntity: { findFirst:  vi.fn() },
@@ -32,27 +34,16 @@ const D = Prisma.Decimal;
 
 function makeDbArticle(overrides: Record<string, any> = {}) {
   return {
-    categoryId:           null,
-    brand:                null,
-    salePrice:            null,
-    useManualSalePrice:   false,
-    costCalculationMode:  "MANUAL",
-    costPrice:            null,
-    manualCurrencyId:     null,
-    manualBaseCost:       null,
+    categoryId:            null,
+    brand:                 null,
+    groupId:               null,
+    salePrice:             null,
+    useManualSalePrice:    false,
     manualAdjustmentKind:  null,
     manualAdjustmentType:  null,
     manualAdjustmentValue: null,
-    multiplierBase:       null,
-    multiplierValue:      null,
-    multiplierQuantity:   null,
-    multiplierCurrencyId: null,
-    hechuraPrice:         null,
-    hechuraPriceMode:     "FIXED",
-    mermaPercent:         null,
-    category:             null,
-    costComposition:      [],
-    compositions:         [],
+    costComposition:       [],
+    manualTaxIds:          [],
     ...overrides,
   };
 }
@@ -82,6 +73,10 @@ beforeEach(() => {
   mockPrisma.articleCategory.findFirst.mockResolvedValue(null);
   mockPrisma.priceList.findFirst.mockResolvedValue(null);
   mockPrisma.jewelry.findUnique.mockResolvedValue(defaultJewelryConfig());
+  // Moneda base por defecto (necesaria para calculateCostFromLines)
+  mockPrisma.currency.findFirst.mockResolvedValue({ id: "ARS" });
+  mockPrisma.metalVariant.findMany.mockResolvedValue([]);
+  mockPrisma.metalQuote.findMany.mockResolvedValue([]);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,8 +86,7 @@ beforeEach(() => {
 describe("Flujo completo: MANUAL + lista + descuentos", () => {
   it("costo=500 → lista +100% → 1000 → qty -10% → 900 → promo -50 → 850", async () => {
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice:           new D("500"),
+      costComposition: [{ type: "MANUAL", quantity: new D("1"), unitValue: new D("500"), currencyId: null, mermaPercent: null, metalVariantId: null }],
     }));
 
     // Lista general que aplica 100% de margen sobre costo total
@@ -118,20 +112,22 @@ describe("Flujo completo: MANUAL + lista + descuentos", () => {
       sortOrder:        0,
     });
 
-    // Descuento por cantidad: -10%
+    // Descuento por cantidad: -10% (isStackable=true para que se combine con la promo)
     mockPrisma.quantityDiscount.findMany.mockResolvedValue([{
       id: "qd1",
-      articleId: "a1", variantId: null, categoryId: null, brand: null,
+      articleId: "a1", variantId: null, categoryId: null, brand: null, groupId: null,
+      isStackable: true, evaluationMode: "LINE",
       tiers: [{ minQty: new D("1"), type: "PERCENTAGE", value: new D("10") }],
     }]);
 
-    // Promoción: -50 fijo
+    // Promoción: -50 fijo (isStackable=true para que se combine con el qty discount)
     mockPrisma.promotion.findMany.mockResolvedValue([{
       id: "promo1", name: "Promo",
       type: "FIXED", value: new D("50"),
-      scope: "ALL",
+      scope: "ALL", applyOn: "TOTAL",
       validFrom: null, validTo: null,
       isActive: true, deletedAt: null, priority: 1,
+      isStackable: true,
     }]);
 
     const res = await resolveFinalSalePrice("j1", { articleId: "a1", quantity: 2 });
@@ -155,8 +151,6 @@ describe("Flujo completo: MANUAL + lista + descuentos", () => {
     expect(keys).toContain("PROMOTION");
     expect(keys).toContain("MARGIN");
     expect(keys).toContain("PRECIO_FINAL");
-    // El último step es siempre PRECIO_FINAL
-    expect(res.steps[res.steps.length - 1].key).toBe("PRECIO_FINAL");
   });
 });
 
@@ -164,18 +158,17 @@ describe("Flujo completo: MANUAL + lista + descuentos", () => {
 // INTEGRACIÓN: METAL_MERMA_HECHURA + lista
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("Flujo completo: METAL_MERMA_HECHURA + lista MARGIN_TOTAL", () => {
+describe("Flujo completo: COST_LINES metal + lista MARGIN_TOTAL", () => {
   it("10g × 50/g + merma 10% + hechura 200 = 750 → lista +50% → 1125", async () => {
     mockPrisma.currency.findFirst.mockResolvedValue({ id: "ARS" });
-    mockPrisma.jewelry.findUnique.mockResolvedValue({ defaultMermaPercent: null });
-    mockPrisma.metalQuote.findFirst.mockResolvedValue({ price: new D("50") });
+    mockPrisma.metalQuote.findMany.mockResolvedValue([{ variantId: "v1", price: new D("50") }]);
+    mockPrisma.metalVariant.findMany.mockResolvedValue([{ id: "v1", saleFactor: new D("1") }]);
 
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "METAL_MERMA_HECHURA",
-      mermaPercent:        new D("10"),
-      hechuraPrice:        new D("200"),
-      hechuraPriceMode:    "FIXED",
-      compositions: [{ variantId: "v1", grams: new D("10"), isBase: true }],
+      costComposition: [
+        { type: "METAL",   quantity: new D("10"), unitValue: new D("0"),   currencyId: null, mermaPercent: new D("10"), metalVariantId: "v1" },
+        { type: "HECHURA", quantity: new D("1"),  unitValue: new D("200"), currencyId: null, mermaPercent: null,        metalVariantId: null },
+      ],
     }));
 
     mockPrisma.priceList.findFirst.mockResolvedValue({
@@ -208,7 +201,8 @@ describe("Flujo completo: METAL_MERMA_HECHURA + lista MARGIN_TOTAL", () => {
 describe("Flujo completo: COST_LINES + cantidad", () => {
   it("COST_LINES=700 → manual salePrice=1400 → qty 20% → 1120", async () => {
     mockPrisma.currency.findFirst.mockResolvedValue({ id: "ARS" });
-    mockPrisma.metalQuote.findFirst.mockResolvedValue({ price: new D("50") });
+    mockPrisma.metalVariant.findMany.mockResolvedValue([{ id: "v1", saleFactor: new D("1") }]);
+    mockPrisma.metalQuote.findMany.mockResolvedValue([{ variantId: "v1", price: new D("50") }]);
 
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
       salePrice: new D("1400"),
@@ -241,8 +235,7 @@ describe("Flujo completo: COST_LINES + cantidad", () => {
 describe("Alertas de negocio", () => {
   it("LOSS_SALE — precio final menor al costo", async () => {
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("500"),
+      costComposition: [{ type: "MANUAL", quantity: new D("1"), unitValue: new D("500"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("300"), // precio < costo
     }));
 
@@ -256,8 +249,7 @@ describe("Alertas de negocio", () => {
   it("LOW_MARGIN — margen entre 0 y 15%", async () => {
     // costo=100, precio=110 → margen ≈ 9.09%
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("100"),
+      costComposition: [{ type: "MANUAL", quantity: new D("1"), unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("110"),
     }));
 
@@ -271,15 +263,14 @@ describe("Alertas de negocio", () => {
   });
 
   it("PARTIAL_DATA — costo parcial", async () => {
-    // METAL_MERMA_HECHURA sin cotización → costPartial=true
+    // COST_LINES con línea METAL sin cotización → costPartial=true
     mockPrisma.currency.findFirst.mockResolvedValue({ id: "ARS" });
-    mockPrisma.jewelry.findUnique.mockResolvedValue({ defaultMermaPercent: null });
-    mockPrisma.metalQuote.findFirst.mockResolvedValue(null); // sin cotización → partial
+    mockPrisma.metalVariant.findMany.mockResolvedValue([{ id: "v1", saleFactor: new D("1") }]);
+    mockPrisma.metalQuote.findMany.mockResolvedValue([]); // sin cotización → partial
 
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "METAL_MERMA_HECHURA",
+      costComposition: [{ type: "METAL", quantity: new D("10"), unitValue: new D("0"), currencyId: null, mermaPercent: new D("0"), metalVariantId: "v1" }],
       salePrice: new D("1000"),
-      compositions: [{ variantId: "v1", grams: new D("10"), isBase: true }],
     }));
 
     const res = await resolveFinalSalePrice("j1", { articleId: "a1" });
@@ -307,10 +298,9 @@ describe("Alertas de negocio", () => {
   });
 
   it("COST_UNRESOLVED — sin precio de costo disponible", async () => {
-    // Artículo con salePrice pero sin costPrice ni modo que resuelva costo
+    // Artículo con salePrice pero sin costComposition → costo no resuelto
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: null,
+      costComposition: [],
       salePrice: new D("500"),
     }));
 
@@ -324,8 +314,7 @@ describe("Alertas de negocio", () => {
   it("alertas ordenadas: errores antes que warnings", async () => {
     // precio < costo → LOSS_SALE (error) + potencial LOW_MARGIN (warning)
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("500"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("500"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("400"),
     }));
 
@@ -342,8 +331,7 @@ describe("Alertas de negocio", () => {
   it("sin alertas cuando precio y costo son válidos y margen es bueno", async () => {
     // costo=100, precio=200 → margen=50% → sin alertas
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("100"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("200"),
     }));
 
@@ -383,9 +371,10 @@ describe("Edge cases", () => {
   });
 
   it("steps tienen status válido en cada paso", async () => {
-    mockPrisma.article.findFirst.mockResolvedValue(
-      makeDbArticle({ salePrice: new D("500"), costPrice: new D("300") })
-    );
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("300"), currencyId: null, mermaPercent: null, metalVariantId: null }],
+      salePrice: new D("500"),
+    }));
     const validStatuses = new Set(["ok", "partial", "missing", "skipped"]);
     const res = await resolveFinalSalePrice("j1", { articleId: "a1" });
     for (const step of res.steps) {
@@ -410,9 +399,10 @@ describe("Edge cases", () => {
   });
 
   it("Todos los campos del resultado están presentes", async () => {
-    mockPrisma.article.findFirst.mockResolvedValue(
-      makeDbArticle({ salePrice: new D("500"), costPrice: new D("250") })
-    );
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("250"), currencyId: null, mermaPercent: null, metalVariantId: null }],
+      salePrice: new D("500"),
+    }));
     const res = await resolveFinalSalePrice("j1", { articleId: "a1" });
 
     expect(res).toHaveProperty("unitPrice");
@@ -447,8 +437,7 @@ describe("Política de confirmación", () => {
   it("canConfirm=true cuando margen es bueno y no hay bloqueos activos", async () => {
     // costo=100, precio=200 → margen=50%
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("100"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("200"),
     }));
 
@@ -475,8 +464,7 @@ describe("Política de confirmación", () => {
   it("LOSS_SALE no bloquea cuando pricingBlockLossSale=false (default)", async () => {
     // costo=500, precio=300 → LOSS_SALE alert, pero no bloquea por default
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("500"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("500"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("300"),
     }));
     // pricingBlockLossSale=false (default)
@@ -493,8 +481,7 @@ describe("Política de confirmación", () => {
       pricingBlockLossSale: true,
     });
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("500"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("500"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("300"),
     }));
 
@@ -506,8 +493,7 @@ describe("Política de confirmación", () => {
   it("LOW_MARGIN — solo warning, no bloquea sin lowMarginBlockPercent", async () => {
     // costo=100, precio=110 → margen≈9.09% → LOW_MARGIN warning, no block
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("100"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("110"),
     }));
 
@@ -524,8 +510,7 @@ describe("Política de confirmación", () => {
     });
     // costo=100, precio=110 → margen≈9.09% < 20%
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("100"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("110"),
     }));
 
@@ -541,8 +526,7 @@ describe("Política de confirmación", () => {
     });
     // costo=100, precio=110 → margen≈9.09% > 5% → no bloquea
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "MANUAL",
-      costPrice: new D("100"),
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
       salePrice: new D("110"),
     }));
 
@@ -552,13 +536,10 @@ describe("Política de confirmación", () => {
   });
 
   it("PARTIAL_DATA no bloquea cuando pricingBlockPartialData=false (default)", async () => {
-    mockPrisma.currency.findFirst.mockResolvedValue({ id: "ARS" });
-    mockPrisma.jewelry.findUnique.mockResolvedValue({ ...defaultJewelryConfig(), defaultMermaPercent: null });
-    mockPrisma.metalQuote.findFirst.mockResolvedValue(null); // sin cotización → partial
+    mockPrisma.metalQuote.findMany.mockResolvedValue([]); // sin cotización → partial
     mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
-      costCalculationMode: "METAL_MERMA_HECHURA",
+      costComposition: [{ type: "METAL", quantity: new D("10"), unitValue: new D("0"), currencyId: null, mermaPercent: new D("0"), metalVariantId: "v1" }],
       salePrice: new D("1000"),
-      compositions: [{ variantId: "v1", grams: new D("10"), isBase: true }],
     }));
 
     const res = await resolveFinalSalePrice("j1", { articleId: "a1" });

@@ -28,6 +28,7 @@ export async function list(req: any, res: Response) {
     warehouseId: s(body.warehouseId ?? query.warehouseId) || null,
     kind:        s(body.kind ?? query.kind) || null,
     articleId:   s(body.articleId ?? query.articleId) || null,
+    variantId:   s(body.variantId ?? query.variantId) || null,
     from:        body.from ? new Date(body.from) : null,
     to:          body.to   ? new Date(body.to)   : null,
   }));

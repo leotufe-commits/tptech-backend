@@ -2,7 +2,7 @@
 // Genera extracto de cuenta corriente para una CommercialEntity.
 
 import { prisma } from "../../lib/prisma.js";
-import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.balance.js";
+import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.js";
 
 // ---------------------------------------------------------------------------
 // Tipos exportados

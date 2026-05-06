@@ -1,6 +1,10 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
-import { applyStockDelta } from "../articles/articles.service.js";
+import {
+  validateStockLineIntegrity,
+  applyMovementImpact,
+  reverseMovementImpact,
+} from "../../lib/stock-engine.js";
 
 type Kind = "IN" | "OUT" | "TRANSFER" | "ADJUST" | "OPENING";
 
@@ -44,14 +48,20 @@ async function generateCode(tx: Prisma.TransactionClient, jewelryId: string, kin
 // ===========================================================================
 // Validaciones comunes de líneas
 // ===========================================================================
-type RawLine = { articleId: string; variantId?: string | null; quantity: any };
+type RawLine = { articleId: string; variantId?: string | null; quantity: any; weightPerUnit?: any };
 
-function parseLines(raw: any[]): Array<{ articleId: string; variantId: string | null; quantity: Prisma.Decimal }> {
+function parseLines(raw: any[]): Array<{
+  articleId: string;
+  variantId: string | null;
+  quantity: Prisma.Decimal;
+  weightPerUnit: Prisma.Decimal | null;
+}> {
   return (raw ?? [])
     .map((l) => ({
-      articleId: s(l?.articleId),
-      variantId: s(l?.variantId) || null,
-      quantity: toDec(l?.quantity),
+      articleId:    s(l?.articleId),
+      variantId:    s(l?.variantId) || null,
+      quantity:     toDec(l?.quantity),
+      weightPerUnit: toDec(l?.weightPerUnit) ?? null,
     }))
     .filter((l) => l.articleId && l.quantity !== null) as any;
 }
@@ -61,48 +71,309 @@ async function validateLinesForStock(
   jewelryId: string,
   lines: Array<{ articleId: string; variantId: string | null; quantity: Prisma.Decimal }>
 ) {
+  // Delegar al motor central: garantiza variant vs parent, BY_ARTICLE, tenant isolation
   for (const line of lines) {
-    // El artículo debe existir, pertenecer al tenant y usar BY_ARTICLE
-    const article = await tx.article.findFirst({
-      where: { id: line.articleId, jewelryId, deletedAt: null },
-      select: { id: true, stockMode: true, name: true },
-    });
-    assert(article, `Artículo ${line.articleId} no encontrado.`);
-    assert(
-      article!.stockMode === "BY_ARTICLE",
-      `El artículo "${article!.name}" no usa stock BY_ARTICLE. Solo se puede mover stock de artículos con stockMode BY_ARTICLE.`
-    );
-
-    // Verificar si el artículo tiene variantes activas → variantId es obligatorio
-    const variantCount = await tx.articleVariant.count({
-      where: { articleId: line.articleId, deletedAt: null, isActive: true },
-    });
-    if (variantCount > 0) {
-      assert(
-        line.variantId,
-        `El artículo "${article!.name}" tiene variantes activas. Especificá la variante (variantId) en cada línea del movimiento.`
-      );
-    }
-
-    // Si se especifica variantId, debe pertenecer al artículo, al tenant, estar activa y no eliminada
-    if (line.variantId) {
-      const variant = await tx.articleVariant.findFirst({
-        where: {
-          id: line.variantId,
-          articleId: line.articleId,
-          jewelryId,
-          deletedAt: null,
-          isActive: true,
-        },
-        select: { id: true, name: true },
-      });
-      assert(
-        variant,
-        `Variante "${line.variantId}" no encontrada, inactiva o no pertenece al artículo "${article!.name}".`,
-        404
-      );
-    }
+    await validateStockLineIntegrity(tx, jewelryId, line);
   }
+}
+
+// ===========================================================================
+// Resolución de peso por línea
+// Regla: solo se resuelve peso si el artículo tiene composiciones de metal reales.
+// Prioridad: weightPerUnit del usuario → weightOverride de la variante →
+//            suma de líneas METAL en costComposition → weight del artículo (legacy).
+// El valor resuelto se guarda como snapshot; nunca se recalcula después.
+// ===========================================================================
+type ParsedLine = {
+  articleId: string;
+  variantId: string | null;
+  quantity: Prisma.Decimal;
+  weightPerUnit: Prisma.Decimal | null;
+};
+
+async function resolveLineWeights(
+  tx: Prisma.TransactionClient,
+  jewelryId: string,
+  lines: ParsedLine[]
+): Promise<Array<ParsedLine & { resolvedWeightPerUnit: Prisma.Decimal | null }>> {
+  return Promise.all(
+    lines.map(async (l) => {
+      // Verificar si el artículo realmente tiene composiciones de metal.
+      // Sin metales → peso siempre null, independientemente de lo que envíe el cliente.
+      const metalLines = await tx.articleCostLine.findMany({
+        where: {
+          articleId: l.articleId,
+          jewelryId,
+          type: "METAL" as any,
+          quantity: { gt: 0 },
+        },
+        select: { quantity: true },
+      });
+      if (metalLines.length === 0) {
+        return { ...l, resolvedWeightPerUnit: null };
+      }
+
+      // Si el usuario ya proporcionó un peso, usarlo directamente
+      if (l.weightPerUnit != null && l.weightPerUnit.gt(0)) {
+        return { ...l, resolvedWeightPerUnit: l.weightPerUnit };
+      }
+
+      // Fallback 1: weightOverride de la variante
+      if (l.variantId) {
+        const variant = await tx.articleVariant.findFirst({
+          where: { id: l.variantId, jewelryId, deletedAt: null },
+          select: { weightOverride: true },
+        });
+        if (variant?.weightOverride != null && new Prisma.Decimal(variant.weightOverride).gt(0)) {
+          return { ...l, resolvedWeightPerUnit: new Prisma.Decimal(variant.weightOverride) };
+        }
+      }
+
+      // Fallback 2: suma de gramos de las líneas METAL (fuente de verdad principal)
+      const sumGrams = metalLines.reduce(
+        (acc, ml) => acc.add(new Prisma.Decimal(ml.quantity.toString())),
+        new Prisma.Decimal(0)
+      );
+      if (sumGrams.gt(0)) return { ...l, resolvedWeightPerUnit: sumGrams };
+
+      // Fallback 3: weight del artículo (campo legacy)
+      const article = await tx.article.findFirst({
+        where: { id: l.articleId, jewelryId, deletedAt: null },
+        select: { weight: true },
+      });
+      if (article?.weight != null && new Prisma.Decimal(article.weight).gt(0)) {
+        return { ...l, resolvedWeightPerUnit: new Prisma.Decimal(article.weight) };
+      }
+
+      return { ...l, resolvedWeightPerUnit: null };
+    })
+  );
+}
+
+// ===========================================================================
+// Select compartido para líneas de movimiento
+// Incluye costComposition del artículo para discriminar gramos por variante de metal
+// en la vista de detalle.
+// ===========================================================================
+const LINE_SELECT = {
+  id: true,
+  articleId: true,
+  variantId: true,
+  quantity: true,
+  weightPerUnit: true,
+  totalWeight: true,
+  snapshot: true,
+  article: {
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      sku: true,
+      mainImageUrl: true,
+      costComposition: {
+        where: { type: "METAL" as any, quantity: { gt: 0 } },
+        select: {
+          quantity: true,
+          metalVariantId: true,
+          metalVariant: {
+            select: {
+              id: true,
+              name: true,
+              metal: { select: { name: true } },
+            },
+          },
+        },
+        orderBy: { sortOrder: "asc" as const },
+      },
+    },
+  },
+  variant: { select: { id: true, code: true, name: true, sku: true, imageUrl: true } },
+} as const;
+
+// ===========================================================================
+// Enriquecimiento de líneas: agrega metals[] y elimina costComposition del response.
+// metals[i].gramsUnit = costComposition[i].quantity (gramos por unidad para ese metal)
+// metals[i].gramsTotal = gramsUnit × abs(lineQuantity)
+// El frontend NO recalcula — solo muestra los valores devueltos aquí.
+// ===========================================================================
+// snapshotWeightPerUnit = weightPerUnit guardado en el movimiento (puede venir de override o suma).
+// Si difiere de sum(composition), los gramos por metal se distribuyen proporcionalmente
+// para garantizar: sum(metals[i].gramsUnit) === snapshotWeightPerUnit siempre.
+function computeLineMetals(
+  costComposition: Array<{
+    quantity: any;
+    metalVariantId: string | null;
+    metalVariant: { id: string; name: string; metal: { name: string } } | null;
+  }>,
+  lineQuantity: any,
+  snapshotWeightPerUnit: any
+): Array<{ metalVariantId: string | null; name: string; gramsUnit: number; gramsTotal: number }> {
+  const qty      = Math.abs(Number(lineQuantity));
+  const validMetals = costComposition.filter(c => Number(c.quantity) > 0);
+  if (validMetals.length === 0) return [];
+
+  const compSum = validMetals.reduce((sum, c) => sum + Number(c.quantity), 0);
+  const wpu     = Number(snapshotWeightPerUnit);
+
+  // Distribución proporcional si el snapshot difiere de la composición (weightOverride o
+  // peso ingresado manualmente por el usuario). Garantiza sum(gramsUnit) === weightPerUnit.
+  const useProportional = wpu > 0 && compSum > 0 && Math.abs(wpu - compSum) > 0.0001;
+
+  return validMetals.map(c => {
+    const gramsUnit = useProportional
+      ? wpu * (Number(c.quantity) / compSum)
+      : Number(c.quantity);
+    return {
+      metalVariantId: c.metalVariantId,
+      name:           c.metalVariant?.name ?? c.metalVariant?.metal?.name ?? "Metal",
+      gramsUnit,
+      gramsTotal:     gramsUnit * qty,
+    };
+  });
+}
+
+// ===========================================================================
+// Construye snapshots para cada línea en el momento de creación.
+// Usa los datos actuales de artículo/variante/composición metálica para
+// preservar nombres, imágenes y gramos aunque el artículo sea renombrado después.
+// Se llama en una transacción activa (dentro de createArticleMovement / transferArticleMovement).
+// ===========================================================================
+async function buildLineSnapshots(
+  tx: Prisma.TransactionClient,
+  jewelryId: string,
+  resolvedLines: Array<ParsedLine & { resolvedWeightPerUnit: Prisma.Decimal | null }>
+): Promise<Map<number, any>> {
+  const articleIds = [...new Set(resolvedLines.map((l) => l.articleId))];
+  const variantIds = [...new Set(resolvedLines.map((l) => l.variantId).filter((v): v is string => v != null))];
+
+  const [articles, variants] = await Promise.all([
+    tx.article.findMany({
+      where: { id: { in: articleIds }, jewelryId },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        sku: true,
+        mainImageUrl: true,
+        costComposition: {
+          where: { type: "METAL" as any, quantity: { gt: 0 } },
+          select: {
+            quantity: true,
+            metalVariantId: true,
+            metalVariant: {
+              select: {
+                id: true,
+                name: true,
+                metal: { select: { name: true } },
+              },
+            },
+          },
+          orderBy: { sortOrder: "asc" as const },
+        },
+      },
+    }),
+    variantIds.length > 0
+      ? tx.articleVariant.findMany({
+          where: { id: { in: variantIds }, jewelryId },
+          select: { id: true, code: true, name: true, sku: true, imageUrl: true },
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const articleMap = new Map(articles.map((a) => [a.id, a]));
+  const variantMap = new Map(variants.map((v) => [v.id, v]));
+
+  const snapshots = new Map<number, any>();
+  resolvedLines.forEach((l, i) => {
+    const article = articleMap.get(l.articleId);
+    if (!article) return;
+    const variant = l.variantId ? (variantMap.get(l.variantId) ?? null) : null;
+
+    const qty    = Math.abs(Number(l.quantity));
+    const wpu    = l.resolvedWeightPerUnit ? Number(l.resolvedWeightPerUnit) : 0;
+    const validComp = article.costComposition.filter((c) => Number(c.quantity) > 0);
+    const compSum   = validComp.reduce((s, c) => s + Number(c.quantity), 0);
+    const useProportional = wpu > 0 && compSum > 0 && Math.abs(wpu - compSum) > 0.0001;
+
+    const metals = validComp.map((c) => {
+      const gramsUnit = useProportional
+        ? wpu * (Number(c.quantity) / compSum)
+        : Number(c.quantity);
+      return {
+        metalVariantId:   c.metalVariantId,
+        metalVariantName: c.metalVariant?.name ?? c.metalVariant?.metal?.name ?? "Metal",
+        metalName:        c.metalVariant?.metal?.name ?? c.metalVariant?.name ?? "Metal",
+        gramsUnit,
+        gramsTotal: gramsUnit * qty,
+      };
+    });
+
+    snapshots.set(i, {
+      articleName:  article.name,
+      articleCode:  article.code,
+      articleSku:   article.sku,
+      articleImage: article.mainImageUrl || null,
+      variantName:  variant?.name  ?? null,
+      variantCode:  variant?.code  ?? null,
+      variantSku:   variant?.sku   ?? null,
+      variantImage: variant?.imageUrl ?? null,
+      metals,
+    });
+  });
+
+  return snapshots;
+}
+
+function enrichMovement(movement: any): any {
+  return {
+    ...movement,
+    lines: (movement.lines ?? []).map((line: any) => {
+      const snap = (line.snapshot as any) ?? null;
+
+      if (snap) {
+        // Usar snapshot — protege contra renombres y cambios de composición posteriores
+        const liveArticle: any = line.article ?? {};
+        const article = {
+          id:           liveArticle.id   ?? line.articleId,
+          code:         snap.articleCode,
+          name:         snap.articleName,
+          sku:          snap.articleSku,
+          mainImageUrl: snap.articleImage ?? liveArticle.mainImageUrl ?? null,
+        };
+        const variant = line.variantId
+          ? {
+              id:       (line.variant as any)?.id       ?? line.variantId,
+              code:     snap.variantCode  ?? (line.variant as any)?.code  ?? "",
+              name:     snap.variantName  ?? (line.variant as any)?.name  ?? "",
+              sku:      snap.variantSku   ?? (line.variant as any)?.sku   ?? "",
+              imageUrl: snap.variantImage ?? (line.variant as any)?.imageUrl ?? null,
+            }
+          : null;
+        const metals: Array<{ metalVariantId: string | null; name: string; gramsUnit: number; gramsTotal: number }> =
+          (snap.metals ?? []).map((m: any) => ({
+            metalVariantId: m.metalVariantId,
+            name:           m.metalVariantName,
+            gramsUnit:      m.gramsUnit,
+            gramsTotal:     m.gramsTotal,
+          }));
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { snapshot: _snap, ...lineWithoutSnap } = line;
+        return { ...lineWithoutSnap, article, variant, metals };
+      }
+
+      // Fallback legacy: computar desde costComposition en vivo
+      const costComposition = line.article?.costComposition ?? [];
+      const metals = computeLineMetals(costComposition, line.quantity, line.weightPerUnit);
+      const { costComposition: _cc, ...articleWithoutComp } = line.article ?? {};
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { snapshot: _snap2, ...lineWithoutSnap2 } = line;
+      return {
+        ...lineWithoutSnap2,
+        article: line.article ? articleWithoutComp : null,
+        metals,
+      };
+    }),
+  };
 }
 
 // ===========================================================================
@@ -118,13 +389,14 @@ export async function listArticleMovements(opts: {
   from?: Date | null;
   to?: Date | null;
   articleId?: string | null;
+  variantId?: string | null;
 }) {
   const { jewelryId } = opts;
   const take = clampTake(opts.pageSize ?? 50);
   const skip = (Math.max(1, opts.page ?? 1) - 1) * take;
 
   const q = s(opts.q || "");
-  const where: any = { jewelryId, voidedAt: null };
+  const where: any = { jewelryId, status: { not: "VOIDED" } };
 
   if (opts.kind) where.kind = opts.kind;
   if (opts.warehouseId) {
@@ -139,8 +411,11 @@ export async function listArticleMovements(opts: {
     if (opts.from) where.effectiveAt.gte = opts.from;
     if (opts.to) where.effectiveAt.lte = opts.to;
   }
-  if (opts.articleId) {
-    where.lines = { some: { articleId: opts.articleId } };
+  if (opts.articleId || opts.variantId) {
+    const lineFilter: Record<string, string> = {};
+    if (opts.articleId) lineFilter.articleId = opts.articleId;
+    if (opts.variantId) lineFilter.variantId = opts.variantId;
+    where.lines = { some: lineFilter };
   }
   if (q) {
     where.OR = [
@@ -160,6 +435,8 @@ export async function listArticleMovements(opts: {
       select: {
         id: true,
         kind: true,
+        status: true,
+        sourceType: true,
         code: true,
         note: true,
         effectiveAt: true,
@@ -171,21 +448,12 @@ export async function listArticleMovements(opts: {
         toWarehouse:   { select: { id: true, name: true, code: true } },
         createdBy:     { select: { id: true, name: true, email: true } },
         voidedBy:      { select: { id: true, name: true, email: true } },
-        lines: {
-          select: {
-            id: true,
-            articleId: true,
-            variantId: true,
-            quantity: true,
-            article: { select: { id: true, code: true, name: true } },
-            variant:  { select: { id: true, code: true, name: true } },
-          },
-        },
+        lines: { select: LINE_SELECT },
       },
     }),
   ]);
 
-  return { rows, total, page: opts.page ?? 1, pageSize: take };
+  return { rows: rows.map(enrichMovement), total, page: opts.page ?? 1, pageSize: take };
 }
 
 // ===========================================================================
@@ -209,9 +477,13 @@ export async function createArticleMovement(opts: {
   const lines = parseLines(opts.lines);
   assert(lines.length > 0, "Agregá al menos una línea.");
 
-  // Para ADJUST las cantidades pueden ser negativas (delta), para el resto deben ser positivas
-  if (opts.kind !== "ADJUST") {
-    for (const l of lines) {
+  // Validación de cantidades por tipo de movimiento
+  for (const l of lines) {
+    if (opts.kind === "ADJUST") {
+      // ADJUST: delta firmado — positivo o negativo, nunca cero
+      assert(!l.quantity.eq(0), `El delta de ajuste no puede ser 0. (artículo: ${l.articleId})`);
+    } else {
+      // IN / OUT / OPENING: magnitud positiva
       assert(l.quantity.gt(0), `La cantidad debe ser mayor a 0. (artículo: ${l.articleId})`);
     }
   }
@@ -226,84 +498,84 @@ export async function createArticleMovement(opts: {
 
     await validateLinesForStock(tx, jewelryId, lines);
 
-    // Verificar stock suficiente para OUT
-    if (opts.kind === "OUT") {
+    // OPENING: no se permite si el artículo ya tiene stock en este almacén
+    if (opts.kind === "OPENING") {
       for (const line of lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: opts.warehouseId,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: line.quantity.neg(),
-          preventNegative: true,
+        const existing = await tx.articleStock.findFirst({
+          where: {
+            jewelryId,
+            warehouseId: opts.warehouseId,
+            articleId:   line.articleId,
+            variantId:   line.variantId ?? null,
+          },
+          select: { id: true },
         });
-      }
-    } else if (opts.kind === "IN" || opts.kind === "OPENING") {
-      for (const line of lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: opts.warehouseId,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: line.quantity,
-          preventNegative: false,
-        });
-      }
-    } else if (opts.kind === "ADJUST") {
-      // Para ADJUST: la línea ya tiene el delta firmado
-      for (const line of lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: opts.warehouseId,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: line.quantity,
-          preventNegative: false, // ajuste puede llevar a negativo si así se quiere
-        });
+        assert(
+          !existing,
+          "No se puede registrar Apertura: el artículo ya tiene stock en este almacén. Usá Ajuste para modificar el stock existente."
+        );
       }
     }
 
+    // Aplicar impacto al stock vía motor central
+    const { hasNegativeStock } = await applyMovementImpact(tx, {
+      kind:        opts.kind,
+      jewelryId,
+      warehouseId: opts.warehouseId,
+      lines,
+    });
+
     const code = await generateCode(tx, jewelryId, opts.kind);
 
-    return tx.articleMovement.create({
+    // Resolver peso efectivo por línea (fallback a variante/artículo si el usuario no lo ingresó)
+    const resolvedLines = await resolveLineWeights(tx, jewelryId, lines);
+
+    // Construir snapshots históricos (write-once: nombre, imagen, gramos por metal al momento de crear)
+    const lineSnapshots = await buildLineSnapshots(tx, jewelryId, resolvedLines);
+
+    const movement = await tx.articleMovement.create({
       data: {
         jewelryId,
-        kind: opts.kind,
+        kind:   opts.kind,
+        status: "CONFIRMED",
+        sourceType: "MANUAL",
         code,
         note: s(opts.note || ""),
         effectiveAt: opts.effectiveAt ?? new Date(),
         warehouseId: opts.warehouseId,
         createdById: userId || null,
         lines: {
-          create: lines.map((l) => ({
-            jewelryId,
-            articleId: l.articleId,
-            variantId: l.variantId ?? null,
-            quantity: l.quantity,
-          })),
+          create: resolvedLines.map((l, i) => {
+            const wpu = l.resolvedWeightPerUnit;
+            const tw  = wpu != null ? l.quantity.abs().mul(wpu) : null;
+            return {
+              jewelryId,
+              articleId:     l.articleId,
+              variantId:     l.variantId ?? null,
+              quantity:      l.quantity,
+              weightPerUnit: wpu,
+              totalWeight:   tw,
+              snapshot:      lineSnapshots.get(i) ?? null,
+            };
+          }),
         },
       },
       select: {
         id: true,
         kind: true,
+        status: true,
+        sourceType: true,
         code: true,
         note: true,
         effectiveAt: true,
         createdAt: true,
         warehouse:  { select: { id: true, name: true, code: true } },
         createdBy:  { select: { id: true, name: true, email: true } },
-        lines: {
-          select: {
-            id: true,
-            articleId: true,
-            variantId: true,
-            quantity: true,
-            article: { select: { id: true, code: true, name: true } },
-            variant:  { select: { id: true, code: true, name: true } },
-          },
-        },
+        lines: { select: LINE_SELECT },
       },
     });
+
+    return enrichMovement({ ...movement, hasNegativeStock });
   });
 }
 
@@ -344,54 +616,56 @@ export async function transferArticleMovement(opts: {
 
     await validateLinesForStock(tx, jewelryId, lines);
 
-    // Restar del origen (con control de stock negativo)
-    for (const line of lines) {
-      await applyStockDelta(tx, {
-        jewelryId,
-        warehouseId: opts.fromWarehouseId,
-        articleId: line.articleId,
-        variantId: line.variantId,
-        delta: line.quantity.neg(),
-        preventNegative: true,
-      });
-    }
-
-    // Sumar al destino
-    for (const line of lines) {
-      await applyStockDelta(tx, {
-        jewelryId,
-        warehouseId: opts.toWarehouseId,
-        articleId: line.articleId,
-        variantId: line.variantId,
-        delta: line.quantity,
-        preventNegative: false,
-      });
-    }
+    // Aplicar impacto al stock vía motor central
+    const { hasNegativeStock } = await applyMovementImpact(tx, {
+      kind:            "TRANSFER",
+      jewelryId,
+      fromWarehouseId: opts.fromWarehouseId,
+      toWarehouseId:   opts.toWarehouseId,
+      lines,
+    });
 
     const code = await generateCode(tx, jewelryId, "TRANSFER");
 
-    return tx.articleMovement.create({
+    // Resolver peso efectivo por línea (fallback a variante/artículo si el usuario no lo ingresó)
+    const resolvedLines = await resolveLineWeights(tx, jewelryId, lines);
+
+    // Construir snapshots históricos (write-once)
+    const lineSnapshots = await buildLineSnapshots(tx, jewelryId, resolvedLines);
+
+    const movement = await tx.articleMovement.create({
       data: {
         jewelryId,
-        kind: "TRANSFER",
+        kind:   "TRANSFER",
+        status: "CONFIRMED",
+        sourceType: "MANUAL",
         code,
         note: s(opts.note || ""),
         effectiveAt: opts.effectiveAt ?? new Date(),
         fromWarehouseId: opts.fromWarehouseId,
-        toWarehouseId: opts.toWarehouseId,
+        toWarehouseId:   opts.toWarehouseId,
         createdById: userId || null,
         lines: {
-          create: lines.map((l) => ({
-            jewelryId,
-            articleId: l.articleId,
-            variantId: l.variantId ?? null,
-            quantity: l.quantity,
-          })),
+          create: resolvedLines.map((l, i) => {
+            const wpu = l.resolvedWeightPerUnit;
+            const tw  = wpu != null ? l.quantity.abs().mul(wpu) : null;
+            return {
+              jewelryId,
+              articleId:     l.articleId,
+              variantId:     l.variantId ?? null,
+              quantity:      l.quantity,
+              weightPerUnit: wpu,
+              totalWeight:   tw,
+              snapshot:      lineSnapshots.get(i) ?? null,
+            };
+          }),
         },
       },
       select: {
         id: true,
         kind: true,
+        status: true,
+        sourceType: true,
         code: true,
         note: true,
         effectiveAt: true,
@@ -399,18 +673,11 @@ export async function transferArticleMovement(opts: {
         fromWarehouse: { select: { id: true, name: true, code: true } },
         toWarehouse:   { select: { id: true, name: true, code: true } },
         createdBy:     { select: { id: true, name: true, email: true } },
-        lines: {
-          select: {
-            id: true,
-            articleId: true,
-            variantId: true,
-            quantity: true,
-            article: { select: { id: true, code: true, name: true } },
-            variant:  { select: { id: true, code: true, name: true } },
-          },
-        },
+        lines: { select: LINE_SELECT },
       },
     });
+
+    return enrichMovement({ ...movement, hasNegativeStock });
   });
 }
 
@@ -434,94 +701,67 @@ export async function voidArticleMovement(opts: {
       select: {
         id: true,
         kind: true,
-        voidedAt: true,
+        status: true,
+        sourceType: true,
         warehouseId: true,
         fromWarehouseId: true,
         toWarehouseId: true,
         lines: {
-          select: {
-            articleId: true,
-            variantId: true,
-            quantity: true,
-          },
+          select: { articleId: true, variantId: true, quantity: true },
         },
       },
     });
 
     assert(movement, "Movimiento no encontrado.", 404);
-    assert(!movement!.voidedAt, "El movimiento ya fue anulado.");
+    assert(movement!.status !== "VOIDED", "El movimiento ya fue anulado.");
+    assert(movement!.status === "CONFIRMED", "Solo se pueden anular movimientos confirmados.");
 
-    // Revertir el efecto en el stock
-    const kind = movement!.kind as Kind;
-
-    if (kind === "IN" || kind === "OPENING") {
-      // Revertir: descontar del almacén destino
-      for (const line of movement!.lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: movement!.warehouseId!,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: new Prisma.Decimal(line.quantity.toString()).neg(),
-          preventNegative: true,
-        });
-      }
-    } else if (kind === "OUT") {
-      // Revertir: devolver al almacén
-      for (const line of movement!.lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: movement!.warehouseId!,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: line.quantity,
-          preventNegative: false,
-        });
-      }
-    } else if (kind === "TRANSFER") {
-      // Revertir: devolver al origen, quitar del destino
-      for (const line of movement!.lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: movement!.toWarehouseId!,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: new Prisma.Decimal(line.quantity.toString()).neg(),
-          preventNegative: true,
-        });
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: movement!.fromWarehouseId!,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: line.quantity,
-          preventNegative: false,
-        });
-      }
-    } else if (kind === "ADJUST") {
-      // Revertir: aplicar el delta opuesto
-      for (const line of movement!.lines) {
-        await applyStockDelta(tx, {
-          jewelryId,
-          warehouseId: movement!.warehouseId!,
-          articleId: line.articleId,
-          variantId: line.variantId,
-          delta: new Prisma.Decimal(line.quantity.toString()).neg(),
-          preventNegative: false,
-        });
-      }
+    // Solo los movimientos manuales se pueden anular desde este módulo
+    if (movement!.sourceType !== "MANUAL") {
+      const sourceLabels: Record<string, string> = {
+        SALE:     "una venta",
+        IMPORT:   "una importación masiva",
+        PURCHASE: "una orden de compra",
+      };
+      const label = sourceLabels[movement!.sourceType] ?? movement!.sourceType;
+      const e: any = new Error(
+        `Este movimiento fue generado por ${label} y no puede anularse manualmente. Anulá desde el módulo de origen.`
+      );
+      e.status = 409;
+      throw e;
     }
 
-    return tx.articleMovement.update({
+    const kind = movement!.kind as Kind;
+
+    // Revertir el efecto en el stock vía motor central
+    const lines = movement!.lines.map(l => ({
+      articleId: l.articleId,
+      variantId: l.variantId,
+      quantity:  new Prisma.Decimal(l.quantity.toString()),
+    }));
+
+    await reverseMovementImpact(tx, {
+      kind,
+      jewelryId,
+      warehouseId:     movement!.warehouseId     ?? undefined,
+      fromWarehouseId: movement!.fromWarehouseId ?? undefined,
+      toWarehouseId:   movement!.toWarehouseId   ?? undefined,
+      lines,
+    });
+
+    const updated = await tx.articleMovement.update({
       where: { id },
       data: {
-        voidedAt: new Date(),
+        status:     "VOIDED",
+        voidedAt:   new Date(),
         voidedById: userId || null,
         voidedNote: s(opts.note || ""),
       },
       select: {
         id: true,
         kind: true,
+        status: true,
+        sourceType: true,
         code: true,
         note: true,
         effectiveAt: true,
@@ -533,17 +773,9 @@ export async function voidArticleMovement(opts: {
         toWarehouse:   { select: { id: true, name: true, code: true } },
         createdBy:     { select: { id: true, name: true, email: true } },
         voidedBy:      { select: { id: true, name: true, email: true } },
-        lines: {
-          select: {
-            id: true,
-            articleId: true,
-            variantId: true,
-            quantity: true,
-            article: { select: { id: true, code: true, name: true } },
-            variant:  { select: { id: true, code: true, name: true } },
-          },
-        },
+        lines: { select: LINE_SELECT },
       },
     });
+    return enrichMovement(updated);
   });
 }

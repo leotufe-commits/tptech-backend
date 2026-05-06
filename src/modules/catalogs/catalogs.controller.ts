@@ -45,18 +45,11 @@ const ALLOWED_TYPES = new Set<CatalogType>([
   "PAYMENT_TERM",
   "ARTICLE_BRAND",
   "ARTICLE_MANUFACTURER",
-  "UNIT_OF_MEASURE",
-  "MULTIPLIER_BASE",
-  "WEIGHT_UNIT",
 ]);
 
 function parseType(raw: any): CatalogType | null {
   const t = String(raw ?? "").trim().toUpperCase() as CatalogType;
   return ALLOWED_TYPES.has(t) ? t : null;
-}
-
-function isPrismaUniqueViolation(e: any) {
-  return e?.code === "P2002";
 }
 
 function parseBool(v: any): boolean | null {

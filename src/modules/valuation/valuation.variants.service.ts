@@ -533,12 +533,12 @@ export async function deleteMetalVariant(jewelryId: string, variantId: string) {
     throw err;
   }
 
-  const compositionCount = await prisma.articleMetalComposition.count({
-    where: { variantId: v.id },
+  const costLineCount = await prisma.articleCostLine.count({
+    where: { metalVariantId: v.id },
   });
-  if (compositionCount > 0) {
+  if (costLineCount > 0) {
     const err: any = new Error(
-      `No se puede eliminar la variante: está usada en ${compositionCount} composición(es) de artículo.`
+      `No se puede eliminar la variante: está usada en ${costLineCount} línea(s) de costo de artículo.`
     );
     err.status = 409;
     throw err;

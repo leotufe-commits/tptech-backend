@@ -150,6 +150,11 @@ export async function updateMyJewelry(req: Request, res: Response) {
       emailFooter:           data.emailFooter        ?? undefined,
       // ────────────────────────────────────────────────────────────────────
 
+      // ── Formato de campos ───────────────────────────────────────────────
+      phoneFormat:    data.phoneFormat    ?? undefined,
+      documentFormat: data.documentFormat ?? undefined,
+      // ────────────────────────────────────────────────────────────────────
+
       // ── Política de alertas de precio ───────────────────────────────────
       pricingLowMarginWarningPercent: "pricingLowMarginWarningPercent" in data
         ? (data.pricingLowMarginWarningPercent != null ? data.pricingLowMarginWarningPercent : null)
@@ -160,6 +165,18 @@ export async function updateMyJewelry(req: Request, res: Response) {
       pricingBlockLossSale:            typeof data.pricingBlockLossSale            === "boolean" ? data.pricingBlockLossSale            : undefined,
       pricingBlockZeroOrNegativePrice: typeof data.pricingBlockZeroOrNegativePrice === "boolean" ? data.pricingBlockZeroOrNegativePrice : undefined,
       pricingBlockPartialData:         typeof data.pricingBlockPartialData         === "boolean" ? data.pricingBlockPartialData         : undefined,
+      // ────────────────────────────────────────────────────────────────────
+
+      // ── Redondeo por comprobante (modo UNIFIED) ─────────────────────────
+      documentRoundingEnabled:   typeof data.documentRoundingEnabled === "boolean"
+        ? data.documentRoundingEnabled
+        : undefined,
+      documentRoundingMode:      typeof data.documentRoundingMode === "string"
+        ? (data.documentRoundingMode as any)
+        : undefined,
+      documentRoundingDirection: typeof data.documentRoundingDirection === "string"
+        ? (data.documentRoundingDirection as any)
+        : undefined,
       // ────────────────────────────────────────────────────────────────────
     },
   });

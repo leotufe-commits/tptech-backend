@@ -3,6 +3,7 @@
 // resolución de catálogos por nombre/código y detección de duplicados por prioridad.
 import { prisma } from "../../lib/prisma.js";
 import type { EntityType } from "@prisma/client";
+import { saveBatch, buildBatchRowsFromEntityResults } from "../../lib/importBatch.helper.js";
 
 function s(v: any): string { return String(v ?? "").trim(); }
 function isTruthy(v: string): boolean {
@@ -57,8 +58,9 @@ export type ImportCommitRow = {
 };
 
 export type ImportCommitResult = {
-  results: ImportCommitRow[];
-  summary: { created: number; updated: number; skipped: number; errors: number; conflicts: number };
+  results:  ImportCommitRow[];
+  summary:  { created: number; updated: number; skipped: number; errors: number; conflicts: number };
+  batchId?: string | null;
 };
 
 // ─── Resultado de búsqueda ───────────────────────────────────────────────────
@@ -393,13 +395,19 @@ export async function commitImport(
   tenantId: string,
   rows: ImportRow[],
   opts: {
-    mode:    "create" | "update" | "upsert";
-    role:    "client" | "supplier" | "both";
-    matchBy?: string; // ignorado — la prioridad es fija: code > document > email > name
+    mode:      "create" | "update" | "upsert";
+    role:      "client" | "supplier" | "both";
+    matchBy?:  string; // ignorado — la prioridad es fija: code > document > email > name
+    userId?:   string;
+    fileName?: string;
   },
 ): Promise<ImportCommitResult> {
   const results: ImportCommitRow[] = [];
   let created = 0, updated = 0, skipped = 0, errors = 0, conflicts = 0;
+
+  // rawRows para trazabilidad: rowNum (1-based) → fila original
+  const rawRowsEntity = new Map<number, ImportRow>();
+  for (let i = 0; i < rows.length; i++) rawRowsEntity.set(i + 1, rows[i]);
 
   for (let i = 0; i < rows.length; i++) {
     const raw    = rows[i];
@@ -479,6 +487,29 @@ export async function commitImport(
           }
         }
 
+        // F1.2: actualizar contacto primario si el CSV trae datos de contacto
+        if (hasContactData(raw)) {
+          const existingContact = await prisma.entityContact.findFirst({
+            where:  { entityId: existingId, deletedAt: null, isPrimary: true },
+            select: { id: true },
+          });
+          const contactData = {
+            firstName: s(raw.contactFirstName),
+            lastName:  s(raw.contactLastName),
+            position:  s(raw.contactPosition),
+            email:     s(raw.contactEmail).toLowerCase(),
+            phone:     s(raw.contactPhone),
+            whatsapp:  s(raw.contactWhatsapp),
+            notes:     s(raw.contactNotes),
+            isPrimary: true,
+          };
+          if (existingContact) {
+            await prisma.entityContact.update({ where: { id: existingContact.id }, data: contactData });
+          } else {
+            await prisma.entityContact.create({ data: { ...contactData, entityId: existingId, jewelryId: tenantId } });
+          }
+        }
+
         results.push({ row: rowNum, displayName: dn, status: "updated", id: existingId });
         updated++;
       } else {
@@ -533,5 +564,16 @@ export async function commitImport(
     }
   }
 
-  return { results, summary: { created, updated, skipped, errors, conflicts } };
+  // Registrar batch + detalle por fila (best-effort)
+  const batchId = await saveBatch({
+    jewelryId:  tenantId,
+    entityType: "COMMERCIAL_ENTITY",
+    fileName:   opts.fileName ?? "",
+    onConflict: opts.mode,
+    userId:     opts.userId,
+    summary:    { created, updated, skipped, errors, conflicts },
+    rows:       buildBatchRowsFromEntityResults(results, rawRowsEntity),
+  });
+
+  return { results, summary: { created, updated, skipped, errors, conflicts }, batchId };
 }

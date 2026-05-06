@@ -5,7 +5,7 @@
 //   UNIFIED   → suma de amounts (saldo monetario clásico)
 //   BREAKDOWN → suma de gramsPure por metalId + suma de hechura por moneda
 
-import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.balance.js";
+import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.js";
 
 // ---------------------------------------------------------------------------
 // Tipos de entrada (subset de EntityBalanceEntry que se necesita)

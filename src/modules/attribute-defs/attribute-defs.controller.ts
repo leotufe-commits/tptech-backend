@@ -81,6 +81,15 @@ export async function toggleOption(req: any, res: Response) {
   return res.json(updated);
 }
 
+export async function reorderDefs(req: any, res: Response) {
+  const jewelryId = req.user?.jewelryId;
+  assert(jewelryId, "Tenant inválido.");
+  const { ids } = req.body;
+  assert(Array.isArray(ids), "ids debe ser un array.");
+  const result = await service.reorderAttributeDefs(ids, jewelryId);
+  return res.json(result);
+}
+
 export async function reorderOptions(req: any, res: Response) {
   const jewelryId = req.user?.jewelryId;
   const defId = s(req.params?.id);

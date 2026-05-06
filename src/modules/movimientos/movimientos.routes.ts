@@ -5,6 +5,7 @@ import { requireAuth } from "../../middlewares/requireAuth.js";
 import {
   list,
   create,
+  createOut,
   transfer,
   adjustMovement,
   voidMovement,
@@ -15,6 +16,7 @@ const router = Router();
 
 router.post("/list", requireAuth, list);
 router.post("/create", requireAuth, create);
+router.post("/out", requireAuth, createOut);
 router.post("/transfer", requireAuth, transfer);
 router.post("/adjust", requireAuth, adjustMovement);
 router.post("/:id/void", requireAuth, voidMovement);

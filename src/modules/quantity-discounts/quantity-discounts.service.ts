@@ -1,8 +1,21 @@
 // src/modules/quantity-discounts/quantity-discounts.service.ts
 import { prisma } from "../../lib/prisma.js";
+import { validateMetalVariantIds } from "../../lib/metal-scope-validator.js";
 
 function assert(cond: any, msg: string, status = 400) {
   if (!cond) { const e: any = new Error(msg); e.status = status; throw e; }
+}
+
+/**
+ * Resuelve la lista final de `metalVariantIds` para persistir.
+ * - Si el payload trae el campo definido y NO vacío → valida y devuelve.
+ * - Si trae array vacío o lo omite → devuelve [] (regla: scope != METALS
+ *   ⇒ limpiar). En `QuantityDiscount` el "scope" se decide por presencia
+ *   del campo (no hay enum dedicado), entonces array vacío = sin filtro.
+ */
+async function resolveMetalVariantIds(jewelryId: string, raw: unknown): Promise<string[]> {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  return validateMetalVariantIds(jewelryId, raw);
 }
 
 function validateTiers(tiers: any[]) {
@@ -17,20 +30,21 @@ function validateTiers(tiers: any[]) {
 }
 
 const QD_SELECT = {
-  id:             true,
-  articleId:      true,
-  variantId:      true,
-  categoryId:     true,
-  brand:          true,
-  groupId:        true,
-  isActive:       true,
-  isStackable:    true,
-  evaluationMode: true,
-  applyOn:        true,
-  sortOrder:      true,
-  deletedAt:      true,
-  createdAt:      true,
-  updatedAt:      true,
+  id:               true,
+  articleId:        true,
+  variantId:        true,
+  categoryId:       true,
+  brand:            true,
+  groupId:          true,
+  metalVariantIds:  true,
+  isActive:         true,
+  isStackable:      true,
+  evaluationMode:   true,
+  applyOn:          true,
+  sortOrder:        true,
+  deletedAt:        true,
+  createdAt:        true,
+  updatedAt:        true,
   article:  { select: { id: true, code: true, name: true } },
   variant:  { select: { id: true, code: true, name: true } },
   category: { select: { id: true, name: true } },
@@ -62,19 +76,24 @@ export async function listQuantityDiscounts(
 export async function createQuantityDiscount(jewelryId: string, data: any) {
   validateTiers(data.tiers ?? []);
 
+  // FASE 2: filtro opcional por variantes de metal. Validado antes de la
+  // escritura para fallar rápido si alguna variante es inválida.
+  const metalVariantIds = await resolveMetalVariantIds(jewelryId, data?.metalVariantIds);
+
   return prisma.quantityDiscount.create({
     data: {
       jewelryId,
-      articleId:      data.articleId      || null,
-      variantId:      data.variantId      || null,
-      categoryId:     data.categoryId     || null,
-      brand:          data.brand          || null,
-      groupId:        data.groupId        || null,
-      isActive:       data.isActive !== false,
-      isStackable:    data.isStackable !== false,
-      evaluationMode: data.evaluationMode || "LINE",
-      applyOn:        data.applyOn        || "TOTAL",
-      sortOrder:      Number(data.sortOrder ?? 0),
+      articleId:       data.articleId      || null,
+      variantId:       data.variantId      || null,
+      categoryId:      data.categoryId     || null,
+      brand:           data.brand          || null,
+      groupId:         data.groupId        || null,
+      metalVariantIds,
+      isActive:        data.isActive !== false,
+      isStackable:     data.isStackable !== false,
+      evaluationMode:  data.evaluationMode || "LINE",
+      applyOn:         data.applyOn        || "TOTAL",
+      sortOrder:       Number(data.sortOrder ?? 0),
       tiers: {
         create: (data.tiers as any[]).map((t: any) => ({
           minQty: t.minQty,
@@ -95,6 +114,12 @@ export async function updateQuantityDiscount(id: string, jewelryId: string, data
     validateTiers(data.tiers);
   }
 
+  // FASE 2: si el caller mandó `metalVariantIds`, validar y persistir;
+  // si no lo mandó, preservar el valor actual.
+  const metalPatch = data.metalVariantIds === undefined
+    ? {}
+    : { metalVariantIds: await resolveMetalVariantIds(jewelryId, data.metalVariantIds) };
+
   return prisma.quantityDiscount.update({
     where: { id },
     data: {
@@ -103,6 +128,7 @@ export async function updateQuantityDiscount(id: string, jewelryId: string, data
       ...(data.categoryId !== undefined ? { categoryId: data.categoryId || null } : {}),
       ...(data.brand      !== undefined ? { brand:      data.brand      || null } : {}),
       ...(data.groupId    !== undefined ? { groupId:    data.groupId    || null } : {}),
+      ...metalPatch,
       ...(data.isActive       !== undefined ? { isActive:       !!data.isActive }              : {}),
       ...(data.isStackable    !== undefined ? { isStackable:    !!data.isStackable }           : {}),
       ...(data.evaluationMode !== undefined ? { evaluationMode: data.evaluationMode || "LINE" } : {}),

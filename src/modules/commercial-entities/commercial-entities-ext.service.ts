@@ -7,7 +7,6 @@ function s(v: any) { return String(v ?? "").trim(); }
 function assert(cond: any, msg: string): asserts cond {
   if (!cond) { const err: any = new Error(msg); err.status = 400; throw err; }
 }
-function n(v: any): number { return Number(v ?? 0) || 0; }
 
 const db = prisma as any;
 

@@ -8,7 +8,7 @@ import {
   aggregateEntityBalance,
 } from "../../commercial-entities/balance.utils.js";
 import type { BalanceEntryLike } from "../../commercial-entities/balance.utils.js";
-import type { BalanceBreakdown } from "../../../lib/pricing-engine/pricing-engine.balance.js";
+import type { BalanceBreakdown } from "../../../lib/pricing-engine/pricing-engine.js";
 
 // ---------------------------------------------------------------------------
 // Helpers

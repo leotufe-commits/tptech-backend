@@ -1,6 +1,6 @@
 // tptech-backend/src/modules/dashboard/dashboard.service.ts
 import { prisma } from "../../lib/prisma.js";
-import { Prisma } from "@prisma/client";
+import { Prisma, SaleStatus } from "@prisma/client";
 
 export type DashboardRange = "7d" | "30d" | "90d" | "1y";
 
@@ -54,6 +54,12 @@ function pickLastPerDay<T extends { effectiveAt: Date }>(
   return map;
 }
 
+function r2(n: number) {
+  return Math.round(n * 100) / 100;
+}
+
+const SALE_ACTIVE: SaleStatus[] = ["CONFIRMED", "PAID", "PARTIALLY_PAID"];
+
 export async function getDashboardSummary(args: {
   jewelryId: string;
   range: DashboardRange;
@@ -63,6 +69,7 @@ export async function getDashboardSummary(args: {
   const from = addDays(now, -(days - 1));
   const axis = buildDayAxis(from, now);
 
+  // ── 1. Contadores generales ────────────────────────────────────────────────
   const [
     baseCurrency,
     currenciesActiveCount,
@@ -90,6 +97,7 @@ export async function getDashboardSummary(args: {
     }),
   ]);
 
+  // ── 2. Catálogos ──────────────────────────────────────────────────────────
   const [currencies, metals] = await Promise.all([
     prisma.currency.findMany({
       where: { jewelryId: args.jewelryId, deletedAt: null, isActive: true },
@@ -105,6 +113,7 @@ export async function getDashboardSummary(args: {
 
   const metalIds = metals.map((m) => m.id);
 
+  // ── 3. Variantes metálicas ────────────────────────────────────────────────
   const variants = await prisma.metalVariant.findMany({
     where: { metalId: { in: metalIds }, deletedAt: null, isActive: true },
     select: { id: true, metalId: true, name: true, sku: true, purity: true, saleFactor: true },
@@ -128,6 +137,7 @@ export async function getDashboardSummary(args: {
 
   const currencyIds = currencies.map((c) => c.id);
 
+  // ── 4. Series históricas FX + metales ─────────────────────────────────────
   const [currencyRates, metalRefHistory] = await Promise.all([
     prisma.currencyRate.findMany({
       where: {
@@ -148,6 +158,7 @@ export async function getDashboardSummary(args: {
     }),
   ]);
 
+  // ── 5. Actividad reciente ─────────────────────────────────────────────────
   const activity = await prisma.auditLog.findMany({
     where: { jewelryId: args.jewelryId },
     select: { id: true, action: true, success: true, createdAt: true, userId: true },
@@ -155,7 +166,151 @@ export async function getDashboardSummary(args: {
     take: 12,
   });
 
-  // Currency series (key = code)
+  // ── 6. Ventas + Inventario (todas las queries en paralelo) ─────────────────
+  const todayStart = startOfDay(now);
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+
+  const [
+    salesTodayAgg,
+    salesMonthAgg,
+    salesRangeRows,
+    saleLineRangeRows,
+    allArticleStocks,
+    articlesActiveCount,
+  ] = await Promise.all([
+    // Ventas hoy (aggregate)
+    prisma.sale.aggregate({
+      where: {
+        jewelryId: args.jewelryId,
+        status: { in: SALE_ACTIVE },
+        confirmedAt: { gte: todayStart },
+      },
+      _sum: { total: true },
+      _count: { _all: true },
+    }),
+    // Ventas este mes (aggregate)
+    prisma.sale.aggregate({
+      where: {
+        jewelryId: args.jewelryId,
+        status: { in: SALE_ACTIVE },
+        confirmedAt: { gte: monthStart },
+      },
+      _sum: { total: true },
+      _count: { _all: true },
+    }),
+    // Ventas en el rango (para serie diaria)
+    prisma.sale.findMany({
+      where: {
+        jewelryId: args.jewelryId,
+        status: { in: SALE_ACTIVE },
+        confirmedAt: { gte: from, lte: now },
+      },
+      select: { total: true, confirmedAt: true },
+      orderBy: { confirmedAt: "asc" },
+    }),
+    // Líneas de venta en el rango (para margen)
+    prisma.saleLine.findMany({
+      where: {
+        jewelryId: args.jewelryId,
+        sale: {
+          status: { in: SALE_ACTIVE },
+          confirmedAt: { gte: from, lte: now },
+        },
+      },
+      select: {
+        totalMargin: true,
+        lineTotal: true,
+        sale: { select: { confirmedAt: true } },
+      },
+    }),
+    // Stock agrupado por artículo
+    prisma.articleStock.groupBy({
+      by: ["articleId"],
+      where: { jewelryId: args.jewelryId },
+      _sum: { quantity: true },
+    }),
+    // Artículos activos con control de stock
+    prisma.article.count({
+      where: {
+        jewelryId: args.jewelryId,
+        deletedAt: null,
+        isActive: true,
+        stockMode: { not: "NO_STOCK" as any },
+      },
+    }),
+  ]);
+
+  // ── Calcular KPIs de ventas ────────────────────────────────────────────────
+  const todayRevenue = Number(salesTodayAgg._sum.total ?? 0);
+  const todayCount = salesTodayAgg._count._all;
+  const todayAvgTicket = todayCount > 0 ? r2(todayRevenue / todayCount) : 0;
+
+  const monthRevenue = Number(salesMonthAgg._sum.total ?? 0);
+  const monthCount = salesMonthAgg._count._all;
+  const monthAvgTicket = monthCount > 0 ? r2(monthRevenue / monthCount) : 0;
+
+  // Serie diaria de ventas
+  const salesByDay = new Map<string, number>();
+  let rangeRevenue = 0;
+  for (const s of salesRangeRows) {
+    if (s.confirmedAt) {
+      const k = dayKey(s.confirmedAt);
+      salesByDay.set(k, (salesByDay.get(k) ?? 0) + Number(s.total));
+    }
+    rangeRevenue += Number(s.total);
+  }
+
+  // Margen por día (solo líneas con costo cargado)
+  let totalMarginRange = 0;
+  let totalRevForMargin = 0;
+  let linesWithoutCost = 0;
+  const marginByDay = new Map<string, number>();
+
+  for (const line of saleLineRangeRows) {
+    if (line.totalMargin != null && line.sale?.confirmedAt) {
+      const k = dayKey(line.sale.confirmedAt);
+      const m = Number(line.totalMargin);
+      marginByDay.set(k, (marginByDay.get(k) ?? 0) + m);
+      totalMarginRange += m;
+      totalRevForMargin += Number(line.lineTotal);
+    } else {
+      linesWithoutCost++;
+    }
+  }
+
+  const hasMarginData =
+    saleLineRangeRows.length > 0 &&
+    saleLineRangeRows.some((l) => l.totalMargin != null);
+
+  const rangeMargin = hasMarginData ? r2(totalMarginRange) : null;
+  const rangeMarginPct =
+    hasMarginData && totalRevForMargin > 0
+      ? r2((totalMarginRange / totalRevForMargin) * 100)
+      : null;
+
+  // Serie diaria: revenue siempre presente (0 = sin ventas), margin null si no hay datos de costo
+  const salesSeries = axis.map((k) => ({
+    date: k,
+    revenue: salesByDay.get(k) ?? 0,
+    margin: hasMarginData ? (marginByDay.get(k) ?? null) : null,
+  }));
+
+  // ── Inventario ────────────────────────────────────────────────────────────
+  const outOfStockItems = allArticleStocks.filter(
+    (s) => Number(s._sum.quantity ?? 0) <= 0
+  );
+  const outOfStockCount = outOfStockItems.length;
+
+  const topIds = outOfStockItems.slice(0, 5).map((s) => s.articleId);
+  const topOutOfStock =
+    topIds.length > 0
+      ? await prisma.article.findMany({
+          where: { id: { in: topIds }, deletedAt: null },
+          select: { id: true, code: true, name: true },
+        })
+      : [];
+
+  // ── Armar series de valuación ─────────────────────────────────────────────
   const ratesByCurrency = new Map<string, Map<string, number>>();
   for (const c of currencies) ratesByCurrency.set(c.id, new Map());
 
@@ -175,7 +330,6 @@ export async function getDashboardSummary(args: {
     for (const [k, v] of perDay.entries()) map.set(k, v.v);
   }
 
-  // Metals series (key = name)
   const refsByMetal = new Map<string, Map<string, number>>();
   for (const m of metals) refsByMetal.set(m.id, new Map());
 
@@ -207,9 +361,8 @@ export async function getDashboardSummary(args: {
   const metalsSeries = axis.map((k) => {
     const row: Record<string, any> = { date: k };
     for (const m of metals) {
-      const key = m.name;
       const v = refsByMetal.get(m.id)?.get(k);
-      if (v != null) row[key] = v;
+      if (v != null) row[m.name] = v;
     }
     return row;
   });
@@ -246,30 +399,53 @@ export async function getDashboardSummary(args: {
     })),
     series: { fx: fxSeries, metals: metalsSeries },
     activity,
+    // ── Nuevo ──────────────────────────────────────────────────────────────
+    salesKpis: {
+      today: {
+        revenue: r2(todayRevenue),
+        ticketCount: todayCount,
+        avgTicket: todayAvgTicket,
+      },
+      month: {
+        revenue: r2(monthRevenue),
+        ticketCount: monthCount,
+        avgTicket: monthAvgTicket,
+      },
+      range: {
+        revenue: r2(rangeRevenue),
+        ticketCount: salesRangeRows.length,
+        margin: rangeMargin,
+        marginPercent: rangeMarginPct,
+        linesWithoutCost,
+      },
+    },
+    salesSeries,
+    inventory: {
+      articlesActive: articlesActiveCount,
+      stockTrackedCount: allArticleStocks.length,
+      outOfStockCount,
+      topOutOfStock,
+    },
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PROFIT SUMMARY
+// PROFIT SUMMARY (sin cambios)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type ProfitGroupBy = "day" | "week" | "month";
 
 function bucketKey(date: Date, groupBy: ProfitGroupBy): string {
   const d = new Date(date);
-  if (groupBy === "month") return d.toISOString().slice(0, 7); // YYYY-MM
+  if (groupBy === "month") return d.toISOString().slice(0, 7);
   if (groupBy === "week") {
     d.setHours(0, 0, 0, 0);
     const dow = d.getDay();
-    const diff = dow === 0 ? -6 : 1 - dow; // shift to Monday
+    const diff = dow === 0 ? -6 : 1 - dow;
     d.setDate(d.getDate() + diff);
     return d.toISOString().slice(0, 10);
   }
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
-function r2(n: number) {
-  return Math.round(n * 100) / 100;
+  return d.toISOString().slice(0, 10);
 }
 
 export async function getProfitSummary(args: {
@@ -280,12 +456,11 @@ export async function getProfitSummary(args: {
 }) {
   const { jewelryId, from, to, groupBy } = args;
 
-  // Only confirmed sales with frozen cost snapshots
   const lines = await prisma.saleLine.findMany({
     where: {
       jewelryId,
       sale: {
-        status: { in: ["CONFIRMED", "PAID", "PARTIALLY_PAID"] as any[] },
+        status: { in: SALE_ACTIVE },
         confirmedAt: { gte: from, lte: to },
       },
     },
@@ -303,23 +478,23 @@ export async function getProfitSummary(args: {
   });
 
   let revenue = 0;
-  let cost    = 0;
-  let margin  = 0;
-  let linesWithCost     = 0;
-  let linesWithoutCost  = 0;
+  let cost = 0;
+  let margin = 0;
+  let linesWithCost = 0;
+  let linesWithoutCost = 0;
   let linesNegativeMargin = 0;
   const negSaleIds = new Set<string>();
 
   const seriesMap = new Map<string, { revenue: number; cost: number; margin: number }>();
-  const artMap    = new Map<string, {
+  const artMap = new Map<string, {
     articleId: string; articleName: string;
     revenue: number; cost: number; margin: number; quantity: number;
   }>();
 
   for (const line of lines) {
     const rev = Number(line.lineTotal);
-    const c   = line.totalCost   != null ? Number(line.totalCost)   : null;
-    const m   = line.totalMargin != null ? Number(line.totalMargin) : null;
+    const c = line.totalCost != null ? Number(line.totalCost) : null;
+    const m = line.totalMargin != null ? Number(line.totalMargin) : null;
     const qty = Number(line.quantity);
 
     revenue += rev;
@@ -329,24 +504,22 @@ export async function getProfitSummary(args: {
       if (m < 0) { linesNegativeMargin++; if (line.sale?.id) negSaleIds.add(line.sale.id); }
     }
 
-    // Time series bucket
     const confirmedAt = line.sale?.confirmedAt;
     if (confirmedAt) {
       const key = bucketKey(confirmedAt, groupBy);
-      const b   = seriesMap.get(key) ?? { revenue: 0, cost: 0, margin: 0 };
+      const b = seriesMap.get(key) ?? { revenue: 0, cost: 0, margin: 0 };
       b.revenue += rev;
       if (c != null) b.cost += c;
       if (m != null) b.margin += m;
       seriesMap.set(key, b);
     }
 
-    // Top articles aggregation
     const a = artMap.get(line.articleId) ?? {
       articleId: line.articleId, articleName: line.articleName,
       revenue: 0, cost: 0, margin: 0, quantity: 0,
     };
-    a.revenue  += rev;
-    if (c != null) a.cost   += c;
+    a.revenue += rev;
+    if (c != null) a.cost += c;
     if (m != null) a.margin += m;
     a.quantity += qty;
     artMap.set(line.articleId, a);
@@ -359,19 +532,19 @@ export async function getProfitSummary(args: {
     .map(([date, v]) => ({
       date,
       revenue: r2(v.revenue),
-      cost:    r2(v.cost),
-      margin:  r2(v.margin),
+      cost: r2(v.cost),
+      margin: r2(v.margin),
     }));
 
   const topArticles = Array.from(artMap.values())
     .map((a) => ({
-      articleId:     a.articleId,
-      articleName:   a.articleName,
-      revenue:       r2(a.revenue),
-      cost:          r2(a.cost),
-      margin:        r2(a.margin),
+      articleId: a.articleId,
+      articleName: a.articleName,
+      revenue: r2(a.revenue),
+      cost: r2(a.cost),
+      margin: r2(a.margin),
       marginPercent: a.revenue > 0 ? r2((a.margin / a.revenue) * 100) : 0,
-      quantity:      Number(Number(a.quantity).toFixed(4)),
+      quantity: Number(Number(a.quantity).toFixed(4)),
     }))
     .sort((a, b) => b.margin - a.margin)
     .slice(0, 20);
@@ -379,11 +552,11 @@ export async function getProfitSummary(args: {
   return {
     period: { from: from.toISOString(), to: to.toISOString(), groupBy },
     totals: {
-      revenue:       r2(revenue),
-      cost:          r2(cost),
-      margin:        r2(margin),
+      revenue: r2(revenue),
+      cost: r2(cost),
+      margin: r2(margin),
       marginPercent: r2(marginPct),
-      linesCount:    lines.length,
+      linesCount: lines.length,
       linesWithCost,
       linesWithoutCost,
       linesNegativeMargin,
@@ -394,5 +567,5 @@ export async function getProfitSummary(args: {
   };
 }
 
-// Suppress unused import warning — Prisma is imported for future Decimal use
+// Suppress unused import warning
 void Prisma;

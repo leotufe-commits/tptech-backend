@@ -6,9 +6,11 @@
 
 import { describe, it, expect } from "vitest";
 import { aggregateEntityBalance } from "../../commercial-entities/balance.utils.js";
-import { buildBalanceBreakdownFromPrice } from "../../../lib/pricing-engine/pricing-engine.balance.js";
-import type { PriceBreakdown } from "../../../lib/pricing-engine/pricing-engine.types.js";
-import type { BalanceBreakdown } from "../../../lib/pricing-engine/pricing-engine.balance.js";
+import {
+  buildBalanceBreakdownFromPrice,
+  type PriceBreakdown,
+  type BalanceBreakdown,
+} from "../../../lib/pricing-engine/pricing-engine.js";
 
 // ---------------------------------------------------------------------------
 // Helpers

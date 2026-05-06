@@ -1,9 +1,33 @@
 import { Prisma, BarcodeSource } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
-import { resolvePriceList, applyPriceList, type CostBreakdown } from "../../lib/pricing.utils.js";
-// computeCostPrice: importado para uso interno y re-exportado para compatibilidad
-import { computeCostPrice } from "../../lib/article-cost.utils.js";
-export { computeCostPrice };
+import {
+  findStock as engineFindStock,
+  applyStockDelta as engineApplyStockDelta,
+  recalcArticleStock,
+} from "../../lib/stock-engine.js";
+import {
+  resolvePriceList,
+  applyPriceList,
+  PL_COMPUTE_SELECT,
+  buildBatchCostContext,
+  calculateCostFromLines,
+  isPriceListValidNow,
+  isPromotionValid,
+  applyTaxesFromMap,
+  computePurchaseTaxes as enginePurchaseTaxes,
+  type CostBreakdown,
+  type ArticleCostInput,
+  type PurchaseTaxResult,
+  type PurchaseTaxBreakdownItem,
+} from "../../lib/pricing-engine/pricing-engine.js";
+import type { CostLineInput as EngineCostLineInput } from "../../lib/pricing-engine/pricing-engine.js";
+import {
+  normalizeComboFields,
+  validateComboComponentsShape,
+  validateComboComponentsAgainstDb,
+  computeComboAvailability,
+} from "../../lib/combo.utils.js";
+import { assignGroupToArticle } from "../article-groups/article-groups.service.js";
 
 function s(v: any): string { return String(v ?? "").trim(); }
 function assert(cond: any, msg: string, status = 400): void {
@@ -16,10 +40,8 @@ function assert(cond: any, msg: string, status = 400): void {
 const VALID_ARTICLE_TYPES  = new Set(["PRODUCT", "SERVICE", "MATERIAL"]);
 const VALID_STATUS         = new Set(["DRAFT", "ACTIVE", "DISCONTINUED", "ARCHIVED"]);
 const VALID_STOCK_MODE     = new Set(["NO_STOCK", "BY_ARTICLE", "BY_MATERIAL"]);
-const VALID_HECHURA_MODE   = new Set(["FIXED", "PER_GRAM"]);
 const VALID_BARCODE_TYPES   = new Set(["CODE128", "EAN13", "QR"]);
 const VALID_BARCODE_SOURCES = new Set(["CODE", "SKU", "CUSTOM"]);
-const VALID_COST_MODES     = new Set(["MANUAL", "METAL_MERMA_HECHURA", "MULTIPLIER"]);
 
 // ===========================================================================
 // Reglas de negocio: articleType ↔ stockMode
@@ -40,47 +62,96 @@ function validateTypeStockMode(articleType: string, stockMode: string): void {
 }
 
 // ===========================================================================
-// Validación: costCalculationMode + campos requeridos según modo
+// Validaciones defensivas de contratos con el pricing-engine
+//
+// El motor de precios (src/lib/pricing-engine) asume ciertas invariantes:
+//   1. Las variantes heredan precio y costo del artículo padre. El único
+//      override soportado es `weightOverride`.
+//   2. Los servicios (articleType=SERVICE) no tienen composición metálica,
+//      merma ni hechura; su costo se modela como línea SERVICE o MANUAL.
+//
+// Estas funciones rechazan payloads que violan el contrato para que el motor
+// nunca tenga que lidiar con datos inconsistentes.
 // ===========================================================================
-function validateCostMode(data: {
-  costCalculationMode?: string;
-  costPrice?: any;
-  multiplierBase?: string;
-  multiplierValue?: any;
-  multiplierQuantity?: any;
-}): void {
-  const mode = data.costCalculationMode;
-  if (!mode) return; // sin modo en el payload → sin validación (update parcial)
 
-  if (mode === "MANUAL") {
-    // costPrice puede ser null (sin costo definido) — no obligatorio
-    return;
-  }
+/**
+ * Campos de precio/costo que NO pueden guardarse en una variante.
+ * El motor siempre lee estos valores del artículo padre.
+ */
+const FORBIDDEN_VARIANT_PRICING_FIELDS = [
+  "salePrice",
+  "costPrice",
+  "priceWithTax",
+  "costWithTax",
+  "costPerGram",
+  "useManualSalePrice",
+  "manualSalePrice",
+  "mermaPercent",
+  "manualAdjustmentKind",
+  "manualAdjustmentType",
+  "manualAdjustmentValue",
+  "manualTaxIds",
+  "marginPercent",
+  "commercialMode",
+  "comboAdjustmentKind",
+  "comboAdjustmentValue",
+] as const;
 
-  if (mode === "METAL_MERMA_HECHURA") {
-    // La composición metálica se gestiona por separado (POST /compositions).
-    // No validamos aquí si existen composiciones porque pueden agregarse después.
-    return;
-  }
-
-  if (mode === "MULTIPLIER") {
-    assert(
-      (data.multiplierBase ?? "").trim() !== "",
-      "Para modo MULTIPLIER, la base del multiplicador es obligatoria."
-    );
-    assert(
-      data.multiplierValue != null && Number(data.multiplierValue) > 0,
-      "Para modo MULTIPLIER, multiplierValue es obligatorio y debe ser mayor que cero."
-    );
-    // multiplierQuantity puede ser null (calculada al momento del uso)
-    return;
-  }
+function assertNoVariantPricingOverrides(data: any): void {
+  if (!data || typeof data !== "object") return;
+  const offending = FORBIDDEN_VARIANT_PRICING_FIELDS.filter((k) => data[k] !== undefined);
+  assert(
+    offending.length === 0,
+    `Las variantes heredan precio y costo del artículo padre. Campos no permitidos en variante: ${offending.join(", ")}. Solo weightOverride está permitido como override.`,
+  );
 }
 
-// ===========================================================================
-// Cálculo de costo computado (runtime, no persistido)
-// Implementación en src/lib/article-cost.utils.ts — re-exportado arriba.
-// ===========================================================================
+/**
+ * Servicios no manejan stock físico ni composición metálica.
+ *
+ * Reglas vigentes (TPTech):
+ *  - HECHURA, SERVICE, MANUAL → permitidos (un servicio puede tener costo de
+ *    mano de obra, sub-servicios y ajustes manuales).
+ *  - PRODUCT → permitido SOLO con `affectsStock=false` (no se puede descontar
+ *    stock físico desde un servicio).
+ *  - METAL → bloqueado (los servicios no se valúan por gramaje).
+ *  - `metalVariantId` en cualquier línea → bloqueado.
+ *  - `mermaPercent` distinto de 0/null → bloqueado.
+ *
+ * Se invoca desde createArticle, updateArticle y setCostLines.
+ */
+function assertServiceArticleComposition(
+  articleType: string,
+  data: { mermaPercent?: any } | null,
+  costLines?: Array<{ type?: string; metalVariantId?: string | null; affectsStock?: boolean }> | null,
+): void {
+  if (articleType !== "SERVICE") return;
+
+  if (data && data.mermaPercent !== undefined && data.mermaPercent !== null) {
+    const m = Number(data.mermaPercent);
+    assert(
+      Number.isFinite(m) && m === 0,
+      "Los servicios no pueden tener merma. Dejá mermaPercent vacío o en 0.",
+    );
+  }
+
+  if (costLines && costLines.length > 0) {
+    for (const l of costLines) {
+      assert(
+        l.type !== "METAL",
+        "Los servicios no pueden tener líneas de tipo METAL en su composición de costo.",
+      );
+      assert(
+        !l.metalVariantId,
+        "Los servicios no pueden referenciar un metalVariantId en sus líneas de costo.",
+      );
+      assert(
+        !(l.type === "PRODUCT" && l.affectsStock === true),
+        "Los servicios no pueden descontar stock de componentes. Desmarcá \"Descuenta stock\" en las líneas PRODUCT.",
+      );
+    }
+  }
+}
 
 // ===========================================================================
 // Barcode helpers
@@ -217,7 +288,7 @@ async function resolveBarcode(opts: {
   excludeArticleId?: string;
   excludeVariantId?: string;
 }): Promise<{ barcode: string | null; barcodeSource: BarcodeSource }> {
-  const barcodeSource = (VALID_BARCODE_SOURCES.has(opts.source) ? opts.source : "CUSTOM") as BarcodeSource;
+  const barcodeSource = (VALID_BARCODE_SOURCES.has(opts.source) ? opts.source : "SKU") as BarcodeSource;
   const barcodeType   = VALID_BARCODE_TYPES.has(opts.barcodeType ?? "") ? opts.barcodeType! : "CODE128";
   let barcode: string | null = null;
 
@@ -275,30 +346,25 @@ const ARTICLE_LIST_SELECT = {
   articleType: true,
   status: true,
   stockMode: true,
+  commercialMode: true,
+  comboAdjustmentKind: true,
+  comboAdjustmentValue: true,
   sku: true,
   barcode: true,
   barcodeType: true,
   barcodeSource: true,
   brand: true,
   manufacturer: true,
-  costPrice: true,
   salePrice: true,
-  hechuraPrice: true,
-  hechuraPriceMode: true,
   mermaPercent: true,
-  costCalculationMode: true,
-  multiplierBase: true,
-  multiplierValue: true,
-  multiplierQuantity: true,
-  multiplierCurrencyId: true,
-  manualBaseCost: true,
-  manualCurrencyId: true,
   manualAdjustmentKind: true,
   manualAdjustmentType: true,
   manualAdjustmentValue: true,
   manualTaxIds: true,
   sellWithoutVariants: true,
   showInStore: true,
+  isReturnable: true,
+  notes: true,
   unitOfMeasure: true,
   reorderPoint: true,
   dimensionLength: true,
@@ -317,24 +383,24 @@ const ARTICLE_LIST_SELECT = {
   useManualSalePrice: true,
   createdAt: true,
   updatedAt: true,
-  groupId: true,
-  groupOrder: true,
   category:          { select: { id: true, name: true, mermaPercent: true } },
   preferredSupplier: { select: { id: true, code: true, displayName: true } },
-  group:             { select: { id: true, name: true, slug: true } },
+  groupItems:        { where: { itemType: "ARTICLE" }, take: 1, select: { groupId: true, groupOrder: true, group: { select: { id: true, name: true, slug: true } } } },
   costComposition: {
     select: {
-      type:           true,
-      label:          true,
-      quantity:       true,
-      unitValue:      true,
-      currencyId:     true,
-      mermaPercent:   true,
-      metalVariantId: true,
-      sortOrder:      true,
-      lineAdjKind:    true,
-      lineAdjType:    true,
-      lineAdjValue:   true,
+      type:             true,
+      label:            true,
+      quantity:         true,
+      unitValue:        true,
+      currencyId:       true,
+      mermaPercent:     true,
+      metalVariantId:   true,
+      catalogItemId:    true,
+      catalogVariantId: true,
+      sortOrder:        true,
+      lineAdjKind:      true,
+      lineAdjType:      true,
+      lineAdjValue:     true,
       currency: {
         select: { id: true, code: true, symbol: true },
       },
@@ -344,11 +410,14 @@ const ARTICLE_LIST_SELECT = {
           metal: { select: { id: true, name: true } },
         },
       },
+      // catalogItem: relación a Article (producto/servicio referenciado en la composición).
+      catalogItem: { select: { id: true, code: true, name: true, sku: true } },
+      // FASE 2: variante específica del componente (cuando aplica).
+      catalogVariant: {
+        select: { id: true, code: true, name: true, sku: true, weightOverride: true },
+      },
     },
     orderBy: { sortOrder: "asc" as const },
-  },
-  compositions: {
-    select: { variantId: true, grams: true, isBase: true },
   },
   variants: {
     where: { deletedAt: null },
@@ -363,9 +432,34 @@ const ARTICLE_LIST_SELECT = {
       imageUrl: true,
       isActive: true,
       sortOrder: true,
-      priceOverride: true,
-      costPrice: true,
       reorderPoint: true,
+      openingStock: true,
+      minSaleQuantity: true,
+      maxSaleQuantity: true,
+      defaultQuantity: true,
+      weightOverride: true,
+      notes: true,
+      attributeValues: {
+        select: {
+          id: true,
+          assignmentId: true,
+          value: true,
+          assignment: {
+            select: {
+              id: true,
+              isRequired: true,
+              sortOrder: true,
+              isVariantAxis: true,
+              definition: {
+                select: {
+                  id: true, name: true, code: true, inputType: true,
+                  options: { select: { id: true, label: true, value: true } },
+                },
+              },
+            },
+          },
+        },
+      },
     },
     orderBy: { sortOrder: "asc" as const },
   },
@@ -381,6 +475,9 @@ const ARTICLE_DETAIL_SELECT = {
   articleType: true,
   status: true,
   stockMode: true,
+  commercialMode: true,
+  comboAdjustmentKind: true,
+  comboAdjustmentValue: true,
   sku: true,
   barcode: true,
   barcodeType: true,
@@ -389,19 +486,9 @@ const ARTICLE_DETAIL_SELECT = {
   manufacturer: true,
   supplierCode: true,
   preferredSupplierId: true,
-  costPrice: true,
   salePrice: true,
   useManualSalePrice: true,
-  hechuraPrice: true,
-  hechuraPriceMode: true,
   mermaPercent: true,
-  costCalculationMode: true,
-  multiplierBase: true,
-  multiplierValue: true,
-  multiplierQuantity: true,
-  multiplierCurrencyId: true,
-  manualBaseCost: true,
-  manualCurrencyId: true,
   manualAdjustmentKind: true,
   manualAdjustmentType: true,
   manualAdjustmentValue: true,
@@ -427,27 +514,9 @@ const ARTICLE_DETAIL_SELECT = {
   notes: true,
   createdAt: true,
   updatedAt: true,
-  groupId: true,
-  groupOrder: true,
   category:          { select: { id: true, name: true, mermaPercent: true } },
   preferredSupplier: { select: { id: true, code: true, displayName: true } },
-  group:             { select: { id: true, name: true, slug: true } },
-  compositions: {
-    select: {
-      id: true,
-      variantId: true,
-      grams: true,
-      isBase: true,
-      sortOrder: true,
-      metalVariant: {
-        select: {
-          id: true, name: true, sku: true, purity: true,
-          metal: { select: { id: true, name: true } },
-        },
-      },
-    },
-    orderBy: [{ sortOrder: "asc" as const }, { createdAt: "asc" as const }],
-  },
+  groupItems:        { where: { itemType: "ARTICLE" }, take: 1, select: { groupId: true, groupOrder: true, group: { select: { id: true, name: true, slug: true } } } },
   variants: {
     where: { deletedAt: null },
     select: {
@@ -459,9 +528,6 @@ const ARTICLE_DETAIL_SELECT = {
       barcodeType: true,
       barcodeSource: true,
       weightOverride: true,
-      hechuraPriceOverride: true,
-      priceOverride: true,
-      costPrice: true,
       reorderPoint: true,
       openingStock: true,
       imageUrl: true,
@@ -527,6 +593,7 @@ const ARTICLE_DETAIL_SELECT = {
       metalVariantId: true,
       mermaPercent: true,
       catalogItemId: true,
+      catalogVariantId: true,
       sortOrder: true,
       lineAdjKind:  true,
       lineAdjType:  true,
@@ -538,7 +605,10 @@ const ARTICLE_DETAIL_SELECT = {
           metal: { select: { id: true, name: true } },
         },
       },
-      catalogItem: { select: { id: true, name: true, salePrice: true } },
+      catalogItem: { select: { id: true, code: true, name: true, sku: true } },
+      catalogVariant: {
+        select: { id: true, code: true, name: true, sku: true, weightOverride: true },
+      },
     },
     orderBy: [{ sortOrder: "asc" as const }, { createdAt: "asc" as const }],
   },
@@ -555,11 +625,11 @@ const VARIANT_SELECT = {
   barcodeType: true,
   barcodeSource: true,
   weightOverride: true,
-  hechuraPriceOverride: true,
-  priceOverride: true,
-  costPrice: true,
   reorderPoint: true,
   openingStock: true,
+  minSaleQuantity: true,
+  maxSaleQuantity: true,
+  defaultQuantity: true,
   imageUrl: true,
   notes: true,
   isActive: true,
@@ -641,150 +711,6 @@ async function getStockSummary(articleId: string, jewelryId: string) {
 // Batch cost computation for list
 // ===========================================================================
 
-/**
- * Aplica bonus/recargo sobre una base. Idéntico a applyAdjustment() en article-cost.utils.ts.
- * Duplicado local para evitar coupling con el módulo lib; mantener en sincronía si cambia la lógica.
- */
-function applyAdj(
-  base:     Prisma.Decimal,
-  kind?:    string | null,
-  adjType?: string | null,
-  adjRaw?:  any,
-): Prisma.Decimal {
-  if (!kind || kind === "" || adjRaw == null) return base;
-  const absVal    = new Prisma.Decimal(Math.abs(Number(adjRaw)).toString());
-  const adjAmount = adjType === "PERCENTAGE" ? base.mul(absVal.div(100)) : absVal;
-  return kind === "SURCHARGE" ? base.add(adjAmount) : base.sub(adjAmount);
-}
-
-function computeArticleCostBase(
-  row: any,
-  baseCurrencyId: string,
-  rateMap: Map<string, Prisma.Decimal>,
-  metalQuoteMap: Map<string, Prisma.Decimal>,
-  defaultMermaPercent: any,
-): Prisma.Decimal | null {
-  const lines: any[] = row.costComposition ?? [];
-
-  // COST_LINES takes priority — aplica ajuste sobre la suma total de líneas
-  if (lines.length > 0) {
-    let total = new Prisma.Decimal(0);
-    for (const line of lines) {
-      const qty = new Prisma.Decimal(line.quantity?.toString() ?? "0");
-      if (line.type === "METAL") {
-        if (!line.metalVariantId) return null;
-        const quote = metalQuoteMap.get(line.metalVariantId);
-        if (!quote) return null;
-        const mermaFactor = new Prisma.Decimal(1).add(
-          new Prisma.Decimal(line.mermaPercent?.toString() ?? "0").div(100)
-        );
-        let lineCost = qty.mul(mermaFactor).mul(quote);
-        lineCost = applyAdj(lineCost, line.lineAdjKind, line.lineAdjType, line.lineAdjValue);
-        if (lineCost.lt(new Prisma.Decimal(0))) lineCost = new Prisma.Decimal(0);
-        total = total.add(lineCost);
-      } else {
-        const unitVal = new Prisma.Decimal(line.unitValue?.toString() ?? "0");
-        let lineValue = qty.mul(unitVal);
-        if (line.currencyId && line.currencyId !== baseCurrencyId) {
-          const rate = rateMap.get(line.currencyId);
-          if (!rate) return null;
-          lineValue = lineValue.mul(rate);
-        }
-        lineValue = applyAdj(lineValue, line.lineAdjKind, line.lineAdjType, line.lineAdjValue);
-        if (lineValue.lt(new Prisma.Decimal(0))) lineValue = new Prisma.Decimal(0);
-        total = total.add(lineValue);
-      }
-    }
-    return applyAdj(total, row.manualAdjustmentKind, row.manualAdjustmentType, row.manualAdjustmentValue);
-  }
-
-  const mode: string = row.costCalculationMode ?? "MANUAL";
-
-  if (mode === "MANUAL") {
-    if (row.manualBaseCost != null) {
-      // Nuevo flujo: manualBaseCost + ajuste global (igual que modoManual en pricing-engine.cost.ts)
-      let val = new Prisma.Decimal(row.manualBaseCost.toString());
-      if (row.manualCurrencyId && row.manualCurrencyId !== baseCurrencyId) {
-        const rate = rateMap.get(row.manualCurrencyId);
-        if (!rate) return null;
-        val = val.mul(rate);
-      }
-      return applyAdj(val, row.manualAdjustmentKind, row.manualAdjustmentType, row.manualAdjustmentValue);
-    }
-    // Fallback legacy: costPrice ya fue persistido como valor ajustado (draftToPayload).
-    if (row.costPrice == null) return null;
-    let val = new Prisma.Decimal(row.costPrice.toString());
-    if (row.manualCurrencyId && row.manualCurrencyId !== baseCurrencyId) {
-      const rate = rateMap.get(row.manualCurrencyId);
-      if (!rate) return null;
-      val = val.mul(rate);
-    }
-    return val;
-  }
-
-  if (mode === "MULTIPLIER") {
-    if (row.multiplierValue == null || row.multiplierQuantity == null) return null;
-    let val = new Prisma.Decimal(row.multiplierQuantity.toString())
-      .mul(new Prisma.Decimal(row.multiplierValue.toString()));
-    if (row.multiplierCurrencyId && row.multiplierCurrencyId !== baseCurrencyId) {
-      const rate = rateMap.get(row.multiplierCurrencyId);
-      if (!rate) return null;
-      val = val.mul(rate);
-    }
-    return applyAdj(val, row.manualAdjustmentKind, row.manualAdjustmentType, row.manualAdjustmentValue);
-  }
-
-  if (mode === "METAL_MERMA_HECHURA") {
-    const comps: any[] = row.compositions ?? [];
-    if (comps.length === 0) return null;
-    const rawMerma = row.mermaPercent ?? row.category?.mermaPercent ?? defaultMermaPercent ?? 0;
-    const mermaFactor = new Prisma.Decimal(1).add(
-      new Prisma.Decimal(rawMerma.toString()).div(100)
-    );
-    let metalCost = new Prisma.Decimal(0);
-    let totalGrams = new Prisma.Decimal(0);
-    for (const comp of comps) {
-      const quote = metalQuoteMap.get(comp.variantId);
-      if (!quote) return null;
-      const grams = new Prisma.Decimal(comp.grams.toString());
-      metalCost = metalCost.add(grams.mul(mermaFactor).mul(quote));
-      totalGrams = totalGrams.add(grams);
-    }
-    let hechura = new Prisma.Decimal(0);
-    if (row.hechuraPrice != null) {
-      const hp = new Prisma.Decimal(row.hechuraPrice.toString());
-      hechura = row.hechuraPriceMode === "PER_GRAM" ? hp.mul(totalGrams) : hp;
-    }
-    return applyAdj(
-      metalCost.add(hechura),
-      row.manualAdjustmentKind,
-      row.manualAdjustmentType,
-      row.manualAdjustmentValue,
-    );
-  }
-
-  return null;
-}
-
-function applyTaxes(
-  costBase: Prisma.Decimal,
-  taxIds: string[],
-  taxMap: Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>,
-): Prisma.Decimal {
-  let total = costBase;
-  for (const tid of taxIds) {
-    const tax = taxMap.get(tid);
-    if (!tax) continue;
-    if (tax.calculationType === "PERCENTAGE") {
-      total = total.add(costBase.mul(tax.rate.div(100)));
-    } else if (tax.calculationType === "FIXED_AMOUNT") {
-      total = total.add(tax.fixedAmount);
-    } else if (tax.calculationType === "PERCENTAGE_PLUS_FIXED") {
-      total = total.add(costBase.mul(tax.rate.div(100))).add(tax.fixedAmount);
-    }
-  }
-  return total;
-}
 
 // ===========================================================================
 // Batch stock summary — una sola query para todos los artículos BY_ARTICLE
@@ -814,6 +740,103 @@ async function batchLoadStockSummary(
 }
 
 // ===========================================================================
+// enrichArticles — resolución de precio y stock para otros módulos
+// Reúsa batchComputeCosts + batchResolveSalePricesNoClient + batchLoadStockSummary
+// sin duplicar lógica. Usado por article-groups.service.
+// ===========================================================================
+export async function enrichArticles(
+  ids: string[],
+  jewelryId: string,
+): Promise<Map<string, { resolvedSalePrice: string | null; resolvedSalePriceWithTax: string | null; stockTotal: number }>> {
+  const out = new Map<string, { resolvedSalePrice: string | null; resolvedSalePriceWithTax: string | null; stockTotal: number }>();
+  if (ids.length === 0) return out;
+
+  const rows = await prisma.article.findMany({
+    where: { id: { in: ids }, jewelryId, deletedAt: null },
+    select: ARTICLE_LIST_SELECT,
+  });
+
+  const computedCosts = await batchComputeCosts(jewelryId, rows as any[]);
+  const rowsWithCost  = rows.map((r) => ({
+    ...r,
+    computedCostBase:    computedCosts.get(r.id)?.computedCostBase    ?? null,
+    computedCostWithTax: computedCosts.get(r.id)?.computedCostWithTax ?? null,
+  }));
+
+  const resolvedPrices = await batchResolveSalePricesNoClient(jewelryId, rowsWithCost);
+
+  const byArticleIds = rows.filter((r) => r.stockMode === "BY_ARTICLE").map((r) => r.id);
+  const stockMap     = await batchLoadStockSummary(jewelryId, byArticleIds);
+
+  for (const row of rows) {
+    const stockEntry = row.stockMode === "BY_ARTICLE" ? stockMap.get(row.id) : null;
+    const p = resolvedPrices.get(row.id);
+    out.set(row.id, {
+      resolvedSalePrice:        p?.resolvedSalePrice        ?? null,
+      resolvedSalePriceWithTax: p?.resolvedSalePriceWithTax ?? null,
+      stockTotal:               stockEntry?.total ?? 0,
+    });
+  }
+  return out;
+}
+
+// ===========================================================================
+// enrichVariants — precio (del padre) y stock (de la variante) para grupos
+// ===========================================================================
+export async function enrichVariants(
+  variantIds: string[],
+  jewelryId: string,
+): Promise<Map<string, { resolvedSalePrice: string | null; resolvedSalePriceWithTax: string | null; stockTotal: number }>> {
+  const out = new Map<string, { resolvedSalePrice: string | null; resolvedSalePriceWithTax: string | null; stockTotal: number }>();
+  if (variantIds.length === 0) return out;
+
+  // Obtener artículo padre de cada variante
+  const variants = await prisma.articleVariant.findMany({
+    where: { id: { in: variantIds }, jewelryId },
+    select: { id: true, articleId: true },
+  });
+  const articleIds = [...new Set(variants.map((v) => v.articleId))];
+
+  // Precio: resuelto a nivel de artículo padre
+  const articles = await prisma.article.findMany({
+    where: { id: { in: articleIds }, jewelryId, deletedAt: null },
+    select: ARTICLE_LIST_SELECT,
+  });
+  const computedCosts = await batchComputeCosts(jewelryId, articles as any[]);
+  const rowsWithCost  = articles.map((r) => ({
+    ...r,
+    computedCostBase:    computedCosts.get(r.id)?.computedCostBase    ?? null,
+    computedCostWithTax: computedCosts.get(r.id)?.computedCostWithTax ?? null,
+  }));
+  const resolvedPrices = await batchResolveSalePricesNoClient(jewelryId, rowsWithCost);
+
+  // Stock: por variante (suma de todos los depósitos)
+  const stocks = await prisma.articleStock.findMany({
+    where: { jewelryId, variantId: { in: variantIds } },
+    select: { variantId: true, quantity: true },
+  });
+  const stockByVariant = new Map<string, number>();
+  for (const s of stocks) {
+    if (s.variantId) {
+      const qty = parseFloat(s.quantity.toString());
+      stockByVariant.set(s.variantId, (stockByVariant.get(s.variantId) ?? 0) + qty);
+    }
+  }
+
+  // Combinar por variantId
+  const articlePriceMap = new Map(articles.map((a) => [a.id, resolvedPrices.get(a.id)]));
+  for (const v of variants) {
+    const priceInfo = articlePriceMap.get(v.articleId);
+    out.set(v.id, {
+      resolvedSalePrice:        priceInfo?.resolvedSalePrice        ?? null,
+      resolvedSalePriceWithTax: priceInfo?.resolvedSalePriceWithTax ?? null,
+      stockTotal:               stockByVariant.get(v.id) ?? 0,
+    });
+  }
+  return out;
+}
+
+// ===========================================================================
 // Batch resolve sale price — sin contexto de cliente
 // 3 queries paralelas al inicio, resto en memoria.
 // ===========================================================================
@@ -824,33 +847,9 @@ type NoClientPriceResult = {
   resolvedPriceName:   string | null;
 };
 
-// Select mínimo para listas de precio (replica local de PL_COMPUTE_SELECT de pricing.utils.ts)
-const PL_LIST_SELECT = {
-  id: true, name: true, mode: true,
-  marginTotal: true, marginMetal: true, marginHechura: true,
-  costPerGram: true, surcharge: true, minimumPrice: true,
-  roundingTarget: true, roundingMode: true, roundingDirection: true,
-  validFrom: true, validTo: true, isActive: true,
-} as const;
+// Select canónico de listas de precio — importado del motor de pricing
+const PL_LIST_SELECT = PL_COMPUTE_SELECT;
 
-function _isPLValidNow(pl: { isActive: boolean; validFrom: Date | null; validTo: Date | null }): boolean {
-  if (!pl.isActive) return false;
-  const now = new Date();
-  if (pl.validFrom && pl.validFrom > now) return false;
-  if (pl.validTo   && pl.validTo   < now) return false;
-  return true;
-}
-
-function _isPromoValid(p: {
-  isActive: boolean; deletedAt: Date | null;
-  validFrom: Date | null; validTo: Date | null;
-}): boolean {
-  if (!p.isActive || p.deletedAt) return false;
-  const now = new Date();
-  if (p.validFrom && p.validFrom > now) return false;
-  if (p.validTo   && p.validTo   < now) return false;
-  return true;
-}
 
 async function batchResolveSalePricesNoClient(
   jewelryId: string,
@@ -901,7 +900,7 @@ async function batchResolveSalePricesNoClient(
     }),
     saleTaxIds.size > 0
       ? prisma.tax.findMany({
-          where: { id: { in: Array.from(saleTaxIds) }, deletedAt: null, appliesOnSale: true },
+          where: { jewelryId, id: { in: Array.from(saleTaxIds) }, deletedAt: null, appliesOnSale: true },
           select: { id: true, rate: true, fixedAmount: true, calculationType: true },
         })
       : Promise.resolve([]),
@@ -911,10 +910,10 @@ async function batchResolveSalePricesNoClient(
   const catPLMap = new Map<string, any>();
   for (const cat of categories) {
     const pl = (cat as any).defaultPriceList;
-    if (pl && _isPLValidNow(pl)) catPLMap.set(cat.id, pl);
+    if (pl && isPriceListValidNow(pl)) catPLMap.set(cat.id, pl);
   }
 
-  const validGeneralPL = generalPL && _isPLValidNow(generalPL as any) ? generalPL : null;
+  const validGeneralPL = generalPL && isPriceListValidNow(generalPL as any) ? generalPL : null;
 
   // Indexar impuestos
   const taxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
@@ -937,11 +936,6 @@ async function batchResolveSalePricesNoClient(
     if (metalLines.length > 0) {
       totalGrams = metalLines.reduce(
         (acc: Prisma.Decimal, l: any) => acc.add(new D(l.quantity?.toString() ?? "0")),
-        new D(0),
-      );
-    } else if ((row.compositions ?? []).length > 0) {
-      totalGrams = (row.compositions ?? []).reduce(
-        (acc: Prisma.Decimal, c: any) => acc.add(new D(c.grams?.toString() ?? "0")),
         new D(0),
       );
     }
@@ -982,7 +976,7 @@ async function batchResolveSalePricesNoClient(
 
     // ── Promoción activa para este artículo ──────────────────────────────────
     const activePromo = promotions.find((p) =>
-      _isPromoValid(p) && (
+      isPromotionValid(p) && (
         p.scope === "ALL" ||
         (p.scope === "ARTICLE" && p.articles.some((a) => a.articleId === row.id))
       )
@@ -1008,7 +1002,7 @@ async function batchResolveSalePricesNoClient(
 
     const rowTaxIds = row.manualTaxIds ?? [];
     const priceWithTax = rowTaxIds.length > 0
-      ? applyTaxes(finalPrice, rowTaxIds, taxMap)
+      ? applyTaxesFromMap(finalPrice, rowTaxIds, taxMap)
       : null;
 
     result.set(row.id, {
@@ -1029,73 +1023,18 @@ async function batchComputeCosts(
   const result = new Map<string, { computedCostBase: string | null; computedCostWithTax: string | null }>();
   if (rows.length === 0) return result;
 
-  const baseCurrency = await prisma.currency.findFirst({
-    where: { jewelryId, isBase: true, deletedAt: null },
-    select: { id: true },
-  });
-  if (!baseCurrency) {
-    rows.forEach((r) => result.set(r.id, { computedCostBase: null, computedCostWithTax: null }));
-    return result;
-  }
+  // Pre-cargar contexto batch: evita N+1 queries en el loop
+  const ctx = await buildBatchCostContext(jewelryId, rows as ArticleCostInput[]);
 
-  // Collect unique currency IDs
-  const currencyIds = new Set<string>();
-  for (const row of rows) {
-    if (row.manualCurrencyId && row.manualCurrencyId !== baseCurrency.id) currencyIds.add(row.manualCurrencyId);
-    if (row.multiplierCurrencyId && row.multiplierCurrencyId !== baseCurrency.id) currencyIds.add(row.multiplierCurrencyId);
-    for (const line of row.costComposition ?? []) {
-      if (line.currencyId && line.currencyId !== baseCurrency.id) currencyIds.add(line.currencyId);
-    }
-  }
-
-  // Collect unique metal variant IDs
-  const variantIds = new Set<string>();
-  for (const row of rows) {
-    for (const line of row.costComposition ?? []) {
-      if (line.type === "METAL" && line.metalVariantId) variantIds.add(line.metalVariantId);
-    }
-    for (const comp of row.compositions ?? []) {
-      if (comp.variantId) variantIds.add(comp.variantId);
-    }
-  }
-
-  // Collect unique tax IDs
+  // Batch fetch de impuestos (no está en el pricing engine)
   const taxIds = new Set<string>();
   for (const row of rows) {
     for (const tid of row.manualTaxIds ?? []) taxIds.add(tid);
   }
-
-  // Batch fetch currency rates (latest per currency)
-  const rateMap = new Map<string, Prisma.Decimal>();
-  if (currencyIds.size > 0) {
-    const allRates = await prisma.currencyRate.findMany({
-      where: { currencyId: { in: Array.from(currencyIds) } },
-      orderBy: { createdAt: "desc" },
-      select: { currencyId: true, rate: true },
-    });
-    for (const r of allRates) {
-      if (!rateMap.has(r.currencyId)) rateMap.set(r.currencyId, new Prisma.Decimal(r.rate.toString()));
-    }
-  }
-
-  // Batch fetch metal quotes (latest per variant, in base currency)
-  const metalQuoteMap = new Map<string, Prisma.Decimal>();
-  if (variantIds.size > 0) {
-    const allQuotes = await prisma.metalQuote.findMany({
-      where: { variantId: { in: Array.from(variantIds) }, currencyId: baseCurrency.id },
-      orderBy: { effectiveAt: "desc" },
-      select: { variantId: true, price: true },
-    });
-    for (const q of allQuotes) {
-      if (!metalQuoteMap.has(q.variantId)) metalQuoteMap.set(q.variantId, new Prisma.Decimal(q.price.toString()));
-    }
-  }
-
-  // Batch fetch taxes
   const taxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
   if (taxIds.size > 0) {
     const taxes = await prisma.tax.findMany({
-      where: { id: { in: Array.from(taxIds) }, deletedAt: null, appliesOnPurchase: true, isRecoverable: false },
+      where: { jewelryId, id: { in: Array.from(taxIds) }, deletedAt: null, appliesOnPurchase: true, isRecoverable: false },
       select: { id: true, rate: true, fixedAmount: true, calculationType: true },
     });
     for (const t of taxes) {
@@ -1107,19 +1046,22 @@ async function batchComputeCosts(
     }
   }
 
-  // Jewelry default merma
-  const jewelry = await prisma.jewelry.findUnique({
-    where: { id: jewelryId },
-    select: { defaultMermaPercent: true },
-  });
-
-  // Compute per article
+  // Calcular costo por artículo (in-memory con ctx, sin queries adicionales por artículo)
   for (const row of rows) {
-    const costBase = computeArticleCostBase(
-      row, baseCurrency.id, rateMap, metalQuoteMap, jewelry?.defaultMermaPercent,
+    const costLines = (row as any).costComposition as EngineCostLineInput[] | undefined;
+    const costResult = await calculateCostFromLines(
+      jewelryId,
+      costLines ?? [],
+      {
+        kind:  (row as any).manualAdjustmentKind,
+        type:  (row as any).manualAdjustmentType,
+        value: (row as any).manualAdjustmentValue,
+      },
+      ctx,
     );
+    const costBase = costResult.value;
     const costWithTax = costBase != null
-      ? applyTaxes(costBase, row.manualTaxIds ?? [], taxMap)
+      ? applyTaxesFromMap(costBase, row.manualTaxIds ?? [], taxMap)
       : null;
     result.set(row.id, {
       computedCostBase:    costBase    != null ? costBase.toFixed(4)    : null,
@@ -1134,19 +1076,24 @@ async function batchComputeCosts(
 // List
 // ===========================================================================
 const ARTICLE_SORT_MAP: Record<string, (dir: "asc" | "desc") => object> = {
-  name:             (d) => ({ name: d }),
-  code:             (d) => ({ code: d }),
-  sku:              (d) => ({ sku: d }),
-  brand:            (d) => ({ brand: d }),
-  manufacturer:     (d) => ({ manufacturer: d }),
-  category:         (d) => ({ category: { name: d } }),
-  supplier:         (d) => ({ preferredSupplier: { displayName: d } }),
-  group:            (d) => ({ group: { name: d } }),
-  updatedAt:        (d) => ({ updatedAt: d }),
-  isReturnable:     (d) => ({ isReturnable: d }),
-  showInStore:      (d) => ({ showInStore: d }),
-  isFavorite:       (d) => ({ isFavorite: d }),
-  costMode:         (d) => ({ costCalculationMode: d }),
+  name:                (d) => ({ name: d }),
+  code:                (d) => ({ code: d }),
+  sku:                 (d) => ({ sku: d }),
+  brand:               (d) => ({ brand: d }),
+  manufacturer:        (d) => ({ manufacturer: d }),
+  category:            (d) => ({ category: { name: d } }),
+  supplier:            (d) => ({ preferredSupplier: { displayName: d } }),
+  group:               (d) => ({ group: { name: d } }),
+  updatedAt:           (d) => ({ updatedAt: d }),
+  isReturnable:        (d) => ({ isReturnable: d }),
+  showInStore:         (d) => ({ showInStore: d }),
+  isFavorite:          (d) => ({ isFavorite: d }),
+  salePrice:           (d) => ({ salePrice: d }),
+  stock:               (d) => ({ stock: { _sum: { quantity: d } } }),
+  articleType:         (d) => ({ articleType: d }),
+  isActive:            (d) => ({ isActive: d }),
+  sellWithoutVariants: (d) => ({ sellWithoutVariants: d }),
+  variantCount:        (d) => ({ variants: { _count: d } }),
 };
 
 export async function listArticles(
@@ -1162,10 +1109,13 @@ export async function listArticles(
     showInStore?: boolean;
     barcode?: string;
     sku?: string;
+    ids?: string[];
     preferredSupplierId?: string;
     groupId?: string;
     brand?: string;
     hasVariants?: boolean;
+    metalId?: string;
+    metalVariantId?: string;
     skip?: number;
     take?: number;
     page?: number;
@@ -1176,15 +1126,27 @@ export async function listArticles(
 ) {
   const {
     q, categoryId, articleType, status, stockMode, isFavorite,
-    showInActive, showInStore, barcode, sku, preferredSupplierId,
-    groupId, brand, hasVariants,
+    showInActive, showInStore, barcode, sku, ids, preferredSupplierId,
+    groupId, brand, hasVariants, metalId, metalVariantId,
   } = opts;
 
-  // Soporte page/pageSize (prioridad) ó skip/take (legacy)
-  const pageSize = opts.pageSize ?? opts.take ?? 50;
-  const page     = opts.page ?? (opts.skip != null ? Math.floor(opts.skip / pageSize) + 1 : 1);
-  const take     = Math.min(200, Math.max(1, pageSize));
-  const skip     = Math.max(0, (page - 1) * take);
+  // Soporte page/pageSize (prioridad) ó skip/take (legacy).
+  // Blindaje contra entradas inválidas (NaN, strings, null): si Number() no
+  // produce un finite, caemos a defaults seguros (25 take, 0 skip). Esto cubre
+  // cualquier caller — hoy el controller saneaba con `|| 50`, pero otros
+  // entrypoints (imports, tests, jobs) podrían pasar valores crudos.
+  const safeNum = (v: any, fallback: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const pageSizeRaw = safeNum(opts.pageSize ?? opts.take, 25);
+  const skipRaw     = safeNum(opts.skip, 0);
+  const pageRaw     = opts.page != null
+    ? safeNum(opts.page, 1)
+    : (opts.skip != null ? Math.floor(skipRaw / Math.max(1, pageSizeRaw)) + 1 : 1);
+  const take = Math.min(200, Math.max(1, pageSizeRaw));
+  const page = Math.max(1, pageRaw);
+  const skip = Math.max(0, (page - 1) * take);
 
   const where: any = { jewelryId, deletedAt: null };
   if (!showInActive) where.isActive = true;
@@ -1192,17 +1154,84 @@ export async function listArticles(
   if (articleType && VALID_ARTICLE_TYPES.has(articleType)) where.articleType = articleType;
   if (status && VALID_STATUS.has(status)) where.status = status;
   if (stockMode && VALID_STOCK_MODE.has(stockMode)) where.stockMode = stockMode;
-  if (isFavorite === true)  where.isFavorite = true;
+  if (isFavorite === true)   where.isFavorite = true;
   if (showInStore === true)  where.showInStore = true;
-  if (preferredSupplierId)  where.preferredSupplierId = preferredSupplierId;
-  if (barcode)              where.barcode = barcode; // búsqueda exacta por barcode
-  if (sku)                  where.sku = { contains: sku, mode: "insensitive" };
-  if (groupId)              where.groupId = groupId;
-  if (brand)                where.brand = { contains: brand, mode: "insensitive" };
-  if (hasVariants === true) where.variants = { some: { deletedAt: null } };
+  if (showInStore === false) where.showInStore = false;
+  if (preferredSupplierId)   where.preferredSupplierId = preferredSupplierId;
+  if (barcode)               where.barcode = barcode; // búsqueda exacta por barcode
+  if (sku) {
+    where.AND = [
+      ...(where.AND ?? []),
+      { OR: [
+        { sku: { contains: sku, mode: "insensitive" } },
+        { variants: { some: { sku: { contains: sku, mode: "insensitive" }, deletedAt: null } } },
+      ]},
+    ];
+  }
+  if (ids && ids.length > 0) where.id = { in: ids };
+  if (groupId)               (where as any).groupItems = { some: { groupId, itemType: "ARTICLE" } };
+  if (brand)                 where.brand = { contains: brand, mode: "insensitive" };
+  if (hasVariants === true)  where.variants = { some: { deletedAt: null } };
+  if (hasVariants === false) where.variants = { none: { deletedAt: null } };
+
+  // Filtro por variante de metal
+  if (metalVariantId) {
+    where.AND = [
+      ...(where.AND ?? []),
+      { costComposition: { some: { metalVariantId } } },
+    ];
+  } else if (metalId) {
+    where.AND = [
+      ...(where.AND ?? []),
+      { costComposition: { some: { metalVariant: { metalId } } } },
+    ];
+  }
 
   if (q) {
-    where.OR = [
+    // Pre-query 1: variantes que coincidan por sus campos directos (sku, code, name, barcode)
+    // (evita depender de `variants.some` dentro de OR en Prisma 7 con adapter-pg)
+    const variantsByFields = (await prisma.articleVariant.findMany({
+      where: {
+        jewelryId,
+        deletedAt: null,
+        OR: [
+          { sku:     { contains: q, mode: "insensitive" } },
+          { code:    { contains: q, mode: "insensitive" } },
+          { name:    { contains: q, mode: "insensitive" } },
+          { barcode: { contains: q, mode: "insensitive" } },
+        ],
+      },
+      select: { articleId: true },
+      take: 200,
+    })).map((v) => v.articleId);
+
+    // Pre-query 2: variantes cuyo atributo de eje (variantLabel) coincida con el término
+    // Esto cubre búsquedas como "Oro 18K" o "Talle 12" que se muestran en la tabla
+    const attrValueVariantIds = (await prisma.articleVariantAttributeValue.findMany({
+      where: {
+        jewelryId,
+        value: { contains: q, mode: "insensitive" },
+      },
+      select: { variantId: true },
+      take: 200,
+    })).map((av) => av.variantId);
+
+    const variantsByAttr = attrValueVariantIds.length > 0
+      ? (await prisma.articleVariant.findMany({
+          where: {
+            id:        { in: attrValueVariantIds },
+            jewelryId,
+            deletedAt: null,
+          },
+          select: { articleId: true },
+          take: 200,
+        })).map((v) => v.articleId)
+      : [];
+
+    // Unir todos los articleIds encontrados vía variante (sin duplicados)
+    const variantArticleIds = [...new Set([...variantsByFields, ...variantsByAttr])];
+
+    const orConditions: any[] = [
       { name:        { contains: q, mode: "insensitive" } },
       { code:        { contains: q, mode: "insensitive" } },
       { description: { contains: q, mode: "insensitive" } },
@@ -1210,6 +1239,12 @@ export async function listArticles(
       { brand:       { contains: q, mode: "insensitive" } },
       { barcode:     { contains: q, mode: "insensitive" } },
     ];
+
+    if (variantArticleIds.length > 0) {
+      orConditions.push({ id: { in: variantArticleIds } });
+    }
+
+    where.OR = orConditions;
   }
 
   const sortDir = opts.sortDir === "desc" ? "desc" : "asc";
@@ -1253,6 +1288,7 @@ export async function listArticles(
     const stockEntry = r.stockMode === "BY_ARTICLE"
       ? (stockMap.get(r.id) ?? { total: 0, byVariant: {} })
       : null;
+    const gi = (r as any).groupItems?.[0];
     return {
       ...r,
       resolvedSalePrice:        p?.resolvedSalePrice        ?? null,
@@ -1260,23 +1296,37 @@ export async function listArticles(
       resolvedPriceSource:      p?.resolvedPriceSource      ?? "NONE",
       resolvedPriceName:        p?.resolvedPriceName        ?? null,
       stockData: stockEntry,
+      groupId:    gi?.groupId    ?? null,
+      groupOrder: gi?.groupOrder ?? 0,
+      group:      gi?.group      ?? null,
     };
   });
 
-  // Enriquecer variantes con precios/costos con impuestos
+  // Enriquecer variantes con precios/costos con impuestos + adjuntar taxDetails a cada row
   const allTaxIds = new Set<string>();
   for (const r of enrichedRows) {
     for (const tid of ((r as any).manualTaxIds ?? []) as string[]) allTaxIds.add(tid);
   }
   if (allTaxIds.size > 0) {
     const taxRecords = await prisma.tax.findMany({
-      where: { id: { in: [...allTaxIds] }, deletedAt: null },
+      where: { jewelryId, id: { in: [...allTaxIds] }, deletedAt: null },
       select: {
-        id: true, rate: true, fixedAmount: true,
+        id: true, name: true, rate: true, fixedAmount: true,
         calculationType: true, appliesOnSale: true,
         appliesOnPurchase: true, isRecoverable: true,
       },
     });
+
+    // Mapa nombre+tasa para mostrar en tabla
+    const taxNameMap = new Map<string, { name: string; rate: string | null }>();
+    for (const t of taxRecords) {
+      taxNameMap.set(t.id, { name: (t as any).name as string, rate: t.rate?.toString() ?? null });
+    }
+    for (const row of enrichedRows as any[]) {
+      const taxIds: string[] = row.manualTaxIds ?? [];
+      row.taxDetails = taxIds.map((id) => taxNameMap.get(id)).filter(Boolean);
+    }
+
     const saleTaxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
     const costTaxMap = new Map<string, { rate: Prisma.Decimal; fixedAmount: Prisma.Decimal; calculationType: string }>();
     for (const t of taxRecords) {
@@ -1292,15 +1342,8 @@ export async function listArticles(
       if (!row.variants?.length) continue;
       const taxIds: string[] = row.manualTaxIds ?? [];
       if (taxIds.length === 0) continue;
-      row.variants = row.variants.map((vv: any) => ({
-        ...vv,
-        priceOverrideWithTax: vv.priceOverride != null
-          ? applyTaxes(new Prisma.Decimal(vv.priceOverride.toString()), taxIds, saleTaxMap).toFixed(4)
-          : null,
-        costPriceWithTax: vv.costPrice != null
-          ? applyTaxes(new Prisma.Decimal(vv.costPrice.toString()), taxIds, costTaxMap).toFixed(4)
-          : null,
-      }));
+      // Las variantes no tienen precio propio — no hay priceOverride que enriquecer con impuestos.
+      // El precio y los impuestos son siempre del artículo padre.
     }
   }
 
@@ -1335,7 +1378,7 @@ export async function listArticles(
         where: { jewelryId, isActive: true, deletedAt: null },
         select: {
           id: true, articleId: true, variantId: true, categoryId: true, brand: true,
-          tiers: { select: { minQty: true, type: true, value: true }, orderBy: { minQty: "asc" }, take: 1 },
+          tiers: { select: { minQty: true, type: true, value: true }, orderBy: { minQty: "asc" } },
         },
       }),
     ]);
@@ -1360,6 +1403,7 @@ export async function listArticles(
     const promoSumMap = new Map<string, string>();
     const qdSet       = new Set<string>();
     const qdSumMap    = new Map<string, string>();
+    const qdTiersMap  = new Map<string, Array<{ minQty: string; type: string; value: string }>>();
 
     function fmtPromo(p: { name: string; type: string; value: { toString(): string } }): string {
       const val = p.type === "PERCENTAGE" ? `-${p.value}%` : `-$${p.value}`;
@@ -1378,6 +1422,13 @@ export async function listArticles(
     function addQD(aid: string, qd: { tiers: Array<{ minQty: { toString(): string }; type: string; value: { toString(): string } }> }): void {
       qdSet.add(aid);
       if (!qdSumMap.has(aid)) qdSumMap.set(aid, fmtQD(qd.tiers));
+      if (!qdTiersMap.has(aid)) {
+        qdTiersMap.set(aid, qd.tiers.map((t) => ({
+          minQty: t.minQty.toString(),
+          type:   t.type,
+          value:  t.value.toString(),
+        })));
+      }
     }
 
     for (const promo of activePromos) {
@@ -1426,10 +1477,11 @@ export async function listArticles(
     }
 
     for (const row of enrichedRows as any[]) {
-      row.hasActivePromotion      = promoSet.has(row.id);
-      row.hasQuantityDiscount     = qdSet.has(row.id);
-      row.promotionSummary        = promoSumMap.get(row.id) ?? null;
-      row.quantityDiscountSummary = qdSumMap.get(row.id)   ?? null;
+      row.hasActivePromotion       = promoSet.has(row.id);
+      row.hasQuantityDiscount      = qdSet.has(row.id);
+      row.promotionSummary         = promoSumMap.get(row.id)  ?? null;
+      row.quantityDiscountSummary  = qdSumMap.get(row.id)     ?? null;
+      row.quantityDiscountTiers    = qdTiersMap.get(row.id)   ?? null;
     }
   }
 
@@ -1447,6 +1499,23 @@ export async function getArticle(articleId: string, jewelryId: string) {
   });
   assert(article, "Artículo no encontrado.", 404);
 
+  // Verificar si el artículo tiene movimientos registrados (vía líneas, que son el vínculo real)
+  const variantIds: string[] = (article as any).variants?.map((v: any) => v.id as string) ?? [];
+  const movementCount = await prisma.articleMovement.count({
+    where: {
+      jewelryId,
+      lines: {
+        some: {
+          OR: [
+            { articleId },
+            ...(variantIds.length ? [{ variantId: { in: variantIds } }] : []),
+          ],
+        },
+      },
+    },
+  });
+  const hasMovements = movementCount > 0;
+
   // Enriquecer con datos de stock según el modo
   let stockData: any = null;
   if ((article as any).stockMode === "BY_ARTICLE") {
@@ -1455,14 +1524,23 @@ export async function getArticle(articleId: string, jewelryId: string) {
     stockData = await _calcMaterialAvailabilityInternal(articleId, jewelryId, article as any);
   }
 
-  // Calcular costo computado según el modo de cálculo
-  const costResult = await computeCostPrice(jewelryId, article as any);
+  // Calcular costo computado desde líneas de composición
+  const _costLines = (article as any).costComposition as EngineCostLineInput[] | undefined;
+  const costResult = await calculateCostFromLines(
+    jewelryId,
+    _costLines ?? [],
+    {
+      kind:  (article as any).manualAdjustmentKind,
+      type:  (article as any).manualAdjustmentType,
+      value: (article as any).manualAdjustmentValue,
+    },
+  );
 
   // ── Impuestos: fetch enriquecido con nombre (para display en tab Costos) ─
   const taxIdsForDetail: string[] = (article as any).manualTaxIds ?? [];
   const taxDetails = taxIdsForDetail.length > 0
     ? await prisma.tax.findMany({
-        where: { id: { in: taxIdsForDetail }, deletedAt: null, appliesOnPurchase: true, isRecoverable: false },
+        where: { jewelryId, id: { in: taxIdsForDetail }, deletedAt: null, appliesOnPurchase: true, isRecoverable: false },
         select: { id: true, name: true, rate: true, fixedAmount: true, calculationType: true },
       })
     : [];
@@ -1478,7 +1556,7 @@ export async function getArticle(articleId: string, jewelryId: string) {
         fixedAmount:     new Prisma.Decimal((t.fixedAmount ?? 0).toString()),
         calculationType: t.calculationType,
       }]));
-      computedCostWithTaxStr = applyTaxes(costBase, taxIdsForDetail, taxMap).toFixed(4);
+      computedCostWithTaxStr = applyTaxesFromMap(costBase, taxIdsForDetail, taxMap).toFixed(4);
     } else {
       computedCostWithTaxStr = costBase.toFixed(4);
     }
@@ -1564,8 +1642,10 @@ export async function getArticle(articleId: string, jewelryId: string) {
     effectivePriceSource = "MANUAL_FALLBACK";
   }
 
+  const _gi = (article as any).groupItems?.[0];
   return {
     ...article,
+    hasMovements,
     stockData,
     computedCostBase:    costResult.value != null ? (costResult.value as Prisma.Decimal).toFixed(4) : null,
     computedCostWithTax: computedCostWithTaxStr,
@@ -1577,7 +1657,49 @@ export async function getArticle(articleId: string, jewelryId: string) {
     baseCurrency:          baseCurrencyForDetail,
     taxDetails,
     costLineCurrentValues,
+    groupId:    _gi?.groupId    ?? null,
+    groupOrder: _gi?.groupOrder ?? 0,
+    group:      _gi?.group      ?? null,
   };
+}
+
+// ===========================================================================
+// FASE 2 — Validación de variantes de componente en composición de costo.
+//
+// Una línea PRODUCT/SERVICE con `catalogItemId` puede opcionalmente apuntar a
+// una variante específica via `catalogVariantId`. Cuando el caller manda esta
+// referencia, validamos en una sola query batch que:
+//   - cada variante existe en el tenant y no está soft-deleted,
+//   - el `articleId` de la variante coincide con el `catalogItemId` de la línea
+//     (no se puede asociar una variante de otro padre al componente).
+// Si solo viene `catalogItemId` (sin variantId), el flujo legacy se mantiene.
+// ===========================================================================
+async function validateCostLineVariants(
+  jewelryId: string,
+  lines: Array<{ catalogItemId?: string | null; catalogVariantId?: string | null }>,
+): Promise<void> {
+  const variantIds = [
+    ...new Set(
+      lines
+        .map((l) => l.catalogVariantId)
+        .filter((v): v is string => typeof v === "string" && v.length > 0),
+    ),
+  ];
+  if (variantIds.length === 0) return;
+  const variants = await prisma.articleVariant.findMany({
+    where: { id: { in: variantIds }, jewelryId, deletedAt: null },
+    select: { id: true, articleId: true, isActive: true },
+  });
+  const variantMap = new Map(variants.map((v) => [v.id, v]));
+  for (const l of lines) {
+    if (!l.catalogVariantId) continue;
+    const v = variantMap.get(l.catalogVariantId);
+    assert(v, `La variante "${l.catalogVariantId}" del componente no existe o fue eliminada.`);
+    assert(
+      l.catalogItemId && v!.articleId === l.catalogItemId,
+      "La variante seleccionada no pertenece al artículo del componente.",
+    );
+  }
 }
 
 // ===========================================================================
@@ -1587,19 +1709,24 @@ export async function createArticle(jewelryId: string, data: any) {
   assert(s(data?.name), "El nombre del artículo es obligatorio.");
 
   const articleType = VALID_ARTICLE_TYPES.has(data?.articleType) ? data.articleType : "PRODUCT";
-  const stockMode   = VALID_STOCK_MODE.has(data?.stockMode) ? data.stockMode : "NO_STOCK";
+  let   stockMode   = VALID_STOCK_MODE.has(data?.stockMode) ? data.stockMode : "NO_STOCK";
+
+  // ── Combo comercial: normaliza/valida campos y fuerza flags si corresponde ──
+  const combo = normalizeComboFields({
+    articleType,
+    commercialMode:       data?.commercialMode,
+    comboAdjustmentKind:  data?.comboAdjustmentKind,
+    comboAdjustmentValue: data?.comboAdjustmentValue,
+  });
+  const isCombo = combo.commercialMode === "COMBO_COMMERCIAL";
+  if (isCombo && combo.stockMode) stockMode = combo.stockMode;
 
   validateTypeStockMode(articleType, stockMode);
 
-  const costCalculationMode = VALID_COST_MODES.has(data?.costCalculationMode)
-    ? data.costCalculationMode : "MANUAL";
-  validateCostMode({
-    costCalculationMode,
-    costPrice:          data?.costPrice,
-    multiplierBase:     data?.multiplierBase,
-    multiplierValue:    data?.multiplierValue,
-    multiplierQuantity: data?.multiplierQuantity,
-  });
+  // Validación defensiva temprana (sin DB): fail-fast para payloads mal formados.
+  // El shape del combo depende de costComposition, por eso lo resolvemos antes.
+  const costCompositionLinesEarly: CostLineInput[] = Array.isArray(data?.costComposition) ? data.costComposition : [];
+  assertServiceArticleComposition(articleType, data, costCompositionLinesEarly);
 
   const code = s(data?.code) || await generateArticleCode(jewelryId);
   const codeExists = await prisma.article.findFirst({
@@ -1636,14 +1763,21 @@ export async function createArticle(jewelryId: string, data: any) {
 
   assert(jewelryId, "jewelryId es requerido para crear un artículo.");
 
-  const costCompositionLines: CostLineInput[] = Array.isArray(data?.costComposition) ? data.costComposition : [];
+  const costCompositionLines = costCompositionLinesEarly;
+
+  // Combo: validar shape de componentes (sin DB) antes de tocar nada.
+  if (isCombo) {
+    validateComboComponentsShape({ ownArticleId: null, componentLines: costCompositionLines });
+  }
+
+  // FASE 2: validar que las variantes referenciadas en las líneas existan y
+  // pertenezcan al artículo del componente.
+  await validateCostLineVariants(jewelryId, costCompositionLines);
 
   const articleData = {
     jewelry:             { connect: { id: jewelryId } },
     ...(data?.categoryId          ? { category:          { connect: { id: data.categoryId } } }          : {}),
     ...(data?.preferredSupplierId ? { preferredSupplier: { connect: { id: data.preferredSupplierId } } } : {}),
-    ...(data?.groupId             ? { group:             { connect: { id: data.groupId } } }             : {}),
-    groupOrder:          Number(data?.groupOrder ?? 0),
     code,
     name:                s(data.name),
     description:         s(data?.description),
@@ -1657,24 +1791,20 @@ export async function createArticle(jewelryId: string, data: any) {
     brand:               s(data?.brand),
     manufacturer:        s(data?.manufacturer),
     supplierCode:        s(data?.supplierCode),
-    costPrice:           data?.costPrice != null ? data.costPrice : null,
+    // Precio de venta. Combos también pueden tener precio manual (lista o override).
     salePrice:           data?.salePrice != null ? data.salePrice : null,
     useManualSalePrice:  !!data?.useManualSalePrice,
-    hechuraPrice:        data?.hechuraPrice != null ? data.hechuraPrice : null,
-    hechuraPriceMode:    VALID_HECHURA_MODE.has(data?.hechuraPriceMode) ? data.hechuraPriceMode : "FIXED",
     mermaPercent:        data?.mermaPercent != null ? data.mermaPercent : null,
-    costCalculationMode,
-    multiplierBase:        s(data?.multiplierBase),
-    multiplierValue:       data?.multiplierValue != null ? data.multiplierValue : null,
-    multiplierQuantity:    data?.multiplierQuantity != null ? data.multiplierQuantity : null,
-    multiplierCurrencyId:  data?.multiplierCurrencyId ?? null,
-    manualBaseCost:        data?.manualBaseCost != null ? data.manualBaseCost : null,
-    manualCurrencyId:      data?.manualCurrencyId ?? null,
+    // Ajuste global sobre composición de costo (se aplica sobre la suma de ArticleCostLine)
     manualAdjustmentKind:  s(data?.manualAdjustmentKind),
     manualAdjustmentType:  s(data?.manualAdjustmentType),
     manualAdjustmentValue: data?.manualAdjustmentValue != null ? data.manualAdjustmentValue : null,
     manualTaxIds:          Array.isArray(data?.manualTaxIds) ? data.manualTaxIds : [],
-    sellWithoutVariants: data?.sellWithoutVariants !== false,
+    // Combo: campos comerciales del combo + flags forzados
+    commercialMode:        combo.commercialMode,
+    comboAdjustmentKind:   combo.comboAdjustmentKind,
+    comboAdjustmentValue:  combo.comboAdjustmentValue,
+    sellWithoutVariants: isCombo ? true : (data?.sellWithoutVariants !== false),
     isReturnable:        data?.isReturnable !== false,
     showInStore:         !!data?.showInStore,
     unitOfMeasure:       s(data?.unitOfMeasure),
@@ -1695,6 +1825,20 @@ export async function createArticle(jewelryId: string, data: any) {
 
   const VALID_TYPES = new Set(["METAL", "HECHURA", "PRODUCT", "SERVICE", "MANUAL"]);
   const articleId = await prisma.$transaction(async (tx) => {
+    // Validación contra DB de los componentes del combo (servicio? eliminado? ciclo?).
+    // En createArticle no hay ownArticleId previo → no chequea ciclos del propio artículo,
+    // pero sí valida que cada componente exista, sea PRODUCT activo, etc.
+    if (isCombo) {
+      const componentIds = costCompositionLines
+        .filter(l => (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId)
+        .map(l => l.catalogItemId as string);
+      await validateComboComponentsAgainstDb(tx, {
+        jewelryId,
+        ownArticleId: null,
+        componentArticleIds: componentIds,
+      });
+    }
+
     const created = await tx.article.create({ data: articleData, select: { id: true } });
     if (costCompositionLines.length > 0) {
       await tx.articleCostLine.createMany({
@@ -1709,6 +1853,17 @@ export async function createArticle(jewelryId: string, data: any) {
           mermaPercent:  l.type === "METAL" ? (l.mermaPercent ?? null) : null,
           metalVariantId: l.type === "METAL" ? (l.metalVariantId ?? null) : null,
           catalogItemId: l.catalogItemId ?? null,
+          // FASE 2: variante específica del componente. Solo se persiste para
+          // líneas PRODUCT/SERVICE que apunten a un artículo. Validado arriba.
+          catalogVariantId:
+            (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId
+              ? (l.catalogVariantId ?? null)
+              : null,
+          // Combo: forzar affectsStock=true en líneas componente (PRODUCT/SERVICE con ref)
+          // para que confirmSale dispare el descuento de stock de los componentes.
+          affectsStock:  isCombo && (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId
+                            ? true
+                            : (l.affectsStock ?? false),
           sortOrder:     l.sortOrder ?? idx,
           lineAdjKind:   l.lineAdjKind  ?? "",
           lineAdjType:   l.lineAdjType  ?? "",
@@ -1718,6 +1873,13 @@ export async function createArticle(jewelryId: string, data: any) {
     }
     return created.id;
   });
+
+  // Grupo comercial: la relación vive en ArticleGroupItem (no es campo escalar
+  // en Article). Solo se asigna si el caller envió `groupId` con un valor truthy
+  // — en create no tiene sentido "desasignar" porque el artículo nace sin grupo.
+  if (typeof data?.groupId === "string" && data.groupId) {
+    await assignGroupToArticle(articleId, data.groupId, jewelryId);
+  }
 
   return getArticle(articleId, jewelryId);
 }
@@ -1731,27 +1893,38 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
 
   const current = await prisma.article.findUnique({
     where: { id: articleId },
-    select: { articleType: true, stockMode: true, barcode: true, barcodeSource: true, code: true, sku: true, costCalculationMode: true },
+    select: { articleType: true, stockMode: true, barcode: true, barcodeSource: true, code: true, sku: true, categoryId: true, commercialMode: true },
   });
   const newType      = VALID_ARTICLE_TYPES.has(data?.articleType) ? data.articleType : current!.articleType;
-  const newStockMode = VALID_STOCK_MODE.has(data?.stockMode) ? data.stockMode : current!.stockMode;
+  let   newStockMode = VALID_STOCK_MODE.has(data?.stockMode) ? data.stockMode : current!.stockMode;
+
+  // ── Combo comercial: normaliza/valida campos y fuerza flags si corresponde ──
+  // Si commercialMode no viene en data, se preserva el actual (current.commercialMode).
+  const incomingCommercialMode =
+    data?.commercialMode !== undefined ? data.commercialMode : current!.commercialMode;
+  const combo = normalizeComboFields({
+    articleType:          newType,
+    commercialMode:       incomingCommercialMode,
+    comboAdjustmentKind:  data?.comboAdjustmentKind,
+    comboAdjustmentValue: data?.comboAdjustmentValue,
+  });
+  const isCombo = combo.commercialMode === "COMBO_COMMERCIAL";
+  if (isCombo && combo.stockMode) newStockMode = combo.stockMode;
+
   validateTypeStockMode(newType, newStockMode);
 
-  // Si se envían campos de costo, validar coherencia
-  const hasCostFields = data?.costCalculationMode != null || data?.multiplierBase != null
-    || data?.multiplierValue != null || data?.multiplierQuantity != null;
-  if (hasCostFields) {
-    const effectiveCostMode = VALID_COST_MODES.has(data?.costCalculationMode)
-      ? data.costCalculationMode
-      : current!.costCalculationMode;
-    validateCostMode({
-      costCalculationMode: effectiveCostMode,
-      costPrice:           data?.costPrice,
-      multiplierBase:      data?.multiplierBase,
-      multiplierValue:     data?.multiplierValue,
-      multiplierQuantity:  data?.multiplierQuantity,
-    });
-  }
+  // Validación defensiva temprana (sin DB): fail-fast para payloads mal formados.
+  // Resolvemos costComposition acá para poder validar servicios, reutilizamos
+  // luego en combo validation + transacción.
+  const hasCostComposition = data?.costComposition !== undefined;
+  const costCompositionLines: CostLineInput[] = hasCostComposition
+    ? (Array.isArray(data.costComposition) ? data.costComposition : [])
+    : [];
+  assertServiceArticleComposition(
+    newType,
+    data,
+    hasCostComposition ? costCompositionLines : null,
+  );
 
   if (data?.code) {
     const conflict = await prisma.article.findFirst({
@@ -1768,6 +1941,85 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
       where: { id: data.categoryId, jewelryId, deletedAt: null }, select: { id: true },
     });
     assert(cat, "Categoría no encontrada.");
+  }
+
+  // Validar cambio de categoría: compatibilidad de ejes (si tiene variantes) o conversión (si es simple)
+  if (data?.categoryId && data.categoryId !== current!.categoryId) {
+    const existingVariantCount = await prisma.articleVariant.count({
+      where: { articleId, jewelryId, deletedAt: null },
+    });
+
+    if (existingVariantCount > 0) {
+      // Artículo ya varianteado → solo permitir si los ejes de variante son exactamente los mismos
+      const getEffectiveAxisDefIds = async (catId: string): Promise<Set<string>> => {
+        const result = new Set<string>();
+        let curId: string | null = catId;
+        const seen = new Set<string>();
+        let isOwn = true;
+        while (curId && !seen.has(curId)) {
+          seen.add(curId);
+          const cat = await prisma.articleCategory.findFirst({
+            where: { id: curId, deletedAt: null },
+            select: {
+              parentId: true,
+              attributes: {
+                where: { isVariantAxis: true, deletedAt: null, ...(isOwn ? {} : { inheritToChild: true }) },
+                select: { definitionId: true },
+              },
+            },
+          });
+          if (!cat) break;
+          cat.attributes.forEach(a => result.add(a.definitionId));
+          curId = cat.parentId ?? null;
+          isOwn = false;
+        }
+        return result;
+      };
+      const [currentDefs, newDefs] = await Promise.all([
+        getEffectiveAxisDefIds(current!.categoryId ?? ""),
+        getEffectiveAxisDefIds(data.categoryId),
+      ]);
+      const axesCompatible =
+        currentDefs.size === newDefs.size &&
+        [...currentDefs].every(id => newDefs.has(id));
+      assert(
+        axesCompatible,
+        "Este artículo ya tiene variantes creadas con la estructura de atributos de su categoría actual y no puede cambiarse a una categoría con ejes distintos."
+      );
+    } else {
+      // Artículo simple → bloquear conversión a categoría con ejes si tiene movimientos
+      const axisCount = await prisma.articleCategoryAttribute.count({
+        where: { categoryId: data.categoryId, isVariantAxis: true, deletedAt: null },
+      });
+      if (axisCount > 0) {
+        const movCount = await prisma.articleMovement.count({
+          where: { jewelryId, lines: { some: { articleId } } },
+        });
+        assert(
+          movCount === 0,
+          "Este artículo tiene movimientos registrados y no puede convertirse en un artículo con variantes."
+        );
+      }
+    }
+  }
+
+  // Validar variantes obligatorias si la categoría efectiva tiene ejes de variante
+  {
+    const effectiveCategoryId = data?.categoryId ?? current!.categoryId;
+    if (effectiveCategoryId && newType !== "SERVICE") {
+      const axisCount = await prisma.articleCategoryAttribute.count({
+        where: { categoryId: effectiveCategoryId, isVariantAxis: true, deletedAt: null },
+      });
+      if (axisCount > 0) {
+        const variantCount = await prisma.articleVariant.count({
+          where: { articleId, jewelryId, deletedAt: null },
+        });
+        assert(
+          variantCount > 0,
+          "Esta categoría requiere al menos una variante. Creá las variantes antes de guardar el artículo."
+        );
+      }
+    }
   }
 
   // Barcode — re-resolve si cambia source, code, sku, o barcode (para CUSTOM)
@@ -1811,10 +2063,6 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
     ...(data?.preferredSupplierId !== undefined
       ? { preferredSupplier: data.preferredSupplierId ? { connect: { id: data.preferredSupplierId } } : { disconnect: true } }
       : {}),
-    ...(data?.groupId !== undefined
-      ? { group: data.groupId ? { connect: { id: data.groupId } } : { disconnect: true } }
-      : {}),
-    ...(data?.groupOrder !== undefined ? { groupOrder: Number(data.groupOrder) } : {}),
     name:               s(data.name),
     description:        s(data?.description),
     articleType:        VALID_ARTICLE_TYPES.has(data?.articleType) ? data.articleType : undefined,
@@ -1827,24 +2075,22 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
     brand:              data?.brand !== undefined ? s(data.brand) : undefined,
     manufacturer:       data?.manufacturer !== undefined ? s(data.manufacturer) : undefined,
     supplierCode:       data?.supplierCode !== undefined ? s(data.supplierCode) : undefined,
-    costPrice:           data?.costPrice !== undefined ? (data.costPrice ?? null) : undefined,
+    // Precio de venta. Combos también pueden tener precio manual (lista o override).
     salePrice:           data?.salePrice !== undefined ? (data.salePrice ?? null) : undefined,
     useManualSalePrice:  data?.useManualSalePrice !== undefined ? !!data.useManualSalePrice : undefined,
-    hechuraPrice:        data?.hechuraPrice !== undefined ? (data.hechuraPrice ?? null) : undefined,
-    hechuraPriceMode:    VALID_HECHURA_MODE.has(data?.hechuraPriceMode) ? data.hechuraPriceMode : undefined,
     mermaPercent:        data?.mermaPercent !== undefined ? (data.mermaPercent ?? null) : undefined,
-    costCalculationMode: VALID_COST_MODES.has(data?.costCalculationMode) ? data.costCalculationMode : undefined,
-    multiplierBase:        data?.multiplierBase !== undefined ? s(data.multiplierBase) : undefined,
-    multiplierValue:       data?.multiplierValue !== undefined ? (data.multiplierValue ?? null) : undefined,
-    multiplierQuantity:    data?.multiplierQuantity !== undefined ? (data.multiplierQuantity ?? null) : undefined,
-    multiplierCurrencyId:  data?.multiplierCurrencyId !== undefined ? (data.multiplierCurrencyId ?? null) : undefined,
-    manualBaseCost:        data?.manualBaseCost !== undefined ? (data.manualBaseCost ?? null) : undefined,
-    manualCurrencyId:      data?.manualCurrencyId !== undefined ? (data.manualCurrencyId ?? null) : undefined,
+    // Ajuste global sobre composición de costo (se aplica sobre la suma de ArticleCostLine)
     manualAdjustmentKind:  data?.manualAdjustmentKind !== undefined ? s(data.manualAdjustmentKind) : undefined,
     manualAdjustmentType:  data?.manualAdjustmentType !== undefined ? s(data.manualAdjustmentType) : undefined,
     manualAdjustmentValue: data?.manualAdjustmentValue !== undefined ? (data.manualAdjustmentValue ?? null) : undefined,
     manualTaxIds:          data?.manualTaxIds !== undefined ? (Array.isArray(data.manualTaxIds) ? data.manualTaxIds : []) : undefined,
-    sellWithoutVariants: data?.sellWithoutVariants !== undefined ? !!data.sellWithoutVariants : undefined,
+    // Combo: persistir siempre los 3 campos resueltos por normalizeComboFields
+    commercialMode:        combo.commercialMode,
+    comboAdjustmentKind:   combo.comboAdjustmentKind,
+    comboAdjustmentValue:  combo.comboAdjustmentValue,
+    sellWithoutVariants: isCombo
+                            ? true
+                            : (data?.sellWithoutVariants !== undefined ? !!data.sellWithoutVariants : undefined),
     isReturnable:       data?.isReturnable !== undefined ? !!data.isReturnable : undefined,
     showInStore:        data?.showInStore !== undefined ? !!data.showInStore : undefined,
     unitOfMeasure:      data?.unitOfMeasure !== undefined ? s(data.unitOfMeasure) : undefined,
@@ -1863,13 +2109,44 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
     notes:              data?.notes !== undefined ? s(data.notes) : undefined,
   };
 
-  const hasCostComposition = data?.costComposition !== undefined;
-  const costCompositionLines: CostLineInput[] = hasCostComposition
-    ? (Array.isArray(data.costComposition) ? data.costComposition : [])
-    : [];
+  // Combo: si vienen componentes O si pasamos a/seguimos siendo combo, validar shape.
+  // Si NO vienen componentes pero sí seguimos siendo combo, hay que validar contra los
+  // existentes (cargados desde DB) para garantizar que el combo no quede sin componentes.
+  if (isCombo) {
+    if (hasCostComposition) {
+      validateComboComponentsShape({ ownArticleId: articleId, componentLines: costCompositionLines });
+    } else {
+      const existingCount = await prisma.articleCostLine.count({
+        where: {
+          articleId, jewelryId,
+          type: { in: ["PRODUCT", "SERVICE"] },
+          catalogItemId: { not: null },
+        },
+      });
+      assert(existingCount > 0, "El combo comercial debe tener al menos un componente.");
+    }
+  }
+
+  // FASE 2: validar variantes referenciadas en las líneas (cuando vienen).
+  if (hasCostComposition) {
+    await validateCostLineVariants(jewelryId, costCompositionLines);
+  }
 
   const VALID_TYPES_SET = new Set(["METAL", "HECHURA", "PRODUCT", "SERVICE", "MANUAL"]);
   await prisma.$transaction(async (tx) => {
+    // Validación contra DB de los componentes del combo (existencia, tipo, ciclos).
+    // Solo se ejecuta cuando el caller envía costComposition Y el artículo es combo.
+    if (isCombo && hasCostComposition) {
+      const componentIds = costCompositionLines
+        .filter(l => (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId)
+        .map(l => l.catalogItemId as string);
+      await validateComboComponentsAgainstDb(tx, {
+        jewelryId,
+        ownArticleId: articleId,
+        componentArticleIds: componentIds,
+      });
+    }
+
     await tx.article.update({ where: { id: articleId }, data: updateData });
     if (hasCostComposition) {
       await tx.articleCostLine.deleteMany({ where: { articleId, jewelryId } });
@@ -1886,6 +2163,15 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
             mermaPercent:  l.type === "METAL" ? (l.mermaPercent ?? null) : null,
             metalVariantId: l.type === "METAL" ? (l.metalVariantId ?? null) : null,
             catalogItemId: l.catalogItemId ?? null,
+            // FASE 2: variante específica del componente, solo PRODUCT/SERVICE con ref.
+            catalogVariantId:
+              (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId
+                ? (l.catalogVariantId ?? null)
+                : null,
+            // Combo: forzar affectsStock=true en componentes (PRODUCT/SERVICE con ref).
+            affectsStock:  isCombo && (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId
+                              ? true
+                              : (l.affectsStock ?? false),
             sortOrder:     l.sortOrder ?? idx,
             lineAdjKind:   l.lineAdjKind  ?? "",
             lineAdjType:   l.lineAdjType  ?? "",
@@ -1896,7 +2182,280 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
     }
   });
 
+  // Grupo comercial: la relación vive en ArticleGroupItem (no es campo escalar
+  // en Article). Solo procesamos si el caller envía `groupId` definido. Si llega
+  // string vacío o null, se interpreta como "quitar del grupo" (el frontend
+  // envía `d.groupId || null`, así que `null` representa "Sin grupo").
+  if (data?.groupId !== undefined) {
+    const target = typeof data.groupId === "string" && data.groupId ? data.groupId : null;
+    await assignGroupToArticle(articleId, target, jewelryId);
+  }
+
   return getArticle(articleId, jewelryId);
+}
+
+// ===========================================================================
+// Clone — copia profunda del artículo: composición, atributos, imágenes,
+// variantes (con sus atributos e imágenes) y grupo comercial.
+//
+// NO copia: stock, movimientos, ventas/compras, historial, openingStock,
+// createdAt/updatedAt, isFavorite. El clon nace en estado DRAFT con `code`
+// nuevo autogenerado, `sku=""`, `barcode=null` y nombre con sufijo " (Copia)".
+// Las imágenes reusan las URLs del original (no se duplican blobs en R2).
+// ===========================================================================
+export async function cloneArticle(sourceId: string, jewelryId: string) {
+  assert(sourceId, "Id de artículo inválido.");
+
+  const src = await prisma.article.findFirst({
+    where: { id: sourceId, jewelryId, deletedAt: null },
+    select: {
+      id: true,
+      name: true,
+      description: true,
+      categoryId: true,
+      articleType: true,
+      stockMode: true,
+      barcodeType: true,
+      brand: true,
+      manufacturer: true,
+      supplierCode: true,
+      preferredSupplierId: true,
+      salePrice: true,
+      useManualSalePrice: true,
+      mermaPercent: true,
+      manualAdjustmentKind: true,
+      manualAdjustmentType: true,
+      manualAdjustmentValue: true,
+      manualTaxIds: true,
+      commercialMode: true,
+      comboAdjustmentKind: true,
+      comboAdjustmentValue: true,
+      sellWithoutVariants: true,
+      isReturnable: true,
+      showInStore: true,
+      unitOfMeasure: true,
+      reorderPoint: true,
+      dimensionLength: true,
+      dimensionWidth: true,
+      dimensionHeight: true,
+      dimensionUnit: true,
+      weight: true,
+      weightUnit: true,
+      minSaleQuantity: true,
+      maxSaleQuantity: true,
+      defaultQuantity: true,
+      inventoryAccount: true,
+      mainImageUrl: true,
+      notes: true,
+      costComposition: {
+        select: {
+          type: true, label: true, quantity: true, unitValue: true,
+          currencyId: true, mermaPercent: true, metalVariantId: true,
+          catalogItemId: true, catalogVariantId: true,
+          lineAdjKind: true, lineAdjType: true,
+          lineAdjValue: true, sortOrder: true, affectsStock: true,
+        },
+        orderBy: { sortOrder: "asc" },
+      },
+      attributeValues: {
+        select: { assignmentId: true, value: true },
+      },
+      images: {
+        select: { url: true, label: true, isMain: true, sortOrder: true },
+        orderBy: { sortOrder: "asc" },
+      },
+      variants: {
+        where: { deletedAt: null },
+        orderBy: { sortOrder: "asc" },
+        select: {
+          code: true, name: true, barcodeType: true,
+          weightOverride: true, reorderPoint: true,
+          minSaleQuantity: true, maxSaleQuantity: true, defaultQuantity: true,
+          imageUrl: true, notes: true, isActive: true, isFavorite: true,
+          sortOrder: true,
+          attributeValues: { select: { assignmentId: true, value: true } },
+          images: {
+            select: { url: true, label: true, isMain: true, sortOrder: true },
+            orderBy: { sortOrder: "asc" },
+          },
+        },
+      },
+      groupItems: {
+        where: { itemType: "ARTICLE" },
+        take: 1,
+        select: { groupId: true },
+      },
+    },
+  });
+  assert(src, "Artículo no encontrado.", 404);
+
+  const newCode = await generateArticleCode(jewelryId);
+
+  const newArticleId = await prisma.$transaction(async (tx) => {
+    const created = await tx.article.create({
+      data: {
+        jewelry: { connect: { id: jewelryId } },
+        ...(src!.categoryId          ? { category:          { connect: { id: src!.categoryId } } } : {}),
+        ...(src!.preferredSupplierId ? { preferredSupplier: { connect: { id: src!.preferredSupplierId } } } : {}),
+        code:           newCode,
+        name:           `${src!.name} (Copia)`,
+        description:    src!.description,
+        articleType:    src!.articleType,
+        status:         "DRAFT",
+        stockMode:      src!.stockMode,
+        sku:            "",
+        barcode:        null,
+        barcodeType:    src!.barcodeType,
+        barcodeSource:  "CUSTOM",
+        brand:          src!.brand,
+        manufacturer:   src!.manufacturer,
+        supplierCode:   src!.supplierCode,
+        salePrice:           src!.salePrice,
+        useManualSalePrice:  src!.useManualSalePrice,
+        mermaPercent:        src!.mermaPercent,
+        manualAdjustmentKind:  src!.manualAdjustmentKind,
+        manualAdjustmentType:  src!.manualAdjustmentType,
+        manualAdjustmentValue: src!.manualAdjustmentValue,
+        manualTaxIds:          src!.manualTaxIds,
+        commercialMode:        src!.commercialMode,
+        comboAdjustmentKind:   src!.comboAdjustmentKind,
+        comboAdjustmentValue:  src!.comboAdjustmentValue,
+        sellWithoutVariants:   src!.sellWithoutVariants,
+        isReturnable:  src!.isReturnable,
+        showInStore:   src!.showInStore,
+        unitOfMeasure: src!.unitOfMeasure,
+        reorderPoint:  src!.reorderPoint,
+        dimensionLength: src!.dimensionLength,
+        dimensionWidth:  src!.dimensionWidth,
+        dimensionHeight: src!.dimensionHeight,
+        dimensionUnit:   src!.dimensionUnit,
+        weight:          src!.weight,
+        weightUnit:      src!.weightUnit,
+        minSaleQuantity: src!.minSaleQuantity,
+        maxSaleQuantity: src!.maxSaleQuantity,
+        defaultQuantity: src!.defaultQuantity,
+        inventoryAccount: src!.inventoryAccount,
+        mainImageUrl:     src!.mainImageUrl,
+        isFavorite:       false,
+        notes:            src!.notes,
+      },
+      select: { id: true },
+    });
+
+    if (src!.costComposition.length > 0) {
+      await tx.articleCostLine.createMany({
+        data: src!.costComposition.map((l, idx) => ({
+          articleId:        created.id,
+          jewelryId,
+          type:             l.type,
+          label:            l.label,
+          quantity:         l.quantity,
+          unitValue:        l.unitValue,
+          currencyId:       l.currencyId,
+          mermaPercent:     l.mermaPercent,
+          metalVariantId:   l.metalVariantId,
+          catalogItemId:    l.catalogItemId,
+          catalogVariantId: l.catalogVariantId,
+          lineAdjKind:      l.lineAdjKind,
+          lineAdjType:      l.lineAdjType,
+          lineAdjValue:     l.lineAdjValue,
+          sortOrder:        l.sortOrder ?? idx,
+          affectsStock:     l.affectsStock,
+        })),
+      });
+    }
+
+    if (src!.attributeValues.length > 0) {
+      await tx.articleAttributeValue.createMany({
+        data: src!.attributeValues.map((av) => ({
+          articleId:    created.id,
+          jewelryId,
+          assignmentId: av.assignmentId,
+          value:        av.value,
+        })),
+      });
+    }
+
+    if (src!.images.length > 0) {
+      await tx.articleImage.createMany({
+        data: src!.images.map((im) => ({
+          articleId: created.id,
+          jewelryId,
+          url:       im.url,
+          label:     im.label,
+          isMain:    im.isMain,
+          sortOrder: im.sortOrder,
+        })),
+      });
+    }
+
+    // Variantes — el unique de variant es (articleId, code), y el articleId es
+    // nuevo, así que reusar el `code` del original NO colisiona. `sku` y
+    // `barcode` se resetean (barcode es único por tenant).
+    for (const v of src!.variants) {
+      const newVariant = await tx.articleVariant.create({
+        data: {
+          articleId:       created.id,
+          jewelryId,
+          code:            v.code,
+          name:            v.name,
+          sku:             "",
+          barcode:         null,
+          barcodeType:     v.barcodeType,
+          barcodeSource:   "CUSTOM",
+          weightOverride:  v.weightOverride,
+          reorderPoint:    v.reorderPoint,
+          openingStock:    null,
+          minSaleQuantity: v.minSaleQuantity,
+          maxSaleQuantity: v.maxSaleQuantity,
+          defaultQuantity: v.defaultQuantity,
+          imageUrl:        v.imageUrl,
+          notes:           v.notes,
+          isActive:        v.isActive,
+          isFavorite:      v.isFavorite,
+          sortOrder:       v.sortOrder,
+        },
+        select: { id: true },
+      });
+
+      if (v.attributeValues.length > 0) {
+        await tx.articleVariantAttributeValue.createMany({
+          data: v.attributeValues.map((av) => ({
+            variantId:    newVariant.id,
+            jewelryId,
+            assignmentId: av.assignmentId,
+            value:        av.value,
+          })),
+        });
+      }
+
+      if (v.images.length > 0) {
+        await tx.articleVariantImage.createMany({
+          data: v.images.map((im) => ({
+            variantId: newVariant.id,
+            articleId: created.id,
+            jewelryId,
+            url:       im.url,
+            label:     im.label,
+            isMain:    im.isMain,
+            sortOrder: im.sortOrder,
+          })),
+        });
+      }
+    }
+
+    return created.id;
+  });
+
+  // Grupo comercial — fuera de la transacción porque assignGroupToArticle
+  // usa el cliente prisma global, no `tx`. Se replica el grupo del original
+  // si existía.
+  const sourceGroupId = src!.groupItems[0]?.groupId ?? null;
+  if (sourceGroupId) {
+    await assignGroupToArticle(newArticleId, sourceGroupId, jewelryId);
+  }
+
+  return getArticle(newArticleId, jewelryId);
 }
 
 // ===========================================================================
@@ -1926,88 +2485,299 @@ export async function toggleFavorite(articleId: string, jewelryId: string) {
 }
 
 // ===========================================================================
+// Bulk update (activar / desactivar / favorito / categoría / grupo / tienda / devoluciones / variantes)
+// ===========================================================================
+export async function bulkUpdateArticles(
+  jewelryId: string,
+  ids: string[],
+  data: {
+    isActive?: boolean;
+    isFavorite?: boolean;
+    categoryId?: string;
+    showInStore?: boolean;
+    isReturnable?: boolean;
+    sellWithoutVariants?: boolean;
+  },
+) {
+  if (!ids.length || Object.keys(data).length === 0) return { updated: 0 };
+
+  // Validar que categoryId pertenece al mismo tenant
+  if (data.categoryId) {
+    const cat = await prisma.articleCategory.findFirst({
+      where: { id: data.categoryId, jewelryId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!cat) {
+      const e: any = new Error("Categoría no encontrada o no pertenece a este tenant.");
+      e.status = 400; throw e;
+    }
+  }
+
+  const result = await prisma.article.updateMany({
+    where: { id: { in: ids }, jewelryId, deletedAt: null },
+    data,
+  });
+  return { updated: result.count };
+}
+
+// ===========================================================================
+// Bulk hechura update
+// ===========================================================================
+export type BulkHechuraAdjType = "PERCENTAGE" | "FIXED";
+export type BulkHechuraDirection = "ADD" | "SUBTRACT";
+export type BulkHechuraScope = "ARTICLE" | "VARIANTS" | "BOTH";
+
+export interface BulkHechuraParams {
+  adjustType: BulkHechuraAdjType;
+  direction: BulkHechuraDirection;
+  value: number;         // porcentaje (0-100) o monto fijo positivo
+  scope: BulkHechuraScope;
+  preview?: boolean;
+  // Para ajuste FIXED: solo aplica a líneas de costo cuya moneda coincida (null = moneda base).
+  currencyId?: string;
+  // Filtros de selección
+  ids?: string[];         // IDs de artículos explícitos
+  categoryId?: string;
+  brand?: string;         // filtro por marca (valor único)
+  manufacturer?: string;
+  groupId?: string;
+  metalIds?: string[];    // filtro por metal padre (multi)
+  metalVariantIds?: string[]; // filtro por variante de metal (multi)
+  preferredSupplierId?: string; // filtro por proveedor preferido (valor único)
+  onlyActive?: boolean;
+  onlyFavorite?: boolean;
+  // Exclusiones manuales desde el preview del frontend
+  excludedArticleIds?:  string[];
+  excludedVariantIds?:  string[];
+  excludedCostLineIds?: string[];
+}
+
+export interface BulkHechuraPreviewItem {
+  articleId: string;
+  articleName: string;
+  articleSku?: string;
+  kind: "cost_line";
+  variantId?: string;
+  variantName?: string;
+  variantSku?: string;
+  costLineId?: string;
+  costLineLabel?: string;
+  costLineCurrencyCode?: string;   // código de moneda de la línea (null = moneda base)
+  oldValue: number | null;
+  newValue: number | null;
+  /** true cuando el ajuste es FIXED y la moneda de la línea no coincide con currencyId */
+  currencyMismatch?: boolean;
+}
+
+export interface BulkHechuraResult {
+  preview: boolean;
+  articlesUpdated: number;
+  variantsUpdated: number;
+  items?: BulkHechuraPreviewItem[];
+}
+
+export async function bulkUpdateHechura(
+  jewelryId: string,
+  params: BulkHechuraParams,
+): Promise<BulkHechuraResult> {
+  const {
+    adjustType, direction, value, scope, preview = false,
+    currencyId,
+    ids, categoryId, brand, manufacturer, groupId,
+    metalIds, metalVariantIds, preferredSupplierId,
+    onlyActive, onlyFavorite,
+    excludedArticleIds, excludedVariantIds, excludedCostLineIds,
+  } = params;
+
+  const exArticles  = new Set(excludedArticleIds  ?? []);
+  const exVariants  = new Set(excludedVariantIds   ?? []);
+  const exCostLines = new Set(excludedCostLineIds  ?? []);
+
+  assert(["PERCENTAGE", "FIXED"].includes(adjustType), "adjustType inválido.");
+  assert(["ADD", "SUBTRACT"].includes(direction), "direction inválido.");
+  assert(["ARTICLE", "VARIANTS", "BOTH"].includes(scope), "scope inválido.");
+  assert(value != null && isFinite(value) && value >= 0, "value debe ser un número no negativo.");
+
+  // ---------- construir WHERE de artículo ----------
+  const articleWhere: Prisma.ArticleWhereInput = {
+    jewelryId,
+    deletedAt: null,
+    ...(ids?.length          && { id:                 { in: ids } }),
+    ...(categoryId           && { categoryId }),
+    ...(brand                && { brand }),
+    ...(manufacturer         && { manufacturer }),
+    ...(groupId              && { groupId }),
+    ...(preferredSupplierId  && { preferredSupplierId }),
+    ...(onlyActive           && { isActive: true }),
+    ...(onlyFavorite         && { isFavorite: true }),
+  };
+
+  // Filtro por metal / variante de metal
+  if (metalIds?.length || metalVariantIds?.length) {
+    const costLineWhere: Prisma.ArticleCostLineWhereInput = {};
+    if (metalVariantIds?.length)   costLineWhere.metalVariantId = { in: metalVariantIds };
+    else if (metalIds?.length)     costLineWhere.metalVariant   = { metalId: { in: metalIds } };
+    articleWhere.costComposition = { some: costLineWhere };
+  }
+
+  // ---------- cargar artículos afectados ----------
+  const articles = await prisma.article.findMany({
+    where: articleWhere,
+    select: {
+      id: true,
+      name: true,
+      sku: true,
+      costComposition: {
+        where: { type: "HECHURA" },
+        select: {
+          id: true,
+          label: true,
+          unitValue: true,
+          currencyId: true,
+          currency: { select: { code: true } },
+        },
+      },
+    },
+  });
+
+  // ---------- calcular nuevos valores ----------
+  const sign = direction === "ADD" ? 1 : -1;
+
+  function applyAdjust(current: number | null): number | null {
+    if (current == null) return null;  // no tocar nulos
+    let next: number;
+    if (adjustType === "PERCENTAGE") {
+      next = current + sign * current * (value / 100);
+    } else {
+      next = current + sign * value;
+    }
+    return Math.max(0, Math.round(next * 10000) / 10000); // 4 decimales, nunca negativo
+  }
+
+  const previewItems: BulkHechuraPreviewItem[] = [];
+  let articlesUpdated = 0;
+  let variantsUpdated = 0;
+
+  for (const art of articles) {
+    const hechuraLines: Array<{ id: string; label: string; unitValue: any; currencyId: string | null; currency: { code: string } | null }> =
+      (art as any).costComposition ?? [];
+
+    if (scope === "ARTICLE" || scope === "BOTH") {
+      // — 1. Líneas de costo tipo HECHURA (sistema nuevo, tiene prioridad)
+      if (hechuraLines.length > 0) {
+        for (const line of hechuraLines) {
+          const oldVal = parseFloat(line.unitValue.toString());
+          const lineCurrencyId = line.currencyId ?? null;
+          const lineCurrencyCode = line.currency?.code ?? null;
+
+          // Para FIXED: solo tocar líneas cuya moneda coincida con currencyId solicitado.
+          // null en ambos = moneda base → coinciden.
+          const isCurrencyMismatch =
+            adjustType === "FIXED" &&
+            lineCurrencyId !== (currencyId ?? null);
+
+          if (preview) {
+            previewItems.push({
+              articleId: art.id, articleName: art.name,
+              articleSku: (art as any).sku ?? undefined,
+              kind: "cost_line",
+              costLineId: line.id,
+              costLineLabel: line.label || "Hechura",
+              costLineCurrencyCode: lineCurrencyCode ?? undefined,
+              oldValue: isCurrencyMismatch ? null : oldVal,
+              newValue: isCurrencyMismatch ? null : applyAdjust(oldVal),
+              currencyMismatch: isCurrencyMismatch || undefined,
+            });
+          } else if (!isCurrencyMismatch && !exCostLines.has(line.id)) {
+            const newVal = applyAdjust(oldVal);
+            if (newVal !== null) {
+              await prisma.articleCostLine.update({
+                where: { id: line.id },
+                data: { unitValue: newVal },
+              });
+              articlesUpdated++;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (preview) {
+    return { preview: true, articlesUpdated: 0, variantsUpdated: 0, items: previewItems };
+  }
+  return { preview: false, articlesUpdated, variantsUpdated };
+}
+
+// ===========================================================================
 // Soft delete
 // ===========================================================================
 export async function deleteArticle(articleId: string, jewelryId: string) {
   await assertArticleOwnership(articleId, jewelryId);
-  await prisma.article.update({
-    where: { id: articleId },
-    data: { deletedAt: new Date(), isActive: false },
+  const now = new Date();
+  await prisma.$transaction(async (tx) => {
+    // Pre-consultar variantes para limpiar ArticleGroupItem de tipo VARIANT
+    const variants = await tx.articleVariant.findMany({
+      where: { articleId, deletedAt: null },
+      select: { id: true },
+    });
+    const variantIds = variants.map((v) => v.id);
+
+    // Limpiar grupos: items de tipo ARTICLE y de tipo VARIANT
+    await tx.articleGroupItem.deleteMany({ where: { articleId } });
+    if (variantIds.length > 0) {
+      await tx.articleGroupItem.deleteMany({ where: { variantId: { in: variantIds } } });
+    }
+
+    // Cascade soft-delete variantes
+    await tx.articleVariant.updateMany({
+      where: { articleId, deletedAt: null },
+      data: { deletedAt: now, isActive: false },
+    });
+    // Soft-delete artículo
+    await tx.article.update({
+      where: { id: articleId },
+      data: { deletedAt: now, isActive: false },
+    });
   });
   return { id: articleId };
 }
 
-// ===========================================================================
-// Compositions
-// ===========================================================================
-const COMPOSITION_SELECT = {
-  id: true,
-  variantId: true,
-  grams: true,
-  isBase: true,
-  sortOrder: true,
-  createdAt: true,
-  metalVariant: {
-    select: {
-      id: true, name: true, sku: true, purity: true,
-      metal: { select: { id: true, name: true } },
-    },
-  },
-} as const;
-
-export async function listCompositions(articleId: string, jewelryId: string) {
-  await assertArticleOwnership(articleId, jewelryId);
-  return prisma.articleMetalComposition.findMany({
-    where: { articleId },
-    select: COMPOSITION_SELECT,
-    orderBy: [{ sortOrder: "asc" as const }, { createdAt: "asc" as const }],
+export async function bulkDeleteArticles(jewelryId: string, ids: string[]) {
+  if (!ids.length) return { deleted: 0, variantsDeleted: 0 };
+  // Verificar pertenencia al tenant antes de borrar
+  const owned = await prisma.article.findMany({
+    where: { id: { in: ids }, jewelryId, deletedAt: null },
+    select: { id: true },
   });
-}
+  const ownedIds = owned.map((a) => a.id);
+  if (!ownedIds.length) return { deleted: 0, variantsDeleted: 0 };
 
-export async function upsertComposition(articleId: string, jewelryId: string, data: any) {
-  await assertArticleOwnership(articleId, jewelryId);
+  const now = new Date();
+  let variantsDeletedCount = 0;
+  await prisma.$transaction(async (tx) => {
+    const variants = await tx.articleVariant.findMany({
+      where: { articleId: { in: ownedIds }, deletedAt: null },
+      select: { id: true },
+    });
+    const variantIds = variants.map((v) => v.id);
 
-  const variantId = s(data?.variantId);
-  assert(variantId, "variantId es obligatorio.");
-  assert(data?.grams != null, "grams es obligatorio.");
-
-  const variant = await prisma.metalVariant.findFirst({
-    where: { id: variantId, deletedAt: null }, select: { id: true },
-  });
-  assert(variant, "Variante de metal no encontrada.");
-
-  const isBase = !!data?.isBase;
-
-  return prisma.$transaction(async (tx) => {
-    if (isBase) {
-      await tx.articleMetalComposition.updateMany({
-        where: { articleId, id: { not: undefined } },
-        data: { isBase: false },
-      });
+    await tx.articleGroupItem.deleteMany({ where: { articleId: { in: ownedIds } } });
+    if (variantIds.length > 0) {
+      await tx.articleGroupItem.deleteMany({ where: { variantId: { in: variantIds } } });
     }
-    return tx.articleMetalComposition.upsert({
-      where: { articleId_variantId: { articleId, variantId } },
-      create: {
-        articleId, jewelryId, variantId, grams: data.grams, isBase,
-        sortOrder: typeof data?.sortOrder === "number" ? data.sortOrder : 0,
-      },
-      update: {
-        grams: data.grams, isBase,
-        sortOrder: typeof data?.sortOrder === "number" ? data.sortOrder : undefined,
-      },
-      select: COMPOSITION_SELECT,
+
+    const varResult = await tx.articleVariant.updateMany({
+      where: { articleId: { in: ownedIds }, deletedAt: null },
+      data: { deletedAt: now, isActive: false },
+    });
+    variantsDeletedCount = varResult.count;
+    await tx.article.updateMany({
+      where: { id: { in: ownedIds } },
+      data: { deletedAt: now, isActive: false },
     });
   });
-}
-
-export async function removeComposition(articleId: string, compositionId: string, jewelryId: string) {
-  await assertArticleOwnership(articleId, jewelryId);
-  const comp = await prisma.articleMetalComposition.findFirst({
-    where: { id: compositionId, articleId }, select: { id: true },
-  });
-  assert(comp, "Composición no encontrada.");
-  await prisma.articleMetalComposition.delete({ where: { id: compositionId } });
-  return { id: compositionId };
+  return { deleted: ownedIds.length, variantsDeleted: variantsDeletedCount };
 }
 
 // ===========================================================================
@@ -2042,6 +2812,9 @@ export async function createVariant(articleId: string, jewelryId: string, data: 
   });
   assert(article?.articleType !== "SERVICE",
     "Los servicios no pueden tener variantes. Creá artículos de tipo SERVICE separados si necesitás diferenciación.");
+
+  // Regla defensiva: las variantes heredan precio/costo del padre (solo weightOverride permitido)
+  assertNoVariantPricingOverrides(data);
 
   const code = s(data?.code);
   assert(code, "El código de variante es obligatorio.");
@@ -2092,11 +2865,11 @@ export async function createVariant(articleId: string, jewelryId: string, data: 
       barcodeType,
       barcodeSource:       varBarcodeSource,
       weightOverride:      data?.weightOverride != null ? data.weightOverride : null,
-      hechuraPriceOverride: data?.hechuraPriceOverride != null ? data.hechuraPriceOverride : null,
-      priceOverride:       data?.priceOverride != null ? data.priceOverride : null,
-      costPrice:           data?.costPrice != null ? data.costPrice : null,
       reorderPoint:        data?.reorderPoint != null ? data.reorderPoint : null,
       openingStock:        data?.openingStock != null ? data.openingStock : null,
+      minSaleQuantity:     data?.minSaleQuantity != null ? data.minSaleQuantity : null,
+      maxSaleQuantity:     data?.maxSaleQuantity != null ? data.maxSaleQuantity : null,
+      defaultQuantity:     data?.defaultQuantity != null ? data.defaultQuantity : null,
       imageUrl:            s(data?.imageUrl),
       notes:               s(data?.notes),
       sortOrder:           typeof data?.sortOrder === "number" ? data.sortOrder : 0,
@@ -2107,6 +2880,10 @@ export async function createVariant(articleId: string, jewelryId: string, data: 
 
 export async function updateVariant(articleId: string, variantId: string, jewelryId: string, data: any) {
   await assertArticleOwnership(articleId, jewelryId);
+
+  // Regla defensiva: las variantes heredan precio/costo del padre (solo weightOverride permitido)
+  assertNoVariantPricingOverrides(data);
+
   const variant = await prisma.articleVariant.findFirst({
     where: { id: variantId, articleId, deletedAt: null },
     select: { id: true, barcodeSource: true, code: true, sku: true },
@@ -2164,10 +2941,10 @@ export async function updateVariant(articleId: string, variantId: string, jewelr
       barcodeType:         vNeedsBarcodeResolve ? vBarcodeType : undefined,
       barcodeSource:       vBarcodeSource,
       weightOverride:      data?.weightOverride !== undefined ? (data.weightOverride ?? null) : undefined,
-      hechuraPriceOverride: data?.hechuraPriceOverride !== undefined ? (data.hechuraPriceOverride ?? null) : undefined,
-      priceOverride:       data?.priceOverride !== undefined ? (data.priceOverride ?? null) : undefined,
-      costPrice:           data?.costPrice !== undefined ? (data.costPrice ?? null) : undefined,
       reorderPoint:        data?.reorderPoint !== undefined ? (data.reorderPoint ?? null) : undefined,
+      minSaleQuantity:     data?.minSaleQuantity !== undefined ? (data.minSaleQuantity ?? null) : undefined,
+      maxSaleQuantity:     data?.maxSaleQuantity !== undefined ? (data.maxSaleQuantity ?? null) : undefined,
+      defaultQuantity:     data?.defaultQuantity !== undefined ? (data.defaultQuantity ?? null) : undefined,
       imageUrl:            data?.imageUrl !== undefined ? s(data.imageUrl) : undefined,
       notes:               data?.notes !== undefined ? s(data.notes) : undefined,
       ...(typeof data?.sortOrder === "number" ? { sortOrder: data.sortOrder } : {}),
@@ -2196,10 +2973,13 @@ export async function removeVariant(articleId: string, variantId: string, jewelr
     where: { id: variantId, articleId, deletedAt: null }, select: { id: true },
   });
   assert(variant, "Variante no encontrada.");
-  await prisma.articleVariant.update({
-    where: { id: variantId },
-    data: { deletedAt: new Date(), isActive: false },
-  });
+  await prisma.$transaction([
+    prisma.articleGroupItem.deleteMany({ where: { variantId } }),
+    prisma.articleVariant.update({
+      where: { id: variantId },
+      data: { deletedAt: new Date(), isActive: false },
+    }),
+  ]);
   return { id: variantId };
 }
 
@@ -2465,57 +3245,13 @@ export async function updateVariantImageLabel(
 }
 
 // ===========================================================================
-// Stock helpers internos
+// Stock helpers — delegados al motor central (src/lib/stock-engine.ts)
 // ===========================================================================
-async function findStock(
-  tx: Prisma.TransactionClient,
-  key: { jewelryId: string; warehouseId: string; articleId: string; variantId: string | null }
-) {
-  return tx.articleStock.findFirst({
-    where: {
-      jewelryId: key.jewelryId,
-      warehouseId: key.warehouseId,
-      articleId: key.articleId,
-      variantId: key.variantId ?? null,
-    },
-    select: { id: true, quantity: true, reservedQty: true },
-  });
-}
+// El motor central es la ÚNICA fuente autorizada para modificar ArticleStock.
+// Estos alias mantienen compatibilidad con el código existente en este archivo.
 
-export async function applyStockDelta(
-  tx: Prisma.TransactionClient,
-  params: {
-    jewelryId: string;
-    warehouseId: string;
-    articleId: string;
-    variantId: string | null;
-    delta: number | Prisma.Decimal;
-    preventNegative?: boolean;
-  }
-): Promise<void> {
-  const { jewelryId, warehouseId, articleId, variantId, preventNegative = false } = params;
-  const delta = new Prisma.Decimal(params.delta.toString());
-  const existing = await findStock(tx, { jewelryId, warehouseId, articleId, variantId });
-
-  if (existing) {
-    const newQty = existing.quantity.add(delta);
-    if (preventNegative) {
-      assert(newQty.gte(0),
-        `Stock insuficiente. Disponible: ${existing.quantity.toFixed(4)}, solicitado: ${delta.abs().toFixed(4)}.`
-      );
-    }
-    await tx.articleStock.update({ where: { id: existing.id }, data: { quantity: newQty } });
-  } else {
-    if (preventNegative) {
-      assert(delta.gte(0),
-        `Stock insuficiente. No hay stock registrado y se quiere descontar ${delta.abs().toFixed(4)}.`
-      );
-    }
-    await tx.articleStock.create({
-      data: { jewelryId, warehouseId, articleId, variantId: variantId ?? null, quantity: delta },
-    });
-  }
-}
+const findStock    = engineFindStock;
+export const applyStockDelta = engineApplyStockDelta;
 
 // ===========================================================================
 // Stock (BY_ARTICLE) — read
@@ -2533,6 +3269,14 @@ const STOCK_SELECT = {
 
 export async function getStock(articleId: string, jewelryId: string) {
   await assertArticleOwnership(articleId, jewelryId);
+  const article = await prisma.article.findUnique({
+    where:  { id: articleId },
+    select: { stockMode: true, articleType: true },
+  });
+  assert(article?.articleType !== "SERVICE",
+    "Los servicios no tienen stock.");
+  assert(article?.stockMode === "BY_ARTICLE",
+    "Este artículo no tiene modo de stock BY_ARTICLE.");
   return prisma.articleStock.findMany({
     where: { articleId, jewelryId },
     select: STOCK_SELECT,
@@ -2563,25 +3307,40 @@ export async function adjustStock(
   assert(data?.quantity != null, "quantity es obligatoria.");
 
   const warehouse = await prisma.warehouse.findFirst({
-    where: { id: data.warehouseId, jewelryId, deletedAt: null }, select: { id: true },
+    where: { id: data.warehouseId, jewelryId, deletedAt: null, isActive: true }, select: { id: true },
   });
-  assert(warehouse, "Almacén no encontrado.");
+  assert(warehouse, "Almacén no encontrado o inactivo.");
 
-  const variantId = data?.variantId ?? null;
-  const newQty = new Prisma.Decimal(data.quantity.toString());
+  // Validar coherencia variantId ↔ variantes activas del artículo
+  const variantCount = await prisma.articleVariant.count({
+    where: { articleId, deletedAt: null, isActive: true },
+  });
+  if (variantCount > 0) {
+    assert(data?.variantId, "El artículo tiene variantes activas. Especificá la variante (variantId).");
+    const variant = await prisma.articleVariant.findFirst({
+      where: { id: data.variantId!, articleId, jewelryId, deletedAt: null, isActive: true },
+      select: { id: true },
+    });
+    assert(variant, "Variante no encontrada, inactiva o no pertenece al artículo.");
+  } else {
+    assert(!data?.variantId, "El artículo no tiene variantes activas. No se debe especificar variantId.");
+  }
+
+  const variantId  = data?.variantId ?? null;
+  const targetQty  = new Prisma.Decimal(data.quantity.toString());
 
   return prisma.$transaction(async (tx) => {
-    const existing = await findStock(tx, { jewelryId, warehouseId: data.warehouseId, articleId, variantId });
+    const existing   = await findStock(tx, { jewelryId, warehouseId: data.warehouseId, articleId, variantId });
     const currentQty = existing?.quantity ?? new Prisma.Decimal(0);
-    const delta = newQty.sub(currentQty);
+    const delta      = targetQty.sub(currentQty);
 
     if (!delta.equals(0)) {
       const count = await tx.articleMovement.count({ where: { jewelryId, kind: "ADJUST" } });
-      const code = `AA-${String(count + 1).padStart(4, "0")}`;
+      const code  = `AA-${String(count + 1).padStart(4, "0")}`;
       await tx.articleMovement.create({
         data: {
-          jewelryId, kind: "ADJUST", code,
-          note: s(data?.note || "Ajuste manual de stock"),
+          jewelryId, kind: "ADJUST", code, status: "CONFIRMED", sourceType: "MANUAL",
+          note:        s(data?.note || "Ajuste manual de stock"),
           effectiveAt: new Date(),
           warehouseId: data.warehouseId,
           createdById: userId || null,
@@ -2590,21 +3349,34 @@ export async function adjustStock(
           },
         },
       });
+      await applyStockDelta(tx, { jewelryId, warehouseId: data.warehouseId, articleId, variantId, delta });
     }
 
-    if (existing) {
-      return tx.articleStock.update({
-        where: { id: existing.id },
-        data: { quantity: newQty },
-        select: STOCK_SELECT,
-      });
-    } else {
-      return tx.articleStock.create({
-        data: { articleId, variantId: variantId ?? null, warehouseId: data.warehouseId, jewelryId, quantity: newQty },
-        select: STOCK_SELECT,
-      });
-    }
+    return tx.articleStock.findFirst({
+      where:  { articleId, jewelryId, warehouseId: data.warehouseId, variantId },
+      select: STOCK_SELECT,
+    });
   });
+}
+
+// ===========================================================================
+// recalcStock — reconstruye ArticleStock desde los movimientos CONFIRMED
+// ===========================================================================
+export async function recalcStock(articleId: string, jewelryId: string): Promise<{ rebuilt: number }> {
+  await assertArticleOwnership(articleId, jewelryId);
+  const article = await prisma.article.findUnique({
+    where:  { id: articleId },
+    select: { stockMode: true, articleType: true },
+  });
+  assert(article?.articleType !== "SERVICE", "Los servicios no tienen stock.");
+  assert(article?.stockMode === "BY_ARTICLE", "Este artículo no tiene modo de stock BY_ARTICLE.");
+
+  await prisma.$transaction(async (tx) => {
+    await recalcArticleStock(tx, articleId, jewelryId);
+  });
+
+  const rebuilt = await prisma.articleStock.count({ where: { articleId, jewelryId } });
+  return { rebuilt };
 }
 
 // ===========================================================================
@@ -2618,11 +3390,12 @@ async function _calcMaterialAvailabilityInternal(
   art: {
     stockMode: string;
     mermaPercent: any;
-    compositions: Array<{ variantId: string; grams: any; metalVariant: { id: string; name: string } }>;
+    costComposition: Array<{ metalVariantId: string | null; quantity: any; metalVariant: { id: string; name: string } | null }>;
     category: { mermaPercent: any } | null;
   }
 ) {
-  if (art.stockMode !== "BY_MATERIAL" || art.compositions.length === 0) {
+  const metalLines = art.costComposition.filter((l) => l.metalVariantId != null);
+  if (art.stockMode !== "BY_MATERIAL" || metalLines.length === 0) {
     return { articleId, stockMode: art.stockMode, byWarehouse: [], totalFabricable: 0 };
   }
 
@@ -2641,7 +3414,7 @@ async function _calcMaterialAvailabilityInternal(
     where: { jewelryId, deletedAt: null, isActive: true }, select: { id: true, name: true },
   });
 
-  const variantIds = art.compositions.map((c) => c.variantId);
+  const variantIds = metalLines.map((l) => l.metalVariantId as string);
   const stocks = await prisma.warehouseStock.findMany({
     where: { jewelryId, variantId: { in: variantIds } },
     select: { warehouseId: true, variantId: true, grams: true },
@@ -2657,15 +3430,16 @@ async function _calcMaterialAvailabilityInternal(
     let minUnits = Infinity;
     let bottleneckVariantId: string | null = null;
     let bottleneckVariantName: string | null = null;
-    for (const comp of art.compositions) {
-      const available = stockMap[wh.id]?.[comp.variantId] ?? new Prisma.Decimal(0);
-      const gramsNeeded = new Prisma.Decimal(comp.grams.toString()).mul(mermaFactor);
+    for (const line of metalLines) {
+      const variantId = line.metalVariantId as string;
+      const available = stockMap[wh.id]?.[variantId] ?? new Prisma.Decimal(0);
+      const gramsNeeded = new Prisma.Decimal(line.quantity?.toString() ?? "0").mul(mermaFactor);
       if (gramsNeeded.equals(0)) continue;
       const units = Math.floor(available.div(gramsNeeded).toNumber());
       if (units < minUnits) {
         minUnits = units;
-        bottleneckVariantId = comp.variantId;
-        bottleneckVariantName = comp.metalVariant.name;
+        bottleneckVariantId = variantId;
+        bottleneckVariantName = line.metalVariant?.name ?? null;
       }
     }
     const fabricable = minUnits === Infinity ? 0 : minUnits;
@@ -2692,9 +3466,10 @@ export async function calcMaterialAvailability(
     where: { id: articleId, jewelryId, deletedAt: null },
     select: {
       id: true, stockMode: true, mermaPercent: true,
-      compositions: {
+      costComposition: {
+        where: { type: "METAL" },
         select: {
-          variantId: true, grams: true,
+          metalVariantId: true, quantity: true,
           metalVariant: { select: { id: true, name: true } },
         },
       },
@@ -2707,7 +3482,8 @@ export async function calcMaterialAvailability(
   if (art.stockMode !== "BY_MATERIAL") {
     return { articleId, stockMode: art.stockMode, byWarehouse: [], totalFabricable: 0 };
   }
-  assert(art.compositions.length > 0, "El artículo no tiene composición metálica definida.");
+  const metalLines = art.costComposition.filter((l) => l.metalVariantId != null);
+  assert(metalLines.length > 0, "El artículo no tiene líneas de metal definidas en su costo.");
 
   const result = await _calcMaterialAvailabilityInternal(articleId, jewelryId, art as any);
 
@@ -2733,6 +3509,34 @@ export async function listBrands(jewelryId: string): Promise<string[]> {
     orderBy: { brand: "asc" },
   });
   return rows.map((r) => r.brand).filter(Boolean) as string[];
+}
+
+// ===========================================================================
+// listSkus — SKUs distintos del tenant (artículos + variantes)
+// ===========================================================================
+export async function listSkus(jewelryId: string): Promise<string[]> {
+  const [articleSkus, variantSkus] = await Promise.all([
+    prisma.article.findMany({
+      where: { jewelryId, deletedAt: null, sku: { not: "" } },
+      select: { sku: true },
+      distinct: ["sku"],
+      orderBy: { sku: "asc" },
+    }),
+    prisma.articleVariant.findMany({
+      where: {
+        article: { jewelryId, deletedAt: null },
+        sku: { not: "" },
+      },
+      select: { sku: true },
+      distinct: ["sku"],
+      orderBy: { sku: "asc" },
+    }),
+  ]);
+  const all = [
+    ...articleSkus.map((r) => r.sku),
+    ...variantSkus.map((r) => r.sku),
+  ].filter(Boolean) as string[];
+  return [...new Set(all)].sort();
 }
 
 // ===========================================================================
@@ -2773,6 +3577,9 @@ export type CostLineInput = {
   mermaPercent?: number | null;
   metalVariantId?: string | null;
   catalogItemId?: string | null;
+  /** FASE 2: variante específica del componente (PRODUCT/SERVICE). */
+  catalogVariantId?: string | null;
+  affectsStock?: boolean;
   sortOrder?: number;
   lineAdjKind?: string | null;
   lineAdjType?: string | null;
@@ -2798,8 +3605,19 @@ export async function setCostLines(
     }
   }
 
+  // Regla defensiva: servicios no aceptan METAL, metalVariantId, ni PRODUCT
+  // con affectsStock=true en su composición. HECHURA / SERVICE / MANUAL OK.
+  const currentType = await prisma.article.findUnique({
+    where: { id: articleId },
+    select: { articleType: true },
+  });
+  assertServiceArticleComposition(currentType?.articleType ?? "", null, lines);
+
+  // FASE 2: validar variantes referenciadas (existen, pertenecen al padre).
+  await validateCostLineVariants(jewelryId, lines);
+
   await prisma.$transaction(async (tx) => {
-    // Borrar líneas anteriores
+    // Borrar líneas anteriores del artículo
     await tx.articleCostLine.deleteMany({ where: { articleId, jewelryId } });
 
     // Crear nuevas líneas
@@ -2816,6 +3634,11 @@ export async function setCostLines(
           mermaPercent:   l.type === "METAL" ? (l.mermaPercent ?? null) : null,
           metalVariantId: l.type === "METAL" ? (l.metalVariantId ?? null) : null,
           catalogItemId:  l.catalogItemId ?? null,
+          catalogVariantId:
+            (l.type === "PRODUCT" || l.type === "SERVICE") && l.catalogItemId
+              ? (l.catalogVariantId ?? null)
+              : null,
+          affectsStock:   l.affectsStock ?? false,
           sortOrder:      l.sortOrder ?? idx,
           lineAdjKind:    l.lineAdjKind  ?? "",
           lineAdjType:    l.lineAdjType  ?? "",
@@ -2830,92 +3653,170 @@ export async function setCostLines(
 }
 
 // ===========================================================================
-// computePurchaseTaxes — impuestos de compra sobre el costo de un artículo
-// Usado por getPricingPreview para enriquecer el response con datos de costo.
+// previewCostLines — preview sin persistir, delega en el pricing-engine
+//
+// Recibe un conjunto de líneas (no necesariamente las persistidas), un ajuste
+// manual global opcional, y devuelve el costo calculado + el breakdown de
+// impuestos de compra sobre ese costo. Toda la aritmética vive en el motor:
+//   · calculateCostFromLines (cost.ts)  — costo
+//   · computePurchaseTaxes   (sale.ts)  — impuestos de compra
+//
+// Usos previstos: composición de costo en edición, CostosTab para valuar
+// líneas registradas vs. actuales con tasas vigentes.
 // ===========================================================================
-export type PurchaseTaxBreakdownItem = {
-  taxId:           string;
-  name:            string;
-  calculationType: string;
-  rate:            number | null;
-  fixedAmount:     number | null;
-  taxAmount:       number;
-};
-
-export type PurchaseTaxResult = {
-  costBase:         string | null;  // costo sin impuestos (formateado)
-  costTaxAmount:    string | null;  // suma de impuestos de compra
-  costWithTax:      string | null;  // costBase + costTaxAmount
-  costTaxBreakdown: PurchaseTaxBreakdownItem[];
-};
-
-export async function computePurchaseTaxes(
-  jewelryId: string,
+export async function previewCostLines(
   articleId: string,
-  costBaseDecimal: Prisma.Decimal | null,
-): Promise<PurchaseTaxResult> {
-  const empty: PurchaseTaxResult = {
-    costBase:         costBaseDecimal != null ? costBaseDecimal.toFixed(4) : null,
-    costTaxAmount:    null,
-    costWithTax:      costBaseDecimal != null ? costBaseDecimal.toFixed(4) : null,
-    costTaxBreakdown: [],
-  };
+  jewelryId: string,
+  input: {
+    lines: CostLineInput[];
+    manualAdjustment?: {
+      kind?: string | null;
+      type?: string | null;
+      value?: number | null;
+    };
+  },
+) {
+  await assertArticleOwnership(articleId, jewelryId);
 
-  if (costBaseDecimal == null) return empty;
-
-  // Leer manualTaxIds del artículo
-  const art = await prisma.article.findFirst({
-    where: { id: articleId, jewelryId, deletedAt: null },
-    select: { manualTaxIds: true },
-  });
-  if (!art || !art.manualTaxIds?.length) return empty;
-
-  // Cargar impuestos de compra (no recuperables)
-  const taxes = await prisma.tax.findMany({
-    where: {
-      id:                { in: art.manualTaxIds },
-      deletedAt:         null,
-      appliesOnPurchase: true,
-      isRecoverable:     false,
-    },
-    select: { id: true, name: true, rate: true, fixedAmount: true, calculationType: true },
-  });
-  if (!taxes.length) return empty;
-
-  // Aplicar cada impuesto y construir breakdown
-  const breakdown: PurchaseTaxBreakdownItem[] = [];
-  let totalTax = new Prisma.Decimal(0);
-
-  for (const t of taxes) {
-    const rate        = new Prisma.Decimal((t.rate ?? 0).toString());
-    const fixedAmt    = new Prisma.Decimal((t.fixedAmount ?? 0).toString());
-    let taxAmt        = new Prisma.Decimal(0);
-
-    if (t.calculationType === "PERCENTAGE") {
-      taxAmt = costBaseDecimal.mul(rate.div(100));
-    } else if (t.calculationType === "FIXED_AMOUNT") {
-      taxAmt = fixedAmt;
-    } else if (t.calculationType === "PERCENTAGE_PLUS_FIXED") {
-      taxAmt = costBaseDecimal.mul(rate.div(100)).add(fixedAmt);
-    }
-
-    totalTax = totalTax.add(taxAmt);
-    breakdown.push({
-      taxId:           t.id,
-      name:            t.name,
-      calculationType: t.calculationType,
-      rate:            t.rate != null ? t.rate.toNumber() : null,
-      fixedAmount:     t.fixedAmount != null ? t.fixedAmount.toNumber() : null,
-      taxAmount:       taxAmt.toNumber(),
-    });
+  const lines = Array.isArray(input?.lines) ? input.lines : [];
+  const VALID_TYPES = new Set(["METAL", "HECHURA", "PRODUCT", "SERVICE", "MANUAL"]);
+  for (const l of lines) {
+    assert(VALID_TYPES.has(l.type), `Tipo de línea inválido: ${l.type}`);
+    assert(l.quantity >= 0, "La cantidad no puede ser negativa.");
+    assert(l.unitValue >= 0, "El valor unitario no puede ser negativo.");
   }
 
-  const costWithTax = costBaseDecimal.add(totalTax);
+  const costResult = await calculateCostFromLines(
+    jewelryId,
+    lines as EngineCostLineInput[],
+    {
+      kind:  input?.manualAdjustment?.kind  ?? null,
+      type:  input?.manualAdjustment?.type  ?? null,
+      value: input?.manualAdjustment?.value ?? null,
+    },
+  );
+
+  const purchaseTaxes = await enginePurchaseTaxes(
+    jewelryId,
+    articleId,
+    costResult.value ?? null,
+  );
 
   return {
-    costBase:         costBaseDecimal.toFixed(4),
-    costTaxAmount:    totalTax.gt(0) ? totalTax.toFixed(4) : null,
-    costWithTax:      costWithTax.toFixed(4),
-    costTaxBreakdown: breakdown,
+    cost: {
+      value:       costResult.value != null ? costResult.value.toFixed(4) : null,
+      metalCost:   costResult.metalCost   != null ? costResult.metalCost.toFixed(4)   : null,
+      hechuraCost: costResult.hechuraCost != null ? costResult.hechuraCost.toFixed(4) : null,
+      totalGrams:  costResult.totalGrams  != null ? costResult.totalGrams.toFixed(4)  : null,
+      partial:     costResult.partial,
+      mode:        costResult.mode,
+    },
+    purchaseTaxes,
   };
+}
+
+// ===========================================================================
+// computePurchaseTaxes — re-export desde el pricing-engine
+//
+// La lógica vive en src/lib/pricing-engine/pricing-engine.sale.ts.
+// Mantenemos este re-export bajo el mismo nombre para compatibilidad con
+// articles.controller.ts. Todos los tipos también provienen del motor.
+// ===========================================================================
+export const computePurchaseTaxes = enginePurchaseTaxes;
+export type { PurchaseTaxBreakdownItem, PurchaseTaxResult };
+
+// ===========================================================================
+// Generic article tree search (for TPArticleScopeSelect)
+// ===========================================================================
+export async function searchArticlesTree(
+  q: string,
+  jewelryId: string,
+  opts: { articleTypes?: string[]; includeVariants?: boolean }
+) {
+  const includeVariants = opts.includeVariants !== false;
+  const typeFilter = opts.articleTypes && opts.articleTypes.length > 0
+    ? { articleType: { in: opts.articleTypes as any[] } }
+    : {};
+
+  const trimmed = q.trim();
+  const where: any = {
+    jewelryId,
+    deletedAt: null,
+    isActive: true,
+    ...typeFilter,
+    ...(trimmed ? {
+      OR: [
+        { name: { contains: trimmed, mode: "insensitive" } },
+        { code: { contains: trimmed, mode: "insensitive" } },
+        ...(includeVariants ? [
+          { variants: { some: { isActive: true, deletedAt: null, name: { contains: trimmed, mode: "insensitive" } } } },
+          { variants: { some: { isActive: true, deletedAt: null, code: { contains: trimmed, mode: "insensitive" } } } },
+          { variants: { some: { isActive: true, deletedAt: null, sku:  { contains: trimmed, mode: "insensitive" } } } },
+        ] : []),
+      ],
+    } : {}),
+  };
+
+  const articles = await prisma.article.findMany({
+    where,
+    select: {
+      id:           true,
+      name:         true,
+      code:         true,
+      mainImageUrl: true,
+      isActive:     true,
+      articleType:  true,
+      ...(includeVariants ? {
+        variants: {
+          where: { isActive: true, deletedAt: null },
+          select: { id: true, name: true, code: true, sku: true, imageUrl: true, isActive: true },
+          orderBy: { sortOrder: "asc" as const },
+        },
+      } : {}),
+    },
+    orderBy: { name: "asc" },
+    take: 40,
+  });
+
+  return articles.map((a: any) => ({
+    articleId:    a.id,
+    name:         a.name,
+    code:         a.code,
+    mainImageUrl: a.mainImageUrl || null,
+    isActive:     a.isActive,
+    articleType:  a.articleType,
+    hasVariants:  includeVariants ? (a.variants?.length > 0) : false,
+    variants:     includeVariants
+      ? (a.variants ?? []).map((v: any) => ({
+          variantId: v.id,
+          name:      v.name,
+          code:      v.code,
+          sku:       v.sku,
+          imageUrl:  v.imageUrl || null,
+          isActive:  v.isActive,
+        }))
+      : [],
+  }));
+}
+
+// ===========================================================================
+// Combo comercial — disponibilidad calculada según stock de componentes
+// ===========================================================================
+//
+// Devuelve cuántos combos pueden venderse según el stock de los componentes
+// (con `affectsStock=true`). Si se pasa `warehouseId`, calcula solo en ese
+// almacén; sin almacén suma el stock de todos los almacenes.
+//
+// Uso típico desde frontend:
+//   GET /api/articles/:id/combo-availability?warehouseId=...
+export async function getComboAvailability(
+  articleId: string,
+  jewelryId: string,
+  warehouseId?: string,
+) {
+  return computeComboAvailability(prisma, {
+    jewelryId,
+    articleId,
+    warehouseId: warehouseId || null,
+  });
 }

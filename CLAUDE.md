@@ -2,303 +2,449 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Communication preferences
+---
 
-- Always respond in Spanish.
-- The user is not a developer. Keep all explanations clear and simple.
+# 🧠 Communication preferences
 
-## Performance para dispositivos móviles (OBLIGATORIO)
+* Always respond in Spanish.
+* The user is not a developer. Keep all explanations clear and simple.
+
+---
+
+# 🚨 PRINCIPIO GLOBAL (CRÍTICO)
+
+👉 **“Si no sale del pricing-engine, está mal.”**
+
+---
+
+# 💰 Pricing / Totales (CRÍTICO ABSOLUTO)
+
+## 📜 Documento vinculante: `src/lib/pricing-engine/POLICY.md`
+
+`POLICY.md` es la **fuente de verdad conceptual** del motor comercial: rounding, snapshots, overrides, frontend lector puro, paridad simulador/factura/comparador, orden inmutable de capas y reproducibilidad histórica.
+
+Reglas:
+
+* Cualquier cambio de pricing (backend o frontend) debe **respetar** `POLICY.md`. Si no lo respeta, es bug.
+* **No** se agregan cálculos comerciales nuevos en frontend sin antes actualizar `POLICY.md` y obtener aprobación.
+* Si una pantalla nueva necesita una regla no contemplada, primero se actualiza `POLICY.md`, después se implementa.
+
+## Fuente única de verdad
+
+El único lugar donde se calculan:
+
+* precios
+* costos
+* descuentos
+* impuestos
+* canal de venta
+* cupones
+* formas de pago
+* redondeos
+* márgenes
+* totales de documentos
+* snapshots
+
+es:
+
+👉 `src/lib/pricing-engine/`
+
+El motor está partido por dominio (`pricing-engine.cost.ts`, `.sale.ts`, `.pricelist.ts`, `.channel.ts`, `.coupon.ts`, `.payment.ts`, `.currency.ts`, `.balance.ts`, `.document.ts`). **Importar siempre desde el barrel `pricing-engine.ts`**, nunca un archivo interno.
+
+Notas sobre los archivos menos obvios:
+
+* `.balance.ts` → arma el desglose metal/hechura (`buildBalanceBreakdownFromPrice`) usado en snapshots de balance.
+* `.document.ts` → arma el snapshot completo de documentos (`buildDocumentPricingSnapshot`); es lo que consumen las hooks de confirmación.
+
+Ver `src/lib/pricing-engine/README.md` para el contrato completo (orden de capas, reglas por tipo de ítem, snapshots).
+
+## Whitelist — quién puede importar el motor
+
+Solo estos módulos están autorizados a importar `pricing-engine`:
+
+`articles`, `sales`, `purchases`, `cross-settlements`, `dashboard`, `article-groups`, y futuros módulos de comprobantes/pagos/cuenta corriente (lectura de snapshots).
+
+Cualquier otro módulo que necesite un cálculo comercial debe pedirlo a uno de estos, **no** importar el motor por su cuenta.
+
+---
+
+## ❌ Prohibiciones
+
+Está PROHIBIDO:
+
+* Calcular precios en controllers
+* Calcular precios en services (excepto orquestación)
+* Calcular precios en helpers
+* Calcular precios en frontend
+* Usar valores del request como verdad
+* Persistir totales sin recalcular desde el motor
+
+---
+
+## 📊 Regla crítica: totales de documentos
+
+El backend/pricing-engine es la única fuente de verdad para:
+
+* subtotal
+* discountAmount
+* taxAmount
+* total
+* redondeos
+* margen
+* snapshots
+
+El frontend puede mostrar totales, pero nunca son autoridad.
+
+Si el frontend envía:
+
+* subtotal
+* discountAmount
+* taxAmount
+* total
+
+👉 el backend debe ignorarlos completamente y recalcular desde el pricing-engine.
+
+👉 El backend puede loggear discrepancias, pero nunca confiar en esos valores.
+
+---
+
+## 🔄 Flujo de cálculo (orden obligatorio)
+
+El orden SIEMPRE debe ser:
+
+1. Costo
+2. Lista de precios / precio manual
+3. Promoción
+4. Descuento por cantidad
+5. Canal de venta
+6. Cupón
+7. Forma de pago
+8. Impuestos
+9. Redondeo
+10. Totales
+11. Snapshot
+
+⚠️ Este orden NO puede alterarse.
+
+---
+
+## 🧾 Factura de venta / simulador
+
+Reglas obligatorias:
+
+* Simulador y Factura deben usar el mismo motor
+* Preview y confirmación deben dar el mismo resultado
+* Cualquier diferencia es un BUG
+
+---
+
+## 📸 Snapshots (CRÍTICO)
+
+Al confirmar un documento:
+
+* Se debe generar snapshot completo
+* Se debe persistir snapshot en base de datos
+* Nunca recalcular desde datos actuales
+
+👉 Los documentos confirmados son inmutables
+
+### Hooks de confirmación
+
+Los efectos colaterales al confirmar un documento (emitir comprobante, mover cuenta corriente, etc.) viven en `src/lib/document-hooks/`. Hoy existe `sale.hook.ts` (`onSaleConfirmed`) que emite Receipt + ReceiptLine + CurrentAccountMovement junto con el snapshot.
+
+Reglas:
+
+* Las hooks reciben un `Prisma.TransactionClient` y **nunca abren su propia transacción** — se ejecutan dentro de la tx que abrió el service.
+* Snapshot + comprobante + movimiento de cuenta corriente se crean en la **misma** tx, o no se crea nada.
+* Si querés agregar efectos al confirmar venta/compra/etc., extendé el hook correspondiente; no los pongas en el service.
+* Ver `src/modules/ARCHITECTURE-RECEIPTS-PAYMENTS.md` (§6.0) para el contrato transaccional.
+
+---
+
+## 🧩 Variantes
+
+* Las variantes NO tienen precio propio
+* Las variantes NO tienen costo propio
+* Todo proviene del artículo padre
+
+Único override permitido:
+
+* peso (si aplica)
+
+---
+
+## 🧪 Testing obligatorio (pricing)
+
+Todo cambio en pricing debe validar:
+
+* preview vs confirmación
+* simulador vs factura
+* impuestos
+* descuentos
+* canal
+* cupón
+* redondeo
+
+Si no hay test → no está terminado.
+
+👉 **Test obligatorio de paridad**: cualquier cambio en `pricing-engine` debe tener (o actualizar) un test que compare el resultado del **preview** con el resultado de la **confirmación** sobre el mismo input. Si los dos resultados no son idénticos byte-a-byte (mismos totales, mismo snapshot), es un BUG.
+
+---
+
+## ⚠️ Antes de modificar pricing
+
+Siempre:
+
+1. Buscar si ya existe en pricing-engine
+2. Identificar fuente de verdad
+3. No crear lógica paralela
+4. No duplicar funciones
+5. Evaluar impacto en snapshot
+6. Revisar tests existentes
+7. Agregar tests si falta cobertura
+
+---
+
+# 📦 Stock — segunda fuente de verdad
+
+Análogo al pricing-engine, **toda la lógica de stock pasa por `src/lib/stock-engine.ts`**. Es el único lugar autorizado a escribir en `ArticleStock`.
+
+Reglas clave (ver el comentario de cabecera del archivo para el detalle completo):
+
+* `ArticleMovement` + `ArticleMovementLine` = fuente de verdad histórica. `ArticleStock` es solo cache materializado.
+* Los movimientos son **inmutables** una vez `CONFIRMED`. Para revertir → estado `VOIDED` (no hay endpoint de edit ni de delete).
+* Solo movimientos con `sourceType=MANUAL` se pueden anular desde el módulo de movimientos. Los de SALE / PURCHASE / IMPORT se anulan desde su módulo de origen.
+* `articleType=SERVICE` no tiene stock; solo `stockMode=BY_ARTICLE` genera saldo.
+* Variantes: si el artículo tiene variantes activas, el stock vive **solo** en variantes (`variantId ≠ null`). Sin variantes activas → solo en el padre (`variantId = null`).
+* Saldo negativo está permitido (se registra pero no se bloquea).
+* Toda operación de stock debe correr dentro de una transacción Prisma.
+
+👉 Si ves escritura a `ArticleStock` fuera de `stock-engine.ts`, es un bug.
+
+---
+
+# 📱 Performance para dispositivos móviles (OBLIGATORIO)
 
 La app es usada desde celulares con conexión limitada. Las respuestas de la API deben ser lo más livianas posible:
 
-- **Paginación obligatoria** en todos los endpoints que devuelvan listas (`skip`/`take` con Prisma). Nunca devolver todos los registros sin límite.
-- **Seleccionar solo los campos necesarios** en cada query Prisma (`select: { ... }`). Nunca usar `findMany` sin `select` en modelos grandes.
-- **Evitar N+1 queries**: usar `include` o `select` anidado en vez de hacer queries dentro de loops.
-- Respuestas JSON sin campos innecesarios: no mandar campos que el frontend no use.
-- Comprimir respuestas: el middleware de compresión (si no está, agregarlo) debe estar activo en producción.
+* Paginación obligatoria (`skip` / `take`)
+* Usar `select` en Prisma
+* Evitar N+1 queries
+* No enviar campos innecesarios
+* JSON liviano
+* Compresión activa en producción
 
-## Deployment
+---
 
-- **Hosting**: [Render](https://render.com) — backend como Web Service, frontend como Static Site
-- **Repositorios**: GitHub (`leotufe-commits/tptech-backend` y `leotufe-commits/tptech-frontend`)
-- **Email en producción**: [Postmark](https://postmarkapp.com) — configurar `MAIL_MODE=production` y `POSTMARK_SERVER_TOKEN` en las env vars de Render
-- **Almacenamiento de archivos**: Cloudflare R2 en producción (configurar las vars `R2_*` en Render)
+# 🚀 Deployment
 
-## Commands
+* Hosting: Render
+* Backend: Web Service
+* Frontend: Static Site
+* Repositorios: GitHub
+
+Email:
+
+* Postmark en producción (`MAIL_MODE=production`)
+* En dev/staging hay route de **preview de mails** (registrada por `registerMailPreviewRoute` desde `src/lib/mail.service.ts`) — útil para inspeccionar plantillas sin enviarlas.
+
+Storage:
+
+* Cloudflare R2 (fallback local)
+
+---
+
+# 🔧 Variables de entorno (mínimas)
+
+Para arrancar el backend en local:
+
+* `DATABASE_URL` → Postgres (ej: `postgresql://user:pass@host:5432/db`)
+* `JWT_SECRET` → mínimo 10 caracteres
+* `PORT` → opcional, default `3001`
+* `MAIL_MODE` → `production` activa Postmark; cualquier otro valor habilita preview de mails
+* `POSTMARK_TOKEN` → solo si `MAIL_MODE=production`
+* R2 (opcional, si falta cae a `/uploads` local): `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL`
+
+Todo lo demás tiene defaults razonables. En producción (Render) se setea desde el dashboard.
+
+---
+
+# ⚙️ Commands
 
 ```bash
-npm run dev                    # Dev server with hot reload (tsx watch)
-npm run build                  # prisma generate + tsc
-npm run start                  # Run compiled output (dist/index.js)
-npm run seed                   # Run prisma/seed.ts
+# Server
+npm run dev                  # tsx watch — dev en puerto 3001
+npm run build                # prisma generate + tsc
+npm run start                # prisma migrate deploy + node dist/index.js (producción)
+npm run seed                 # tsx prisma/seed.ts (no correr salvo pedido explícito)
 
-npm run prisma:generate        # Regenerate Prisma client after schema changes
-npm run prisma:migrate:dev     # Create + apply a new migration (dev)
-npm run prisma:migrate:deploy  # Apply pending migrations (production/CI)
+# Prisma
+npm run prisma:generate      # SIEMPRE después de tocar schema.prisma
+npm run prisma:migrate:dev   # crea + aplica migración local
+npm run prisma:migrate:deploy
+
+# Tests (Vitest)
+npm test                     # corre toda la suite una vez
+npm run test:watch
+npm run test:coverage
+npx vitest run <archivo>     # un único archivo (ej: src/lib/pricing-engine/__tests__/sale.test.ts)
+npx vitest run <archivo> -t "<nombre>"   # un único test por nombre dentro del archivo
+npx vitest run <archivo> --coverage      # coverage de un único archivo
+
+# TypeScript
+npx tsc --noEmit             # chequeo rápido de tipos sin compilar a dist/
+
+# Scripts de migración / debug (one-shot)
+npm run migrate:cost-to-lines   # migra costos legacy a ArticleCostLine
+npm run check:legacy-cost       # diagnostica artículos con costo legacy
+npm run debug:entity-discount   # diagnostica descuentos por entidad comercial
 ```
 
-No test runner is configured.
+Los tests viven co-locados en carpetas `__tests__/`:
 
-## Environment variables
+* `src/lib/__tests__/` — utilidades comunes
+* `src/lib/pricing-engine/__tests__/` — motor de precios
+* `src/lib/document-hooks/__tests__/` — hooks de documentos
+* `src/modules/<modulo>/__tests__/` — por módulo
 
-Required in `.env`:
+## Tests del pricing-engine
 
-```
-DATABASE_URL=postgresql://...
-JWT_SECRET=<min 10 chars>
+Cobertura por archivo (en `src/lib/pricing-engine/__tests__/`):
 
-# Optional with defaults
-PORT=3001
-NODE_ENV=development
-JWT_ISSUER=tptech
-JWT_AUDIENCE=tptech-web
-CORS_ORIGIN=              # comma-separated allowed origins (adds to hardcoded list)
-APP_URL=http://localhost:5173  # used to build reset/invite links in emails
+* `cost.test.ts` — cálculo de costo desde ArticleCostLine
+* `sale.test.ts` — motor de venta (resolveFinalSalePrice y capas)
+* `metal-hechura.test.ts` — desglose metal/hechura
+* `integration.test.ts` — flujo end-to-end del motor
+* `simulator-vs-invoice-parity.test.ts` — paridad simulador ↔ factura
+* `endpoint-parity.test.ts` — paridad entre endpoints que consumen el motor
+* `document-totals.test.ts` — totales de documentos confirmados
+* `document-breakdown.test.ts` — breakdown por línea de documento
+* `cross-flow-consistency.test.ts` — consistencia entre flujos (venta, compra, cross-settlement)
+* `src/modules/sales/__tests__/preview-confirm-parity.test.ts` — paridad entre preview de venta y confirmación final (vive en el módulo `sales`, no en `pricing-engine`)
 
-# Mail (one of three modes)
-MAIL_MODE=preview         # preview | console | production
-MAIL_FROM=no-reply@tptech.local
-MAIL_APP_NAME=TPTech      # name shown in email templates
-POSTMARK_SERVER_TOKEN=    # required when MAIL_MODE=production (también acepta POSTMARK_API_TOKEN como alias)
+⚠️ Tras editar `prisma/schema.prisma`: correr `prisma:generate` y reiniciar `npm run dev` a mano (tsx watch no recarga `node_modules/@prisma/client`).
 
-# R2 storage (Cloudflare) — optional, falls back to local /uploads/
-R2_ENDPOINT=
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_BUCKET=
-R2_PUBLIC_BASE_URL=
-```
+---
 
-## Architecture
+# 🔐 Multi-tenancy (CRÍTICO)
 
-### Boot sequence
+* Todo está scopeado por `jewelryId`
+* Nunca confiar en el cliente
+* Siempre usar `req.tenantId` / `req.user.jewelryId`
 
-`src/index.ts` → `src/server.ts` → `src/app.ts` (creates Express app and applies all middleware).
+---
 
-### Middleware stack (`src/app.ts`)
+# 🔑 Auth
 
-Applied in this order on every request:
-1. `trust proxy 1` + `x-powered-by` disabled
-2. Helmet (CSP, frameguard, HSTS, CORP) — `src/config/security.ts`
-3. CORS with credentials — `src/config/cors.ts`
-4. JSON + urlencoded body parsers (1mb limit)
-5. cookie-parser
-6. Prisma ALS request context (`src/lib/prisma.ts`)
-7. Performance logger
-8. Static file serving (`/uploads`, `/api/uploads`)
-9. Global rate limiter (300 req/15min prod, 600 dev) — skips OPTIONS, /health, /uploads
+* JWT en cookie httpOnly `tptech_session`
+* Bearer token como fallback
+* `requireAuth`:
 
-### Route structure (`src/routes/index.ts`)
+  * valida usuario
+  * valida estado
+  * calcula permisos
+  * setea contexto
 
-All routes are prefixed with `/api`:
+---
 
-| Path | Auth | Module |
-|---|---|---|
-| `/api/auth/*` | Public (some endpoints) | auth.routes.ts |
-| `/api/users/*` | requireAuth | users.routes.ts |
-| `/api/roles/*` | requireAuth | roles.routes.ts |
-| `/api/permissions/*` | requireAuth | permissions.routes.ts |
-| `/api/company/*` | requireAuth | company.routes.ts |
-| `/api/warehouses/*` | requireAuth | warehouses.routes.ts |
-| `/api/movimientos/*` | requireAuth | movimientos.routes.ts |
-| `/api/valuation/*` | requireAuth (internal) | valuation.routes.ts |
-| `/api/dashboard/*` | requireAuth | dashboard.routes.ts |
-| `/api/storage/*` | — | storage.routes.ts |
-| `/api/company/catalogs/*` | requireAuth | catalogs.routes.ts |
-| `/api/categories/*` | requireAuth | categories.routes.ts |
-| `/api/taxes/*` | requireAuth | taxes.routes.ts |
-| `/api/payments/*` | requireAuth | payments.routes.ts |
-| `/api/shipping/*` | requireAuth | shipping.routes.ts |
-| `/api/sellers/*` | requireAuth | sellers.routes.ts |
-| `/api/price-lists/*` | requireAuth | price-lists.routes.ts |
+# 🧾 Soft delete
 
-Dev-only: `GET /dev/mail/:id` — email preview (active when `MAIL_MODE !== production`).
+* Usar `deletedAt`
+* Nunca hard delete en entidades críticas
 
-### Multi-tenancy
+---
 
-Every table record is scoped to a `jewelryId` (the tenant). All queries MUST filter by `jewelryId`. The tenant ID comes from `req.tenantId` / `req.user.jewelryId` (set by `requireAuth`). Never trust the client to send a jewelryId — always use the one from the auth context.
+# 📦 Uploads
 
-### Authentication (`src/middlewares/requireAuth.ts`)
+* R2 si está configurado
+* sino `/uploads` local
 
-JWT stored in httpOnly cookie `tptech_session`. Bearer token is accepted as fallback for legacy compatibility.
+---
 
-On each request, `requireAuth`:
-1. Verifies the JWT (cookie takes precedence over Bearer)
-2. Loads the user from DB, checks `deletedAt`, checks `status === ACTIVE`
-3. Validates `tokenVersion` (if present in JWT) — invalidated when password changes
-4. Computes the effective permission set: role permissions + per-user overrides (ALLOW/DENY)
-5. Sets `req.userId`, `req.tenantId`, `req.user`, `req.roles`, `req.isOwner`, `req.permissions`
+# 🪵 Logs
 
-### Permission system (`src/middlewares/requirePermission.ts`)
+* No usar `console.log` salvo en scripts one-shot. El middleware `perfLogger` (`src/middlewares/perfLogger.ts`) ya emite una línea por request con método, URL, status, duración y `tenant`/`user` cuando corresponde. En producción solo loggea requests lentos (≥ `slowMs`, default 700ms); en dev loggea todo.
+* `requestContextMiddleware` (`src/lib/prisma.ts`) asigna un `reqId` por request vía `AsyncLocalStorage`. Usarlo para correlacionar logs si agregás logging propio.
+
+---
+
+# ⚠️ Error handling
 
 ```ts
-requirePermission("USERS_ROLES", "ADMIN")   // single
-requireAnyPermission(["INVENTORY:VIEW", "INVENTORY:EDIT"]) // any
-```
-
-OWNER role bypasses all permission checks. Permissions are computed once in `requireAuth` and stored in `req.permissions` — no extra DB query in `requirePermission`.
-
-Permission format: `MODULE:ACTION` (e.g. `USERS_ROLES:VIEW`, `INVENTORY:ADMIN`).
-
-### Auth tokens (`src/lib/authTokens.ts`, `src/lib/authTokenStore.ts`)
-
-Single-use tokens for password reset and user invitation. Stored in the `AuthToken` table with fields `jti` (unique), `expiresAt`, `usedAt`. Consuming a token marks `usedAt` atomically — a second use is rejected.
-
-- `type: "reset"` — used for both password recovery (30min) and user invitations (7d)
-- `signResetToken` + `buildResetLink` → `/reset-password?token=...`
-- `signResetToken` + `buildInviteLink` → `/accept-invite?token=...`
-
-### Mail system (`src/lib/mailer.ts`, `src/lib/mail.service.ts`)
-
-`MAIL_MODE` controls behavior:
-- `preview` (default dev) — stores email in memory, logs URL `/dev/mail/:id`
-- `console` — prints to stdout only
-- `production` — sends via Postmark (`src/lib/mail.provider.postmark.ts`)
-
-All email functions are in `src/lib/mailer.ts`: `sendResetEmail`, `sendInviteEmail`.
-
-### File uploads
-
-Multer handles multipart uploads. Storage strategy:
-- If R2 env vars are set → Cloudflare R2 (`src/lib/storage/r2.ts`)
-- Otherwise → local `uploads/` directory (`src/lib/uploads/localUploads.ts`)
-
-Uploaded files are served at `/uploads/*` and `/api/uploads/*`.
-
-### Soft delete
-
-All major models have `deletedAt DateTime?`. Always filter `deletedAt: null` in queries. Never use hard deletes on User, Role, Warehouse, Metal, or Jewelry records.
-
-### Automatic short codes
-
-- **Movement codes**: generated in `movimientos.service.ts` — `E-NNNN` (IN), `S-NNNN` (OUT), `T-NNNN` (TRANSFER), `A-NNNN` (ADJUST). Counter per tenant + kind (including voided movements).
-- **Warehouse codes**: generated in `warehouses.service.ts` — first 3 letters of name (no accents) + 2-digit sequence (e.g. `ALM01`). Only generated if the user leaves the code field empty.
-
-### Rate limiting (`src/config/rateLimit.ts`)
-
-Per-endpoint limiters on auth routes (applied in `auth.routes.ts`):
-- `authLoginLimiter` — login
-- `authForgotLimiter` — forgot password
-- `authResetLimiter` — reset password
-- `authRegisterLimiter` — register (10/hour/IP)
-
-### PIN / Quick Switch (`src/modules/auth/auth.pin.controller.ts`)
-
-Users can set a 4-digit PIN for screen unlock and quick user switching within the same tenant.
-
-- **PIN lock**: after 5 failed attempts → account locked for 5 minutes (`quickPinLockedUntil`)
-- **Quick switch**: `Jewelry.quickSwitchEnabled` must be true. The switching user authenticates with the *target* user's PIN (if `pinLockRequireOnUserSwitch` is true). Issues a new JWT for the target user.
-- **Company PIN lock settings**: `pinLockEnabled`, `pinLockTimeoutSec`, `pinLockRequireOnUserSwitch` — configurable per tenant via `PATCH /api/auth/company/security/pin-lock`.
-- PIN hash stored as bcrypt in `User.quickPinHash`. Setting or disabling a PIN increments `tokenVersion` to invalidate existing sessions.
-
-### Valuation module (`src/modules/valuation/`)
-
-Manages metals, metal variants, currencies and price quotes. The controller imports exclusively from `valuation.service.ts` (barrel), which re-exports from four sub-services:
-
-| Sub-service | Responsibility |
-|---|---|
-| `valuation.currencies.service.ts` | Currencies, FX rates, base currency |
-| `valuation.metals.service.ts` | Metals catalog, reference value history |
-| `valuation.variants.service.ts` | Metal variants (purity, buy/sale factors, pricing mode) |
-| `valuation.quotes.service.ts` | Price snapshots per variant + currency |
-
-**Pricing modes** (`VariantPricingMode`): `AUTO` (derived from metal reference value × purity × factor) or `OVERRIDE` (manual price). Both modes generate `MetalQuote` snapshots and `MetalVariantValueHistory` records.
-
-### Inventory stock materialization
-
-`WarehouseStock` keeps a running total of grams per `(jewelryId, warehouseId, variantId)`. It is updated atomically whenever movements are created or voided. This allows fast stock lookups and prevents warehouse deletion when stock > 0.
-
-### Module file conventions
-
-Each feature module under `src/modules/` follows this structure:
-- `*.routes.ts` — Express router, applies middleware and calls controller
-- `*.controller.ts` — Request/response handling, no business logic
-- `*.service.ts` — Business logic and Prisma queries (or barrel re-export)
-- `*.schemas.ts` — Zod schemas for request validation
-
-**Validation**: use `validateBody(schema)` middleware (from `src/middlewares/validate.ts`) before controllers. It runs `schema.safeParse(req.body)` and replies 400 with `{ message, issues }` on failure; replaces `req.body` with the parsed/sanitized value on success.
-
-**Multipart + JSON**: for endpoints that accept both file uploads and JSON data, use `parseJsonBodyField("data")` after Multer to parse a JSON-encoded field named `data` into `req.body`.
-
-### Audit logger (`src/lib/auditLogger.ts`)
-
-`auditLog(req, event)` or `auditLog(event)` — currently logs to console only (structured JSON). The `AuditLog` Prisma model exists for future DB persistence but is not written to yet.
-
-### Login flow
-
-`POST /api/auth/login/options` (also `GET` for legacy) — accepts `{ email }` and returns whether the user exists and what auth methods are available (password, PIN). The frontend calls this first to decide which login UI to show.
-
-### Error handling pattern
-
-Controllers wrap async functions with `asyncHandler` (from `src/middlewares/asyncHandlers.ts`), which forwards thrown errors to the global `errorHandler` middleware (`src/middlewares/errorHandler.ts`).
-
-To return an error with a specific HTTP status from a service, throw an error with `.status`:
-
-```ts
-const err: any = new Error("Mensaje de error");
+const err: any = new Error("Mensaje");
 err.status = 400;
 throw err;
 ```
 
-The `errorHandler` reads `err.status` (or `err.statusCode`) and responds with `{ ok: false, message }`.
+---
 
-### ESM import convention
+# 🧱 Convenciones de módulos
 
-This project uses `"type": "module"`. All local imports **must** use the `.js` extension, even when importing `.ts` source files:
+Cada módulo en `src/modules/<nombre>/` se compone de:
 
-```ts
-import { prisma } from "../../lib/prisma.js";   // ✅ correct
-import { prisma } from "../../lib/prisma";       // ❌ will break at runtime
-```
+* `<nombre>.routes.ts` → routing + `requireAuth` + `asyncHandler`
+* `<nombre>.controller.ts` → request/response, delega al service (sin lógica)
+* `<nombre>.service.ts` → lógica + queries Prisma
+* `<nombre>.schemas.ts` → validación con Zod
 
-### Catalogs module (`src/modules/catalogs/`)
+Reglas obligatorias:
 
-Manages lookup lists per tenant. `CatalogItem` supports these types (enum `CatalogType`):
+* **ESM puro** (`"type": "module"`): los imports relativos a `.ts` deben terminar en `.js`. Ej: `import { foo } from "./foo.js"`.
+* Toda query Prisma con `select` explícito (no `findMany` pelado) — ver sección de performance móvil.
+* Toda query filtra `deletedAt: null` y `jewelryId` del contexto del request.
+* Soft delete: `{ deletedAt: new Date(), isActive: false }`.
+* Validación de invariantes: `assert(cond, "msg")` lanza `{ status: 400 }`.
+* Uploads: `multer.memoryStorage()` + `uploadFile()` de `src/lib/r2.ts` + `buildObjectKey()` de `src/lib/storage/keys.ts`.
 
-| Type | Description |
+## Registrar un módulo nuevo
+
+Todo módulo nuevo debe:
+
+1. Vivir en `src/modules/<nombre>/` con la estructura de arriba.
+2. Exportar un `Router` por default desde `<nombre>.routes.ts`.
+3. **Quedar registrado en `src/routes/index.ts`** con `requireAuth` salvo que sea explícitamente público (auth, webhooks).
+
+> No hay generador de scaffolding. Para crear un módulo nuevo, **copiar la estructura de un módulo simple** como `taxes` o `payments` (routes + controller + service + schemas) y renombrar.
+
+---
+
+# 🗺️ Mapa de dominios
+
+`src/modules/` agrupa ~40 módulos. Para orientarse rápido:
+
+| Dominio | Módulos |
 |---|---|
-| `IVA_CONDITION` | IVA tax condition options |
-| `PHONE_PREFIX` | Country phone prefixes |
-| `DOCUMENT_TYPE` | ID document types |
-| `CITY` | City list |
-| `PROVINCE` | Province/state list |
-| `COUNTRY` | Country list |
+| Auth & accesos | `auth`, `users`, `roles`, `permissions` |
+| Catálogo | `articles`, `article-groups`, `article-movements`, `categories`, `attribute-defs`, `units`, `import-batches`, `valuation`, `catalogs` |
+| Comercial | `sales`, `purchases`, `cross-settlements`, `receipts`, `commercial-entities`, `sales-channels`, `coupons`, `promotions`, `quantity-discounts`, `price-lists` |
+| Configuración | `taxes`, `payments`, `shipping`, `sellers`, `warehouses`, `company`, `printer-profiles`, `label-templates`, `document-templates` |
+| Soporte | `dashboard`, `movimientos`, `storage` |
 
-Each item has `label`, `isActive`, `sortOrder`, `isFavorite`, and `deletedAt` (soft delete). Unique constraint: `(jewelryId, type, label)`.
+Toda la API se monta bajo `/api/<modulo>` desde `src/routes/index.ts`.
 
-### System configuration modules
+---
 
-These modules all follow the same CRUD pattern (list / create / update / toggle / soft-delete):
+# 🛠️ Infra clave
 
-| Module | Path | Key model fields |
-|---|---|---|
-| **Taxes** | `src/modules/taxes/` | `TaxType`, `TaxCalculationType`, `TaxApplyOn`, `rate`, `fixedAmount`, `isDefault`, `isActive` |
-| **Payment methods** | `src/modules/payments/` | `PaymentMethodType`, `surchargePercent`, `isDefault`, `isActive` |
-| **Shipping** | `src/modules/shipping/` | `ShippingCalcMode` (FIXED/BY_WEIGHT/BY_ZONE), `fixedCost`, `costPerKg`, `isActive` |
-| **Price lists** | `src/modules/price-lists/` | `PriceListScope`, `PriceListMode`, `RoundingTarget/Mode/Direction`, `marginPercent`, `isActive` |
+* **Entrypoint del servidor**: `src/index.ts` (carga `dotenv`) → `src/server.ts` (escucha el puerto) → `src/app.ts` (construye el `app` Express: helmet, CORS con credenciales, parsers JSON/urlencoded de 1mb, `cookieParser`, `requestContextMiddleware`, `perfLogger`, rate limit global, montaje de `/api`, error handler).
+* Toda la API se monta bajo el prefijo `/api` (ver `src/app.ts`). El frontend usa `VITE_API_URL` apuntando a esa base.
+* **Health checks**: `GET /api/health` devuelve `{ ok: true, service: "tptech-backend" }`; `GET /` devuelve `"TPTech Backend OK 🚀"`. Útiles para chequear el deploy en Render.
+* **Mail preview en dev/staging**: si `MAIL_MODE !== "production"`, `registerMailPreviewRoute(app)` agrega una ruta para previsualizar los mails generados.
+* **Uploads estáticos**: la carpeta `uploads/` se sirve tanto en `/uploads` (directo backend) como en `/api/uploads` (proxy Vite).
+* `src/lib/prisma.ts` define `requestContextMiddleware` con `AsyncLocalStorage`: asigna un `reqId` por request (lee `x-request-id` / `x-correlation-id` o genera uno). Útil para logging y trazabilidad.
+* Prisma 7 — la conexión usa **`PrismaPg` adapter** explícito (`new PrismaClient({ adapter })`). Antes de tocar `src/lib/prisma.ts` o agregar otra conexión, tener presente que Prisma 7 ya no admite el modo legacy sin adapter.
+* Migraciones con descripción:
 
-### Categories module (`src/modules/categories/`)
+  ```bash
+  npm run prisma:migrate:dev -- --name <descripcion_corta>
+  ```
 
-`ArticleCategory` supports a hierarchy (`parentId`). `defaultPriceListId` links to a `PriceList`.
+---
 
-**Attribute system**: each category can have `ArticleCategoryAttribute` records with `CategoryAttributeInputType` (TEXT, TEXTAREA, NUMBER, DECIMAL, BOOLEAN, DATE, SELECT, MULTISELECT, COLOR). Attributes with `inheritToChild: true` propagate down the hierarchy.
+# 🧭 Regla final
 
-Key endpoints beyond basic CRUD:
-- `GET /categories/:id/attributes` — own attributes only
-- `GET /categories/:id/attributes/effective` — own + inherited (climbs ancestor chain, own attrs override inherited by matching `code||name`)
-- `POST /categories/attributes/:attributeId/options` — add option for SELECT/MULTISELECT/COLOR types
-- `DELETE /categories/attributes/options/:optionId` — remove option
+👉 Si ves lógica de precios fuera de `pricing-engine`, es un error.
 
-### Sellers module (`src/modules/sellers/`)
+👉 Si frontend y backend no coinciden, el problema está en la arquitectura, no en la UI.
 
-`Seller` model fields: basic info (name, code, email, phone, documentType, documentNumber, commissionType, commissionRate, commissionBase), address fields (street, streetNumber, city, province, country, postalCode), `avatarUrl`, `isFavorite`, `isActive`, `deletedAt`.
-
-Additional relations:
-- `SellerWarehouse` — M2M with `Warehouse`
-- `SellerAttachment` — documents attached to a seller (filename, url, mimeType, size)
-
-File upload middlewares (dedicated, not generic):
-- `src/middlewares/uploadSellerAvatar.ts` — image only, max 5MB, field name `file` → `PATCH /sellers/:id/avatar`
-- `src/middlewares/uploadSellerAttachments.ts` — any file, max 20MB → `POST /sellers/:id/attachments`
-
-Both middlewares auto-route to R2 when `R2_ENABLED`, otherwise local disk under `uploads/sellers/`.
+---

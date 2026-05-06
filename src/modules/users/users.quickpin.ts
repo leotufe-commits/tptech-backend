@@ -8,6 +8,8 @@ import { auditLog } from "../../lib/auditLogger.js";
 import { requireTenantId, isValidPin4 } from "./users.helpers.js";
 import { requireAdminUsersRoles } from "./users.perms.js";
 
+const MSG_PIN_INVALID = "El PIN debe tener exactamente 4 dígitos.";
+
 async function countUserOverrides(userId: string) {
   return prisma.userPermissionOverride.count({ where: { userId } });
 }
@@ -74,7 +76,7 @@ export async function updateMyQuickPin(req: Request, res: Response) {
   const { pin, currentPin } = req.body as { pin?: string; currentPin?: string };
 
   if (!isValidPin4(pin)) {
-    return res.status(400).json({ message: "El PIN debe tener exactamente 4 dígitos." });
+    return res.status(400).json({ message: MSG_PIN_INVALID });
   }
 
   const me = await prisma.user.findFirst({
@@ -210,7 +212,7 @@ export async function updateUserQuickPin(req: Request, res: Response) {
   if (!targetUserId) return res.status(400).json({ message: "ID inválido." });
 
   const { pin } = req.body as { pin?: string };
-  if (!isValidPin4(pin)) return res.status(400).json({ message: "El PIN debe tener exactamente 4 dígitos." });
+  if (!isValidPin4(pin)) return res.status(400).json({ message: MSG_PIN_INVALID });
 
   const target = await prisma.user.findFirst({
     where: { id: targetUserId, jewelryId: tenantId, deletedAt: null },

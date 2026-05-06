@@ -1,5 +1,4 @@
 // tptech-backend/src/modules/roles/roles.service.ts
-import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { uniqStrings } from "../users/users.helpers.js";
 

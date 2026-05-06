@@ -17,13 +17,14 @@ const router = Router();
 /* =========================
    PERMISOS
 ========================= */
-const requireCompanyView = requirePermission("COMPANY_SETTINGS", "VIEW");
 const requireCompanyEdit = requirePermission("COMPANY_SETTINGS", "EDIT");
 
 /* =========================
    PERFIL (DATOS)
 ========================= */
-router.get("/me", requireCompanyView, getMyJewelryProfile);
+// GET: accesible a cualquier usuario autenticado (requireAuth ya está en el router padre)
+// PATCH: requiere permiso de edición
+router.get("/me", getMyJewelryProfile);
 router.patch("/me", requireCompanyEdit, updateMyJewelry);
 
 /* =========================

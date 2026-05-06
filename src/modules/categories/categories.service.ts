@@ -74,6 +74,7 @@ const ASSIGN_SELECT = {
       helpText: true,
       unit: true,
       defaultValue: true,
+      sortOrder: true,
       options: {
         where: { isActive: true },
         select: {
@@ -153,6 +154,7 @@ function mapAssignment(row: any) {
       helpText: definition.helpText ?? "",
       unit: definition.unit ?? "",
       defaultValue: definition.defaultValue ?? "",
+      sortOrder: definition.sortOrder ?? 0,
       options: mappedOptions,
     },
   };

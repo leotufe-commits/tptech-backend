@@ -5,7 +5,7 @@ import type { Request, Response } from "express";
  * Detecta OWNER desde varios lugares posibles.
  * (depende de cómo tu requireAuth setea el request)
  */
-export function isOwnerReq(req: Request): boolean {
+function isOwnerReq(req: Request): boolean {
   const anyReq = req as any;
 
   if (anyReq?.isOwner === true) return true;
@@ -70,11 +70,5 @@ export function requireAdminUsersRoles(req: Request, res: Response): boolean {
   }
   return true;
 }
-
-/**
- * ✅ Alias defensivo por si en algún lado lo importaste con otro nombre (histórico)
- * (no molesta y evita roturas)
- */
-export const requireUsersAdmin = requireAdminUsersRoles;
 
 export default requireAdminUsersRoles;

@@ -34,3 +34,10 @@ export async function remove(req: any, res: Response) {
   await service.deletePromotion(id, req.user.jewelryId);
   return res.json({ ok: true });
 }
+
+export async function toggle(req: any, res: Response) {
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  const id = s(req.params?.id);
+  assert(id, "Id inválido.");
+  return res.json(await service.togglePromotionActive(id, req.user.jewelryId));
+}

@@ -10,6 +10,7 @@ export type StorageKind =
   | "jewelry_logo"
   | "product_image"
   | "product_video"
+  | "group_image"
   | "attachment"
   | "document";
 
@@ -45,6 +46,11 @@ export function buildObjectKey(args: {
     case "product_video": {
       const p = safeSeg(args.productId || "product");
       return `tptech/tenants/${t}/videos/products/${p}/${Date.now()}_${name}${suffix}`;
+    }
+
+    case "group_image": {
+      const p = safeSeg(args.productId || "group");
+      return `tptech/tenants/${t}/catalog/groups/${p}/${Date.now()}_${name}${suffix}`;
     }
 
     case "attachment":

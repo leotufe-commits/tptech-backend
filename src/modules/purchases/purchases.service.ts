@@ -1,10 +1,19 @@
 // src/modules/purchases/purchases.service.ts
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
-import { computeCostPrice } from "../../lib/article-cost.utils.js";
-import { buildBalanceBreakdownFromPrice } from "../../lib/pricing-engine/pricing-engine.balance.js";
-import type { BalanceBreakdown } from "../../lib/pricing-engine/pricing-engine.balance.js";
-import type { PriceBreakdown } from "../../lib/pricing-engine/pricing-engine.types.js";
+import {
+  calculateCostFromLines,
+  buildBatchCostContext,
+  buildBalanceBreakdownFromPrice,
+  type CostLineInput,
+  type ArticleCostInput,
+  type BatchCostContext,
+  type BalanceBreakdown,
+  type PriceBreakdown,
+  type CostSnapshot,
+} from "../../lib/pricing-engine/pricing-engine.js";
+import { getBaseCurrencyId } from "../../lib/pricing-engine/pricing-engine.currency.js";
+import type { EntitySnapshot, IssuerSnapshot, CurrencySnapshot } from "../../lib/document-snapshot.types.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -300,25 +309,70 @@ export async function confirmPurchase(
   const supplier = await prisma.commercialEntity.findFirst({
     where: { id: purchase!.supplierId, jewelryId, deletedAt: null },
     select: {
-      id: true,
-      displayName: true,
-      code: true,
-      balanceType: true,
-      email: true,
-      phone: true,
-      documentNumber: true,
+      id: true, displayName: true, code: true,
+      documentType: true, documentNumber: true, ivaCondition: true,
+      email: true, phone: true,
+      balanceType: true, taxExempt: true, taxApplyOnOverride: true,
+      taxOverrides: { where: { isActive: true }, select: { taxId: true, overrideMode: true, applyOn: true, isActive: true } },
+      addresses: {
+        where: { type: "BILLING", deletedAt: null },
+        select: { street: true, streetNumber: true, floor: true, apartment: true, city: true, province: true, country: true, postalCode: true },
+        take: 1,
+      },
     },
   });
   if (!supplier) err("Proveedor no encontrado.", 404);
 
-  const supplierSnapshot = {
-    id: supplier!.id,
-    displayName: supplier!.displayName,
-    code: supplier!.code,
-    email: supplier!.email,
-    phone: supplier!.phone,
-    documentNumber: supplier!.documentNumber,
+  const snapshotAt = new Date().toISOString();
+
+  const supplierSnapshot: EntitySnapshot = {
+    id:                 supplier!.id,
+    displayName:        supplier!.displayName,
+    code:               supplier!.code,
+    documentType:       supplier!.documentType ?? "",
+    documentNumber:     supplier!.documentNumber,
+    ivaCondition:       supplier!.ivaCondition,
+    email:              supplier!.email,
+    phone:              supplier!.phone,
+    taxExempt:          supplier!.taxExempt,
+    taxApplyOnOverride: (supplier!.taxApplyOnOverride as string | null) ?? null,
+    taxOverrides:       supplier!.taxOverrides as EntitySnapshot["taxOverrides"],
+    billingAddress:     (supplier!.addresses?.[0] as EntitySnapshot["billingAddress"]) ?? null,
+    snapshotAt,
   };
+
+  // ── currencySnapshot + issuerSnapshot ────────────────────────────────────
+  const baseCurrencyId = await getBaseCurrencyId(jewelryId);
+  const [currencyRow, jewelry] = await Promise.all([
+    baseCurrencyId
+      ? prisma.currency.findUnique({
+          where: { id: baseCurrencyId },
+          select: { id: true, code: true, name: true, symbol: true, isBase: true },
+        })
+      : Promise.resolve(null),
+    prisma.jewelry.findUnique({
+      where: { id: jewelryId },
+      select: {
+        id: true, name: true, legalName: true, cuit: true, ivaCondition: true, email: true,
+        street: true, number: true, floor: true, apartment: true,
+        city: true, province: true, country: true, postalCode: true, logoUrl: true,
+      },
+    }),
+  ]);
+
+  const currencySnapshot: CurrencySnapshot | null = currencyRow
+    ? { id: currencyRow.id, code: currencyRow.code, name: currencyRow.name, symbol: currencyRow.symbol, isBase: currencyRow.isBase, exchangeRate: null, snapshotAt }
+    : null;
+
+  const issuerSnapshot: IssuerSnapshot | null = jewelry
+    ? {
+        id: jewelry.id, name: jewelry.name, legalName: jewelry.legalName,
+        cuit: jewelry.cuit, ivaCondition: jewelry.ivaCondition, email: jewelry.email,
+        street: jewelry.street, number: jewelry.number, floor: jewelry.floor, apartment: jewelry.apartment,
+        city: jewelry.city, province: jewelry.province, country: jewelry.country, postalCode: jewelry.postalCode,
+        logoUrl: jewelry.logoUrl, snapshotAt,
+      }
+    : null;
 
   const isBreakdown = supplier!.balanceType === "BREAKDOWN";
 
@@ -334,57 +388,72 @@ export async function confirmPurchase(
     lineId: string;
     lineTotal: number;
     breakdown: PriceBreakdown | null;
+    pricingSnapshot: CostSnapshot;
   };
 
   const linesWithBreakdown: LineWithBreakdown[] = [];
+  const purchaseResolvedAt = new Date().toISOString();
+
+  // Pre-cargar todos los artículos en una sola query batch (evita N+1)
+  const lineArticleIds = [...new Set(
+    purchase!.lines.map(l => l.articleId).filter((id): id is string => !!id)
+  )];
+  type ArtRow = ArticleCostInput & { id: string };
+  let purchaseArticleMap = new Map<string, ArtRow>();
+  let purchaseBatchCtx: BatchCostContext | undefined;
+
+  if (lineArticleIds.length > 0) {
+    const purchaseArticles = await prisma.article.findMany({
+      where: { id: { in: lineArticleIds }, jewelryId },
+      select: {
+        id: true,
+        manualAdjustmentKind:  true,
+        manualAdjustmentType:  true,
+        manualAdjustmentValue: true,
+        costComposition: {
+          orderBy: { sortOrder: "asc" as const },
+          select: {
+            type: true, label: true, quantity: true, unitValue: true,
+            currencyId: true, mermaPercent: true, metalVariantId: true,
+            lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
+          },
+        },
+      },
+    });
+    purchaseArticleMap = new Map(purchaseArticles.map(a => [a.id, a as ArtRow]));
+    purchaseBatchCtx = await buildBatchCostContext(jewelryId, purchaseArticles as ArticleCostInput[]);
+  }
 
   for (const line of purchase!.lines) {
     let breakdown: PriceBreakdown | null = null;
+    let costSnapshot: CostSnapshot = {
+      unitCost:    null,
+      costMode:    "NONE",
+      costPartial: false,
+      resolvedAt:  purchaseResolvedAt,
+    };
 
     if (line.articleId) {
-      const article = await prisma.article.findFirst({
-        where: { id: line.articleId, jewelryId },
-        select: {
-          costCalculationMode: true,
-          costPrice: true,
-          hechuraPrice: true,
-          hechuraPriceMode: true,
-          mermaPercent: true,
-          multiplierBase: true,
-          multiplierValue: true,
-          multiplierQuantity: true,
-          category: { select: { mermaPercent: true } },
-          compositions: { select: { variantId: true, grams: true, isBase: true } },
-          costComposition: {
-            orderBy: { sortOrder: "asc" as const },
-            select: {
-              type: true,
-              label: true,
-              quantity: true,
-              unitValue: true,
-              currencyId: true,
-              mermaPercent: true,
-              metalVariantId: true,
-            },
-          },
-        },
-      });
+      const article = purchaseArticleMap.get(line.articleId);
 
       if (article) {
-        const costResult = await computeCostPrice(jewelryId, {
-          costCalculationMode: article.costCalculationMode,
-          costPrice: article.costPrice,
-          multiplierBase: article.multiplierBase,
-          multiplierValue: article.multiplierValue,
-          multiplierQuantity: article.multiplierQuantity,
-          hechuraPrice: article.hechuraPrice,
-          hechuraPriceMode: article.hechuraPriceMode,
-          mermaPercent: article.mermaPercent,
-          compositions: article.compositions,
-          category: article.category,
-          costComposition: article.costComposition as any,
-        });
+        const costResult = await calculateCostFromLines(
+          jewelryId,
+          article.costComposition as CostLineInput[],
+          {
+            kind:  article.manualAdjustmentKind,
+            type:  article.manualAdjustmentType,
+            value: article.manualAdjustmentValue,
+          },
+          purchaseBatchCtx,
+        );
         breakdown = costResult.breakdown ?? null;
+        costSnapshot = {
+          unitCost:    costResult.value?.toNumber() ?? null,
+          costMode:    costResult.mode,
+          costPartial: costResult.partial,
+          resolvedAt:  purchaseResolvedAt,
+        };
       }
     }
 
@@ -392,6 +461,7 @@ export async function confirmPurchase(
       lineId: line.id,
       lineTotal: parseFloat(line.lineTotal.toString()),
       breakdown,
+      pricingSnapshot: costSnapshot,
     });
   }
 
@@ -404,14 +474,20 @@ export async function confirmPurchase(
         status: "CONFIRMED",
         subtotal,
         total,
-        supplierSnapshot,
+        supplierSnapshot: supplierSnapshot as any,
+        currencyId:       currencyRow?.id ?? null,
+        currencySnapshot: (currencySnapshot ?? Prisma.JsonNull) as any,
+        issuerSnapshot:   (issuerSnapshot  ?? Prisma.JsonNull) as any,
         confirmedAt: new Date(),
         confirmedById: userId,
-        // Actualizar breakdownSnapshot en cada línea
+        // Actualizar breakdownSnapshot y pricingSnapshot en cada línea
         lines: {
-          update: linesWithBreakdown.map(({ lineId, breakdown }) => ({
+          update: linesWithBreakdown.map(({ lineId, breakdown, pricingSnapshot }) => ({
             where: { id: lineId },
-            data: { breakdownSnapshot: breakdown ? (breakdown as any) : Prisma.JsonNull },
+            data: {
+              breakdownSnapshot: breakdown ? (breakdown as any) : Prisma.JsonNull,
+              pricingSnapshot:   pricingSnapshot as any,
+            },
           })),
         },
       },

@@ -8,6 +8,7 @@ const DEFAULT_FROM =
   "no-reply@tptech.local";
 
 const APP_NAME = process.env.MAIL_APP_NAME || "TPTech";
+const BRAND_COLOR = "#F36A21";
 
 /* =========================
    TENANT MAIL CONTEXT
@@ -125,7 +126,7 @@ function buildHtml(opts: TemplateOpts): string {
 
           <!-- Header naranja -->
           <tr>
-            <td style="background-color:#F36A21; padding:28px 32px;">
+            <td style="background-color:${BRAND_COLOR}; padding:28px 32px;">
               <p style="margin:0; font-size:22px; font-weight:700; color:#ffffff; letter-spacing:-0.3px;">${safeAppName}</p>
             </td>
           </tr>
@@ -157,7 +158,7 @@ function buildHtml(opts: TemplateOpts): string {
                 <tr>
                   <td style="padding:0 0 20px 0;">
                     <a href="${safeUrl}"
-                       style="display:inline-block; padding:14px 28px; background-color:#F36A21; color:#ffffff; text-decoration:none; border-radius:10px; font-size:15px; font-weight:700; letter-spacing:0.1px;">
+                       style="display:inline-block; padding:14px 28px; background-color:${BRAND_COLOR}; color:#ffffff; text-decoration:none; border-radius:10px; font-size:15px; font-weight:700; letter-spacing:0.1px;">
                       ${safeCtaText}
                     </a>
                   </td>
@@ -180,7 +181,7 @@ function buildHtml(opts: TemplateOpts): string {
                 Si el botón no funciona, copiá y pegá este link en tu navegador:
               </p>
               <p style="margin:4px 0 0 0; font-size:12px;">
-                <a href="${safeUrl}" style="color:#F36A21; word-break:break-all;">${safeUrl}</a>
+                <a href="${safeUrl}" style="color:${BRAND_COLOR}; word-break:break-all;">${safeUrl}</a>
               </p>
             </td>
           </tr>
@@ -242,6 +243,19 @@ export async function sendResetEmail(to: string, resetLink: string, tenant?: Ten
     ctaText: "Restablecer contraseña",
     ctaUrl: resetLink,
     expiry: "30 minutos",
+    showIgnoreNote: true,
+  }, tenant);
+}
+
+/** Verificación de email al registrarse (link de un solo uso, 48 horas) */
+export async function sendVerifyEmail(to: string, verifyLink: string, tenant?: TenantMailContext) {
+  return sendTemplatedEmail(to, {
+    subject: `${APP_NAME} · Verificá tu email`,
+    heading: "Verificá tu email",
+    intro: "Para activar tu cuenta en TPTech, hacé click en el botón. Este link es de un solo uso.",
+    ctaText: "Verificar mi email",
+    ctaUrl: verifyLink,
+    expiry: "48 horas",
     showIgnoreNote: true,
   }, tenant);
 }

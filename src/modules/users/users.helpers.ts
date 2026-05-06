@@ -1,7 +1,6 @@
 // tptech-backend/src/modules/users/users.helpers.ts
 import type { Request, Response } from "express";
 import { UserStatus } from "@prisma/client";
-import path from "node:path";
 
 /**
  * ✅ Compat:
@@ -111,9 +110,4 @@ export function contentDisposition(filename: string) {
   const fallback = safeAsciiFilename(filename);
   const utf8 = encodeURIComponent(String(filename || fallback));
   return `attachment; filename="${fallback}"; filename*=UTF-8''${utf8}`;
-}
-
-export function safeBasename(filename: string) {
-  const safe = path.basename(String(filename || ""));
-  return safe || "";
 }
