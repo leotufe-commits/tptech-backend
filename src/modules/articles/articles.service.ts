@@ -1958,18 +1958,19 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
         let isOwn = true;
         while (curId && !seen.has(curId)) {
           seen.add(curId);
-          const cat = await prisma.articleCategory.findFirst({
-            where: { id: curId, deletedAt: null },
-            select: {
-              parentId: true,
-              attributes: {
-                where: { isVariantAxis: true, deletedAt: null, ...(isOwn ? {} : { inheritToChild: true }) },
-                select: { definitionId: true },
+          const cat: { parentId: string | null; attributes: { definitionId: string }[] } | null =
+            await prisma.articleCategory.findFirst({
+              where: { id: curId, deletedAt: null },
+              select: {
+                parentId: true,
+                attributes: {
+                  where: { isVariantAxis: true, deletedAt: null, ...(isOwn ? {} : { inheritToChild: true }) },
+                  select: { definitionId: true },
+                },
               },
-            },
-          });
+            });
           if (!cat) break;
-          cat.attributes.forEach(a => result.add(a.definitionId));
+          cat.attributes.forEach((a: { definitionId: string }) => result.add(a.definitionId));
           curId = cat.parentId ?? null;
           isOwn = false;
         }

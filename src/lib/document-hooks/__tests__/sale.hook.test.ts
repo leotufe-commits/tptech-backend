@@ -51,7 +51,7 @@ function makeSaleRecord(over: Partial<any> = {}) {
       {
         id: "line-1",
         articleId: "art-1",
-        variantId: null,
+        variantId: null as string | null,
         articleName: "Producto 1",
         variantName: "",
         sku: "SKU1",

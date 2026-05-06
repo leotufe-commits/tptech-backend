@@ -11,6 +11,7 @@ datasource db {
 model Jewelry {
   id                         String                     @id @default(cuid())
   name                       String
+  legalName                  String                     @default("")
   firstName                  String
   lastName                   String
   phoneCountry               String
@@ -117,6 +118,10 @@ model Jewelry {
   coupons                    Coupon[]
   couponBrands               CouponBrand[]
   units                      Unit[]
+  receiptSeries              ReceiptSeries[]
+  receipts                   Receipt[]
+  receiptLines               ReceiptLine[]
+  currentAccountMovements    CurrentAccountMovement[]
 
   @@index([createdAt])
   @@index([deletedAt])
@@ -337,6 +342,8 @@ model User {
   crossSettlementsCreated    CrossSettlement[]           @relation("CrossSettlementCreatedBy")
   crossSettlementsVoided     CrossSettlement[]           @relation("CrossSettlementVoidedBy")
   importBatches              ImportBatch[]               @relation("ImportBatchCreatedBy")
+  receiptsIssued             Receipt[]                   @relation("ReceiptIssuedBy")
+  receiptsVoided             Receipt[]                   @relation("ReceiptVoidedBy")
 
   @@unique([jewelryId, email])
   @@index([jewelryId])
@@ -1441,6 +1448,8 @@ model CommercialEntity {
   couponRedemptions          CouponRedemption[]     @relation("CouponRedemptionClient")
   purchasePaymentsAsSupplier PurchasePayment[]       @relation("PurchasePaymentSupplier")
   crossSettlementsAsSupplier CrossSettlement[]       @relation("CrossSettlementSupplier")
+  receiptsAsCounterparty     Receipt[]               @relation("ReceiptCounterparty")
+  currentAccountMovements    CurrentAccountMovement[]
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -1705,6 +1714,7 @@ model Article {
   quantityDiscounts QuantityDiscount[] @relation("ArticleQuantityDiscounts")
   couponArticles    CouponArticle[]
   groupItems        ArticleGroupItem[]
+  receiptLines      ReceiptLine[]
 
   @@unique([jewelryId, code])
   @@unique([jewelryId, barcode])         // barcode único por tenant (NULLs excluidos del check)
@@ -1903,6 +1913,7 @@ model ArticleVariant {
   attributeValues   ArticleVariantAttributeValue[]
   images            ArticleVariantImage[]
   costLineRefs      ArticleCostLine[]  @relation("CostLineRefVariant")
+  receiptLines      ReceiptLine[]
 
   @@unique([articleId, code])
   @@unique([jewelryId, barcode])   // barcode único por tenant (NULLs excluidos)
@@ -2262,6 +2273,7 @@ model Sale {
   lines            SaleLine[]
   payments         SalePayment[]
   couponRedemptions CouponRedemption[]
+  receipts         Receipt[]
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -2701,6 +2713,7 @@ model Purchase {
   lines              PurchaseLine[]
   payments           PurchasePayment[]
   crossSettlements   CrossSettlement[]  @relation("CrossSettlementPurchase")
+  receipts           Receipt[]
 
   @@unique([jewelryId, code])
   @@index([jewelryId])
@@ -3231,4 +3244,175 @@ model CouponMetalVariant {
   @@index([couponId])
   @@index([metalVariantId])
   @@index([jewelryId])
+}
+
+/// ===========================================================================
+/// FASE 5 — Comprobantes (Receipt) + Cuenta corriente
+/// Migración: 20260424000000_add_receipts_current_account
+/// ===========================================================================
+
+enum ReceiptType {
+  QUOTE
+  INVOICE
+  DELIVERY_NOTE
+  CREDIT_NOTE
+  DEBIT_NOTE
+}
+
+enum ReceiptDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum ReceiptStatus {
+  DRAFT
+  ISSUED
+  VOIDED
+}
+
+enum AccountMovementKind {
+  DEBIT
+  CREDIT
+}
+
+enum AccountMovementSource {
+  RECEIPT
+  PAYMENT_ALLOCATION
+}
+
+model ReceiptSeries {
+  id          String           @id @default(cuid())
+  jewelryId   String
+  name        String
+  type        ReceiptType
+  direction   ReceiptDirection
+  prefix      String           @default("")
+  pointOfSale String           @default("0001")
+  nextNumber  Int              @default(1)
+  isActive    Boolean          @default(true)
+  deletedAt   DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  jewelry  Jewelry   @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  receipts Receipt[]
+
+  @@unique([jewelryId, type, direction, prefix, pointOfSale])
+  @@index([jewelryId])
+  @@index([jewelryId, type, direction])
+}
+
+model Receipt {
+  id                 String           @id @default(cuid())
+  jewelryId          String
+  seriesId           String
+  code               String
+  type               ReceiptType
+  direction          ReceiptDirection
+  status             ReceiptStatus    @default(DRAFT)
+  saleId             String?
+  purchaseId         String?
+  correctedReceiptId String?
+  counterpartyId     String?
+  pricingSnapshot    Json
+  currencySnapshot   Json
+  currencyCode       String           @default("")
+  currencyRate       Decimal          @default(1) @db.Decimal(18, 8)
+  subtotal           Decimal          @default(0) @db.Decimal(14, 2)
+  discountAmount     Decimal          @default(0) @db.Decimal(14, 2)
+  taxAmount          Decimal          @default(0) @db.Decimal(14, 2)
+  total              Decimal          @default(0) @db.Decimal(14, 2)
+  totalBase          Decimal          @default(0) @db.Decimal(14, 2)
+  issueDate          DateTime         @default(now())
+  dueDate            DateTime?
+  issuedAt           DateTime?
+  voidedAt           DateTime?
+  voidReason         String           @default("")
+  notes              String           @default("")
+  issuedById         String?
+  voidedById         String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  jewelry           Jewelry                  @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  series            ReceiptSeries            @relation(fields: [seriesId], references: [id], onDelete: Restrict)
+  sale              Sale?                    @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  purchase          Purchase?                @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  correctedReceipt  Receipt?                 @relation("ReceiptCorrection", fields: [correctedReceiptId], references: [id], onDelete: Restrict)
+  correctingReceipts Receipt[]               @relation("ReceiptCorrection")
+  counterparty      CommercialEntity?        @relation("ReceiptCounterparty", fields: [counterpartyId], references: [id], onDelete: SetNull)
+  issuedBy          User?                    @relation("ReceiptIssuedBy", fields: [issuedById], references: [id], onDelete: SetNull)
+  voidedBy          User?                    @relation("ReceiptVoidedBy", fields: [voidedById], references: [id], onDelete: SetNull)
+  lines             ReceiptLine[]
+  accountMovements  CurrentAccountMovement[]
+
+  @@unique([jewelryId, seriesId, code])
+  @@index([jewelryId, type])
+  @@index([jewelryId, status])
+  @@index([jewelryId, issueDate])
+  @@index([counterpartyId])
+  @@index([saleId])
+  @@index([purchaseId])
+  @@index([correctedReceiptId])
+}
+
+model ReceiptLine {
+  id              String   @id @default(cuid())
+  receiptId       String
+  jewelryId       String
+  pricingSnapshot Json
+  articleId       String?
+  variantId       String?
+  itemKind        String
+  name            String   @default("")
+  code            String   @default("")
+  sku             String   @default("")
+  barcode         String   @default("")
+  quantity        Decimal  @db.Decimal(14, 4)
+  unitPrice       Decimal  @db.Decimal(14, 4)
+  subtotal        Decimal  @db.Decimal(14, 2)
+  discountAmount  Decimal  @default(0) @db.Decimal(14, 2)
+  lineTotal       Decimal  @db.Decimal(14, 2)
+  taxAmount       Decimal  @default(0) @db.Decimal(14, 2)
+  totalWithTax    Decimal  @db.Decimal(14, 2)
+  totalCost       Decimal? @db.Decimal(14, 2)
+  totalMargin     Decimal? @db.Decimal(14, 2)
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  receipt Receipt          @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  article Article?         @relation(fields: [articleId], references: [id], onDelete: SetNull)
+  variant ArticleVariant?  @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  jewelry Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+
+  @@index([receiptId])
+  @@index([articleId])
+  @@index([variantId])
+  @@index([jewelryId])
+}
+
+model CurrentAccountMovement {
+  id                  String                @id @default(cuid())
+  jewelryId           String
+  entityId            String
+  kind                AccountMovementKind
+  source              AccountMovementSource
+  receiptId           String?
+  paymentAllocationId String?
+  amountBase          Decimal               @db.Decimal(14, 2)
+  amountOriginal      Decimal               @db.Decimal(14, 2)
+  currencySnapshot    Json
+  currencyCode        String                @default("")
+  currencyRate        Decimal               @db.Decimal(18, 8)
+  movementDate        DateTime
+  createdAt           DateTime              @default(now())
+  notes               String                @default("")
+
+  jewelry Jewelry          @relation(fields: [jewelryId], references: [id], onDelete: Cascade)
+  entity  CommercialEntity @relation(fields: [entityId], references: [id], onDelete: Restrict)
+  receipt Receipt?         @relation(fields: [receiptId], references: [id], onDelete: Restrict)
+
+  @@index([jewelryId, entityId, movementDate])
+  @@index([receiptId])
+  @@index([paymentAllocationId])
 }
