@@ -901,8 +901,93 @@ export interface PricingLineSnapshot {
     hechura?:      { original: number | null; applied: number | null; manual: boolean };
   };
 
+  // ── F1.3 G4.x #5b — composición + breakdown sale-side persistidos ─────────
+  // Se agregan en snapshot v4 (aditivos, opcionales). Snapshots v3 se siguen
+  // leyendo: estos campos vienen `undefined` y la UI los normaliza a defaults
+  // seguros (composition=null → arrays vacíos; componentSaleBreakdown=null →
+  // sin desglose por componente).
+  //
+  // Decisión de shape:
+  //   · Tipos plain (no Decimal, no clases) — JSON-safe y space-frozen.
+  //   · Estructura idéntica al preview (paridad byte-a-byte verificable).
+  //   · Cero cálculo en lectura — POLICY R4.5 reader-only.
+
+  /** Composición visual del precio (metal / hechura / products / services /
+   *  taxes). Espejo del bloque que articles/pricing-preview y sales/preview
+   *  emiten. `null` cuando el caller no la pasó (snapshots viejos / casos
+   *  donde la armado de composition falló por motivo independiente). */
+  composition?: SnapshotComposition | null;
+
+  /** Desglose por componente (metal/hechura) con `base`, `adjustments[]`,
+   *  `final` y `salePreManualDiscount`. Es el mismo shape que
+   *  `SalePriceResult.componentSaleBreakdown` pero serializado plano. */
+  componentSaleBreakdown?: ComponentSaleDetail | null;
+
   // ── Timestamp ISO-8601 del momento en que se congeló el precio ────────────
   resolvedAt: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SnapshotComposition — espejo plano del bloque `composition` de pricing
+// preview, persistido en PricingLineSnapshot (v4+). Estructuralmente idéntico
+// al tipo `Composition` de `src/lib/pricing-composition.ts`. Se redeclara acá
+// para evitar import circular (pricing-composition depende del motor).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SnapshotCompositionMetalBlock {
+  originalGrams:     number | null;
+  appliedGrams:      number | null;
+  gramsManual:       boolean;
+  originalMermaPct:  number | null;
+  appliedMermaPct:   number | null;
+  mermaManual:       boolean;
+  originalVariantId: string | null;
+  appliedVariantId:  string | null;
+  variantManual:     boolean;
+  purity:            number | null;
+  purityLabel:       string | null;
+  metalName:         string | null;
+}
+
+export interface SnapshotCompositionHechuraBlock {
+  originalAmount: number | null;
+  appliedAmount:  number | null;
+  manual:         boolean;
+  appliesTo:      string | null;
+}
+
+export interface SnapshotCompositionItemBlock {
+  costLineId:       string | null;
+  catalogItemId:    string | null;
+  catalogItemCode:  string | null;
+  catalogItemName:  string | null;
+  quantity:         number;
+  unitValue:        number;
+  totalValue:       number;
+  currencyId:       string | null;
+  lineAdjKind:      "BONUS" | "SURCHARGE" | null;
+  lineAdjType:      "PERCENTAGE" | "FIXED_AMOUNT" | null;
+  lineAdjValue:     number | null;
+  lineAdjAmount:    number | null;
+  affectsStock:     boolean | null;
+}
+
+export interface SnapshotCompositionTaxItem {
+  id:        string;
+  name:      string;
+  code:      string;
+  rate:      number | null;
+  appliesTo: string;
+  taxAmount: number;
+  manual:    boolean;
+}
+
+export interface SnapshotComposition {
+  metal:    SnapshotCompositionMetalBlock | null;
+  hechura:  SnapshotCompositionHechuraBlock | null;
+  products: SnapshotCompositionItemBlock[];
+  services: SnapshotCompositionItemBlock[];
+  taxes:    SnapshotCompositionTaxItem[];
 }
 
 /** Versión actual del shape de PricingLineSnapshot. Bump al agregar campos
@@ -914,5 +999,10 @@ export interface PricingLineSnapshot {
  *  v3 (Sprint 3) — populi customerDiscountAmount cuando hay rule de cliente
  *                  DISCOUNT/BONUS; populi pureGramsBase/pureGramsSale en
  *                  metalHechuraBreakdown cuando hay purity única. Snapshots
- *                  v2 siguen siendo legibles (campos nuevos quedan null). */
-export const PRICING_LINE_SNAPSHOT_VERSION = 3;
+ *                  v2 siguen siendo legibles (campos nuevos quedan null).
+ *  v4 (F1.3 G4.x #5b) — agrega `composition` (metal/hechura/products[]/
+ *                  services[]/taxes) y `componentSaleBreakdown` (con
+ *                  `salePreManualDiscount` por componente). Aditivos:
+ *                  snapshots v3 son legibles — los campos nuevos quedan
+ *                  `undefined` y la UI los normaliza a null. */
+export const PRICING_LINE_SNAPSHOT_VERSION = 4;

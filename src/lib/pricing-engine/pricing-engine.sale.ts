@@ -36,6 +36,7 @@ import type {
   ComponentSaleAdjustment,
   ComponentSaleBreakdown,
   ComponentSaleDetail,
+  SnapshotComposition,
 } from "./pricing-engine.types.js";
 import { PRICING_LINE_SNAPSHOT_VERSION } from "./pricing-engine.types.js";
 
@@ -2853,9 +2854,25 @@ export async function evaluatePricingPolicy(
 // Uso:
 //   const snap = buildPricingSnapshot(result);
 //   await tx.saleLine.update({ data: { pricingSnapshot: snap as any } });
+//
+// F1.3 G4.x #5b — segundo arg opcional `{ composition }`:
+//   const snap = buildPricingSnapshot(result, { composition });
+// La composición se arma fuera del motor (pricing-composition.ts depende del
+// motor → no se puede importar al revés sin ciclo). El caller la pasa cuando
+// la armó; si no la pasa, el snapshot queda con `composition: null` y la UI
+// degrada a defaults seguros.
 // ---------------------------------------------------------------------------
 
-export function buildPricingSnapshot(result: SalePriceResult): PricingLineSnapshot {
+export interface BuildPricingSnapshotOptions {
+  /** Composición visual (metal/hechura/products/services/taxes). Se persiste
+   *  tal cual la pasó el caller — paridad byte-a-byte con el preview. */
+  composition?: SnapshotComposition | null;
+}
+
+export function buildPricingSnapshot(
+  result:  SalePriceResult,
+  options?: BuildPricingSnapshotOptions,
+): PricingLineSnapshot {
   const mhb = result.metalHechuraBreakdown ?? null;
   return {
     snapshotVersion: PRICING_LINE_SNAPSHOT_VERSION,
@@ -2907,6 +2924,12 @@ export function buildPricingSnapshot(result: SalePriceResult): PricingLineSnapsh
       : null,
 
     costOverrideContext: result.costOverrideContext,
+
+    // F1.3 G4.x #5b — paridad preview/persisted (aditivo, snapshot v4).
+    // `composition` viene del caller (pricing-composition.ts); el motor solo
+    // pasa el componentSaleBreakdown que él mismo computó.
+    composition:            options?.composition ?? null,
+    componentSaleBreakdown: result.componentSaleBreakdown ?? null,
 
     resolvedAt: new Date().toISOString(),
   };

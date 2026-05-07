@@ -1731,14 +1731,30 @@ export async function resolveDraftSaleLinesPricing(
   // ── Precarga de totales por categoría / marca / grupo ────────────────────
   // Se usan cuando un QuantityDiscount evalúa por CATEGORY_TOTAL / BRAND_TOTAL
   // / GROUP_TOTAL. Mismo patrón que previewSale().
+  //
+  // F1.3 G4.x #5b — además precargamos `costComposition` para poder armar
+  // composition (products/services) y persistirla en el snapshot del DRAFT.
+  // Sin esto, el snapshot iba sin composition y al confirmar perdíamos
+  // paridad preview/persisted.
   const articleIds = [...new Set(lines.map(l => l.articleId))];
   const articleMeta = articleIds.length > 0
     ? await prisma.article.findMany({
         where: { id: { in: articleIds }, jewelryId, deletedAt: null },
-        select: { id: true, categoryId: true, brand: true },
+        select: {
+          id: true, categoryId: true, brand: true,
+          costComposition: { select: { catalogItemId: true } },
+        },
       })
     : [];
   const metaMap = new Map(articleMeta.map(a => [a.id, a]));
+
+  // F1.3 G4.x #5b — catalogItemsMap GLOBAL (1 query con dedupe cross-líneas).
+  // Mismo patrón que previewSale (commit G4.1.4). Failure-safe: catálogo
+  // caído → Map vacío y los items renderean con fallback meta.lineCode/Label.
+  const catalogItemsMap = await buildCatalogItemsMapForCostLines(
+    jewelryId,
+    articleMeta.map(a => a.costComposition ?? []),
+  );
 
   const variantIds = lines.map(l => l.variantId).filter(Boolean) as string[];
   const variantGroupItems = variantIds.length > 0
@@ -1821,7 +1837,23 @@ export async function resolveDraftSaleLinesPricing(
       const discountPct = 0;
       const lineTotal   = Math.round(unitPrice * line.quantity * 100) / 100;
 
-      const pricingSnapshot = buildPricingSnapshot(result);
+      // F1.3 G4.x #5b — armar composition para persistirla en el snapshot.
+      // Failure-safe: si buildComposition falla, snapshot queda con
+      // composition=null y la UI degrada a defaults seguros (sin crash).
+      let composition: Awaited<ReturnType<typeof buildComposition>> | null = null;
+      try {
+        const metalVariantIdToFetch = resolveMetalVariantIdFromResult(result);
+        const metalVariantInfo      = await fetchMetalVariantInfo(metalVariantIdToFetch);
+        composition = buildComposition(result, metalVariantInfo, catalogItemsMap);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[sales.draftPricing] buildComposition falló para articleId=${line.articleId}; ` +
+          `snapshot persistido con composition=null:`,
+          err,
+        );
+      }
+      const pricingSnapshot = buildPricingSnapshot(result, { composition });
 
       return {
         articleId:           line.articleId,
@@ -2620,8 +2652,28 @@ export async function previewSale(
           }
         : null;
 
+      // F1.3 G4.x #5b — composition se arma ANTES del snapshot para que se
+      // persista junto con el resto del precio (paridad preview/persisted).
+      // Failure-isolation por línea: si buildComposition lanza, esa línea
+      // queda con composition=null y el resto del preview sigue.
+      const metalVariantIdToFetch = resolveMetalVariantIdFromResult(pricing);
+      const metalVariantInfo      = await fetchMetalVariantInfo(metalVariantIdToFetch);
+      let composition: Awaited<ReturnType<typeof buildComposition>> | null = null;
+      try {
+        composition = buildComposition(pricing, metalVariantInfo, catalogItemsMap);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[sales/preview] buildComposition falló para línea articleId=${line.articleId}; ` +
+          `composition=null para esta línea, resto del preview sigue:`,
+          err,
+        );
+      }
+
       // Snapshot reusable — lo mismo que createSale persiste en DRAFT.
-      const pricingSnapshotForLine = buildPricingSnapshot(pricing);
+      // F1.3 G4.x #5b — pasamos `composition` para que viaje en el snapshot
+      // (igual al de DRAFT). El motor ya provee componentSaleBreakdown.
+      const pricingSnapshotForLine = buildPricingSnapshot(pricing, { composition });
       // El snapshot del motor ya trae `totalWithTax` UNITARIO REDONDEADO
       // (preservando applyRounding cuando la lista aplica `applyOn=TOTAL`).
       // NO pisarlo: antes lo reescribíamos como `unitPrice + unitTaxAmount`
@@ -2636,24 +2688,6 @@ export async function previewSale(
         line.articleId,
         pricing.unitCost ?? null,
       );
-      // 2) Bloque `composition` (metal/hechura/taxes/products/services).
-      // F1.3 G4.1.4 — catalogItemsMap se construyó UNA VEZ globalmente arriba.
-      // Failure-isolation por línea: si buildComposition lanza por alguna razón
-      // inesperada (shape inválido, variante metal corrupta), NO rompemos todo
-      // el preview — esa línea queda con composition=null y el resto continúa.
-      const metalVariantIdToFetch = resolveMetalVariantIdFromResult(pricing);
-      const metalVariantInfo      = await fetchMetalVariantInfo(metalVariantIdToFetch);
-      let composition: Awaited<ReturnType<typeof buildComposition>> | null = null;
-      try {
-        composition = buildComposition(pricing, metalVariantInfo, catalogItemsMap);
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[sales/preview] buildComposition falló para línea articleId=${line.articleId}; ` +
-          `composition=null para esta línea, resto del preview sigue:`,
-          err,
-        );
-      }
       const appliedMermaPercent   = getAppliedMermaPercent(pricing);
 
       // FASE 1.1 G7 — flags explícitos de qué overrides aplicó el operador a
