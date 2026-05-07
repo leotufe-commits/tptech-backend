@@ -3731,6 +3731,15 @@ export async function previewCostLines(
       metalCost:   costResult.metalCost   != null ? costResult.metalCost.toFixed(4)   : null,
       hechuraCost: costResult.hechuraCost != null ? costResult.hechuraCost.toFixed(4) : null,
       totalGrams:  costResult.totalGrams  != null ? costResult.totalGrams.toFixed(4)  : null,
+      // FASE 1.1 G5 — breakdown extendido del costo. El motor ya los computa
+      // internamente; los exponemos para que ArticleModal/CostosTab dejen de
+      // replicar la fórmula `metal × (1 + merma%)` en cliente (POLICY.md R4.3).
+      metalGramsWithMerma: costResult.metalGramsWithMerma != null
+        ? costResult.metalGramsWithMerma.toFixed(4)
+        : null,
+      metalPurity: costResult.metalPurity != null
+        ? costResult.metalPurity.toFixed(4)
+        : null,
       partial:     costResult.partial,
       mode:        costResult.mode,
     },
