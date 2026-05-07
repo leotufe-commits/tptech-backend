@@ -190,6 +190,65 @@ export function resolveMetalVariantIdFromResult(
 }
 
 /**
+ * F1.3 G4.1.3 — pre-carga el catalog info (code/name) para los PRODUCT/SERVICE
+ * referenciados en los steps de un resultado de pricing. UNA SOLA query
+ * batch — evita N+1 cuando el artículo tiene múltiples cost lines.
+ *
+ * IMPORTANTE — cuándo llamar:
+ *   · UNA vez por request (post-engine, pre-buildComposition).
+ *   · NO llamar per-línea, per-step, ni dentro de buildComposition.
+ *
+ * Failure-safety:
+ *   · Si la query Prisma falla por cualquier razón (DB down, jewelryId
+ *     inválido, artículos eliminados, etc.), devuelve Map vacío.
+ *   · Los items aparecerán igual con `catalogItemCode/Name` desde
+ *     `step.meta.lineCode/lineLabel` fallback (resuelto en
+ *     `extractCompositionItems`). NUNCA rompe la composición.
+ *
+ * @param jewelryId Tenant scope obligatorio (multi-tenancy).
+ * @param steps     Lista de steps del motor (cualquiera; se filtra adentro).
+ */
+export async function buildCatalogItemsMapForSteps(
+  jewelryId: string,
+  steps: PricingStep[] | null | undefined,
+): Promise<Map<string, { code: string; name: string }>> {
+  const empty = new Map<string, { code: string; name: string }>();
+  if (!Array.isArray(steps) || steps.length === 0) return empty;
+  if (!jewelryId) return empty;
+
+  const ids = new Set<string>();
+  for (const s of steps) {
+    if (!s) continue;
+    if (s.key !== "COST_LINES_PRODUCT" && s.key !== "COST_LINES_SERVICE") continue;
+    if (s.status !== "ok") continue;
+    const id = (s.meta as any)?.catalogItemId;
+    if (typeof id === "string" && id.length > 0) ids.add(id);
+  }
+  if (ids.size === 0) return empty;
+
+  try {
+    const items = await prisma.article.findMany({
+      where:  { jewelryId, id: { in: [...ids] }, deletedAt: null },
+      select: { id: true, code: true, name: true },
+    });
+    const map = new Map<string, { code: string; name: string }>();
+    for (const a of items) {
+      map.set(a.id, { code: a.code ?? "", name: a.name ?? "" });
+    }
+    return map;
+  } catch (err) {
+    // Failure-safety: NO romper composition por catalog lookup fallido.
+    // Los items renderean igual con fallback meta.lineCode/lineLabel.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[pricing-composition] catalog lookup falló; usando fallback meta.lineCode/lineLabel:",
+      err,
+    );
+    return empty;
+  }
+}
+
+/**
  * F1.3 G4.1.1 — extrae bloques `products[]` o `services[]` desde
  * `result.steps[]` filtrando por la key correspondiente.
  *

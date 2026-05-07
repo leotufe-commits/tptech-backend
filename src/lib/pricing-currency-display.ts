@@ -250,6 +250,26 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
     convertFieldNumber(comp.hechura, "originalAmount", rate);
     convertFieldNumber(comp.hechura, "appliedAmount",  rate);
   }
+  // F1.3 G4.1.3 — products/services arrays. Convertir SOLO los campos
+  // monetarios (unitValue, totalValue, lineAdjAmount, y lineAdjValue
+  // únicamente cuando type=FIXED_AMOUNT). PRESERVAR sin convertir:
+  //   · quantity (no es moneda)
+  //   · ids/codes/names (strings)
+  //   · lineAdjValue cuando type=PERCENTAGE (porcentaje)
+  //   · affectsStock (boolean)
+  //   · currencyId (id, no monto)
+  for (const items of [comp.products, comp.services]) {
+    if (!Array.isArray(items)) continue;
+    for (const it of items) {
+      convertFieldNumber(it, "unitValue",     rate);
+      convertFieldNumber(it, "totalValue",    rate);
+      convertFieldNumber(it, "lineAdjAmount", rate);
+      // lineAdjValue: convertir SOLO si es FIXED_AMOUNT (es monto, no %).
+      if (it?.lineAdjType === "FIXED_AMOUNT") {
+        convertFieldNumber(it, "lineAdjValue", rate);
+      }
+    }
+  }
   if (Array.isArray(comp.taxes)) {
     for (const t of comp.taxes) {
       convertFieldNumber(t, "taxAmount", rate);

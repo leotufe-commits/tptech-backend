@@ -23,6 +23,7 @@ import { auditLog } from "../../lib/auditLogger.js";
 import { prisma } from "../../lib/prisma.js";
 import {
   buildComposition,
+  buildCatalogItemsMapForSteps,
   fetchMetalVariantInfo,
   resolveMetalVariantIdFromResult,
 } from "../../lib/pricing-composition.js";
@@ -1291,9 +1292,16 @@ export async function getPricingPreview(req: any, res: Response) {
   // `src/lib/pricing-composition.ts`. La lógica original (purity/label,
   // bloque metal+hechura+taxes) vive ahí para que `sales/preview` exponga
   // exactamente el mismo shape sin duplicación.
+  //
+  // F1.3 G4.1.3 — pre-carga catalog info para los PRODUCT/SERVICE
+  // referenciados en `result.steps`. UNA SOLA query batch por request,
+  // failure-safe (si falla, los items usan fallback meta.lineCode/lineLabel).
   const metalVariantIdToFetch = resolveMetalVariantIdFromResult(result);
-  const metalVariantInfo = await fetchMetalVariantInfo(metalVariantIdToFetch);
-  const composition = buildComposition(result, metalVariantInfo);
+  const [metalVariantInfo, catalogItemsMap] = await Promise.all([
+    fetchMetalVariantInfo(metalVariantIdToFetch),
+    buildCatalogItemsMapForSteps(req.user.jewelryId, result.steps),
+  ]);
+  const composition = buildComposition(result, metalVariantInfo, catalogItemsMap);
 
   // ── Document totals (paridad simulador↔factura) ─────────────────────────
   // Antes el frontend derivaba `documentTotals` localmente desde unitPrice +
