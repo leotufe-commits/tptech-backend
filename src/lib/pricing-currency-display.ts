@@ -482,6 +482,8 @@ export function convertArticlePreviewResponseInPlace(res: any, rate: number): vo
   convertFieldNumber(res, "lineTotal",        rate);
   convertFieldNumber(res, "lineTaxAmount",    rate);
   convertFieldNumber(res, "lineTotalWithTax", rate);
+  // FASE 1.2 G3.1 — descuento per-line top-level (mismo patrón que G3).
+  convertFieldNumber(res, "lineDiscount",     rate);
 
   // Costo de compra.
   convertFieldString(res, "costBase",      rate);

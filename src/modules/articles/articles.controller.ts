@@ -1452,6 +1452,26 @@ export async function getPricingPreview(req: any, res: Response) {
     lineTotal:        lineTotalNet,
     lineTaxAmount:    lineTaxAmountDoc,
     lineTotalWithTax: lineTotalWithTax,
+    // ── FASE 1.2 G3.1 — lineDiscount top-level (incremento mínimo a G3) ──
+    // POLICY.md §4 R4.5 — el frontend NO debe derivar campos aritméticamente.
+    // Hoy normalizeArticlePricingPreview hace `r2((basePrice - unitPrice) ×
+    // qty)` para mostrar el descuento de la línea; con G3.1 el backend lo
+    // emite plano y el frontend pasa a passthrough puro.
+    //
+    // Cálculo: (basePrice - unitPrice) × quantity, redondeado.
+    // Si basePrice o unitPrice no están disponibles → 0 (mismo fallback que
+    // el frontend usaba bajo legacy).
+    //
+    // Frontend desbloqueado:
+    //   · Priority 1 — completa la migración del normalizer del simulador.
+    //     normalizeArticlePricingPreview ya no necesita NINGÚN cálculo local
+    //     para los 4 totales per-línea (lineTotal, lineTaxAmount,
+    //     lineTotalWithTax, lineDiscount).
+    // Sin clamp a 0 — preserva paridad exacta con el cálculo legacy del
+    // frontend (`r2((basePrice - unitPrice) × qty)`). Si unitPrice > basePrice
+    // (override manual que sube el precio), lineDiscount queda negativo —
+    // semánticamente "recargo manual". El consumidor decide si filtrar o no.
+    lineDiscount:     round2((basePriceNum - unitPriceNum) * quantity),
     costBase:              costTaxResult.costBase,
     costTaxAmount:         costTaxResult.costTaxAmount,
     costWithTax:           costTaxResult.costWithTax,
