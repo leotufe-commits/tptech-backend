@@ -2633,6 +2633,13 @@ export async function previewSale(
       // pero ese flag no distingue entre los 3 tipos.
       // `quantity` queda en `false` siempre — el motor nunca computa qty,
       // es siempre input directo del operador.
+      //
+      // Frontend desbloqueado:
+      //   · Priority 6 — composeDocumentPricingDetail puede mostrar
+      //     trazabilidad explícita: "este descuento es manual, no de regla".
+      //   · Priority 8 — VentasFacturas / TPDocumentLineAdvancedEditor
+      //     pueden destacar visualmente cada subcampo overrideado en lugar
+      //     de mostrar un único badge "MANUAL_OVERRIDE".
       const manualOverridesApplied = {
         quantity: false,
         price:    line.manualPriceOverride != null,

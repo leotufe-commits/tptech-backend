@@ -211,6 +211,12 @@ export type PriceSource =
   // El motor todavía la procesa fuera del flow normal en sales.service.ts:2349
   // y devuelve un snapshot sintético con priceSource="MANUAL_LINE". Está en el
   // union para que TypeScript no obligue el cast `as any` (POLICY §3 R3.6).
+  //
+  // Frontend desbloqueado:
+  //   · Priority 4 — VentasFacturas computeManualTax: la línea manual puede
+  //     consumir el snapshot tipado sin perder type-safety en sus consumers.
+  //   · Priority 8 — paridad de líneas manuales: requisito previo a que el
+  //     motor formal procese MANUAL_LINE (Gap G2 / Fase 1.3).
   | "MANUAL_LINE"
   | "NONE";
 

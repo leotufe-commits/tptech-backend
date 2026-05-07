@@ -234,6 +234,15 @@ export async function previewCostLines(req: any, res: Response) {
   const manualAdjustment = req.body?.manualAdjustment ?? undefined;
   // FASE 1.1 G6 — moneda de display. Si viene currencyId distinto a la base,
   // el response se convierte in-place. Mismo patrón que pricing-preview.
+  //
+  // POLICY.md §9 R9.6 — la cotización de moneda viva nunca contamina un
+  // documento histórico; aplica solo al display del preview.
+  //
+  // Frontend desbloqueado:
+  //   · Priority 5 / Área adicional — pages/article-detail/CostRow.tsx y
+  //     ArticleModal.tsx hoy hacen `unitCost / dispRate` y `metalCost /
+  //     latestRate` para mostrar costo en otra moneda. Con G6 el cálculo
+  //     viaja al backend (POLICY R12 — frontend NO convierte moneda).
   const responseCurrencyId =
     typeof req.body?.currencyId === "string" && req.body.currencyId
       ? req.body.currencyId
