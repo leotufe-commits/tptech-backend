@@ -1415,6 +1415,14 @@ export async function getPricingPreview(req: any, res: Response) {
           ),
         }
       : null,
+    // FASE 1.1 G3 — totales per-line escalados × quantity, expuestos top-level.
+    // El backend ya los computa internamente para `documentTotals`; los
+    // exponemos planos para que el normalizer del frontend pueda dejar de
+    // multiplicar `unitPrice × qty` con `r2` (POLICY.md R4.5). El simulador
+    // siempre tiene 1 línea — estos valores son agregados de esa única línea.
+    lineTotal:        lineTotalNet,
+    lineTaxAmount:    lineTaxAmountDoc,
+    lineTotalWithTax: lineTotalWithTax,
     costBase:              costTaxResult.costBase,
     costTaxAmount:         costTaxResult.costTaxAmount,
     costWithTax:           costTaxResult.costWithTax,

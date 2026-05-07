@@ -478,6 +478,11 @@ export function convertArticlePreviewResponseInPlace(res: any, rate: number): vo
   convertFieldString(res, "totalWithTax", rate);
   convertTaxBreakdownItemsInPlace(res.taxBreakdown, rate);
 
+  // FASE 1.1 G3 — totales per-line top-level (números, no strings).
+  convertFieldNumber(res, "lineTotal",        rate);
+  convertFieldNumber(res, "lineTaxAmount",    rate);
+  convertFieldNumber(res, "lineTotalWithTax", rate);
+
   // Costo de compra.
   convertFieldString(res, "costBase",      rate);
   convertFieldString(res, "costTaxAmount", rate);
