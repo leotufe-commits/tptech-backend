@@ -76,10 +76,12 @@ vi.mock("../../../lib/pricing-engine/pricing-engine.js", () => ({
 // Helper compartido `pricing-composition` también lo usa previewSale. Lo
 // mockeamos vacío para que los tests no necesiten metalVariant en DB.
 vi.mock("../../../lib/pricing-composition.js", () => ({
-  buildComposition:               () => ({ metal: null, hechura: null, taxes: [] }),
+  buildComposition:               () => ({ metal: null, hechura: null, products: [], services: [], taxes: [] }),
   fetchMetalVariantInfo:          vi.fn().mockResolvedValue({ purity: null, purityLabel: null, metalName: null }),
   resolveMetalVariantIdFromResult: () => null,
   getAppliedMermaPercent:         () => null,
+  buildCatalogItemsMapForCostLines: vi.fn().mockResolvedValue(new Map()),
+  buildCatalogItemsMapForSteps:     vi.fn().mockResolvedValue(new Map()),
 }));
 
 vi.mock("../../../lib/pricing-engine/pricing-engine.currency.js", () => ({

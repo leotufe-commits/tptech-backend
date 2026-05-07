@@ -190,41 +190,23 @@ export function resolveMetalVariantIdFromResult(
 }
 
 /**
- * F1.3 G4.1.3 — pre-carga el catalog info (code/name) para los PRODUCT/SERVICE
- * referenciados en los steps de un resultado de pricing. UNA SOLA query
- * batch — evita N+1 cuando el artículo tiene múltiples cost lines.
+ * F1.3 G4.1.3 — internal — query batch failure-safe por catalogItemIds.
  *
- * IMPORTANTE — cuándo llamar:
- *   · UNA vez por request (post-engine, pre-buildComposition).
- *   · NO llamar per-línea, per-step, ni dentro de buildComposition.
+ * Centraliza el patrón de:
+ *   1. Set dedupe (no se valida acá; el caller pasa el Set ya dedupeado).
+ *   2. Single query Prisma con filtros multi-tenancy + soft-delete.
+ *   3. Failure-safety: si Prisma throws, devuelve Map vacío + log warning.
  *
- * Failure-safety:
- *   · Si la query Prisma falla por cualquier razón (DB down, jewelryId
- *     inválido, artículos eliminados, etc.), devuelve Map vacío.
- *   · Los items aparecerán igual con `catalogItemCode/Name` desde
- *     `step.meta.lineCode/lineLabel` fallback (resuelto en
- *     `extractCompositionItems`). NUNCA rompe la composición.
- *
- * @param jewelryId Tenant scope obligatorio (multi-tenancy).
- * @param steps     Lista de steps del motor (cualquiera; se filtra adentro).
+ * Reusada por `buildCatalogItemsMapForSteps` (post-engine) y
+ * `buildCatalogItemsMapForCostLines` (pre-engine, para sales/preview que
+ * conoce los catalogItemIds desde la precarga de articleData).
  */
-export async function buildCatalogItemsMapForSteps(
+async function loadCatalogItemsByIds(
   jewelryId: string,
-  steps: PricingStep[] | null | undefined,
+  ids: Set<string>,
 ): Promise<Map<string, { code: string; name: string }>> {
   const empty = new Map<string, { code: string; name: string }>();
-  if (!Array.isArray(steps) || steps.length === 0) return empty;
-  if (!jewelryId) return empty;
-
-  const ids = new Set<string>();
-  for (const s of steps) {
-    if (!s) continue;
-    if (s.key !== "COST_LINES_PRODUCT" && s.key !== "COST_LINES_SERVICE") continue;
-    if (s.status !== "ok") continue;
-    const id = (s.meta as any)?.catalogItemId;
-    if (typeof id === "string" && id.length > 0) ids.add(id);
-  }
-  if (ids.size === 0) return empty;
+  if (!jewelryId || ids.size === 0) return empty;
 
   try {
     const items = await prisma.article.findMany({
@@ -246,6 +228,75 @@ export async function buildCatalogItemsMapForSteps(
     );
     return empty;
   }
+}
+
+/**
+ * F1.3 G4.1.3 — pre-carga el catalog info (code/name) para los PRODUCT/SERVICE
+ * referenciados en los steps de un resultado de pricing. UNA SOLA query
+ * batch — evita N+1 cuando el artículo tiene múltiples cost lines.
+ *
+ * Variante para 1 artículo (post-engine). Para sales/preview con N líneas,
+ * usar `buildCatalogItemsMapForCostLines` que dedupea GLOBAL antes del engine.
+ *
+ * IMPORTANTE — cuándo llamar:
+ *   · UNA vez por request (post-engine, pre-buildComposition).
+ *   · NO llamar per-línea, per-step, ni dentro de buildComposition.
+ */
+export async function buildCatalogItemsMapForSteps(
+  jewelryId: string,
+  steps: PricingStep[] | null | undefined,
+): Promise<Map<string, { code: string; name: string }>> {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return new Map<string, { code: string; name: string }>();
+  }
+  const ids = new Set<string>();
+  for (const s of steps) {
+    if (!s) continue;
+    if (s.key !== "COST_LINES_PRODUCT" && s.key !== "COST_LINES_SERVICE") continue;
+    if (s.status !== "ok") continue;
+    const id = (s.meta as any)?.catalogItemId;
+    if (typeof id === "string" && id.length > 0) ids.add(id);
+  }
+  return loadCatalogItemsByIds(jewelryId, ids);
+}
+
+/**
+ * F1.3 G4.1.4 — variante para sales/preview con N líneas del documento.
+ *
+ * Recibe arrays de cost lines (del articleData precargado por previewSale)
+ * y dedupea catalogItemIds GLOBALMENTE antes de la query batch única.
+ *
+ * IMPORTANTE — cuándo llamar:
+ *   · UNA vez por request, ANTES del engine loop (en paralelo con otras
+ *     precargas via Promise.all).
+ *   · NO per-línea, NO dentro del loop, NO dentro de buildComposition.
+ *
+ * Performance: query count = 1 incluso con 100 líneas y catalogItemIds
+ * repetidos. Verificado por test específico de benchmark.
+ *
+ * Failure-safety: si Prisma falla, Map vacío (fallback a meta.lineCode/Label).
+ *
+ * @param jewelryId             Tenant scope obligatorio.
+ * @param costLinesByArticle    Array de arrays de cost lines (típicamente
+ *                              `articleData.map(a => a.costComposition ?? [])`).
+ *                              Solo se inspecciona el campo `catalogItemId`.
+ */
+export async function buildCatalogItemsMapForCostLines(
+  jewelryId: string,
+  costLinesByArticle: Array<Array<{ catalogItemId?: string | null }>> | null | undefined,
+): Promise<Map<string, { code: string; name: string }>> {
+  if (!Array.isArray(costLinesByArticle) || costLinesByArticle.length === 0) {
+    return new Map<string, { code: string; name: string }>();
+  }
+  const ids = new Set<string>();
+  for (const lines of costLinesByArticle) {
+    if (!Array.isArray(lines)) continue;
+    for (const cl of lines) {
+      const id = cl?.catalogItemId;
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+  }
+  return loadCatalogItemsByIds(jewelryId, ids);
 }
 
 /**

@@ -39,6 +39,7 @@ import {
 // `composition` (metal/hechura/taxes). Vive fuera del motor.
 import {
   buildComposition,
+  buildCatalogItemsMapForCostLines,
   fetchMetalVariantInfo,
   resolveMetalVariantIdFromResult,
   getAppliedMermaPercent,
@@ -2287,6 +2288,9 @@ export async function previewSale(
           category: { select: { mermaPercent: true } },
           costComposition: {
             select: {
+              // F1.3 G4.1.2 — `id` necesario para que step.meta.costLineId
+              // se propague (trazabilidad estable, snapshot-safe).
+              id: true,
               type: true, label: true, quantity: true, unitValue: true, currencyId: true,
               mermaPercent: true, metalVariantId: true, lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
               catalogItemId: true, affectsStock: true,
@@ -2296,6 +2300,17 @@ export async function previewSale(
       })
     : [];
   const articleMap = new Map(articleData.map(a => [a.id, a]));
+
+  // F1.3 G4.1.4 — pre-carga GLOBAL del catalog info (code/name) para los
+  // PRODUCT/SERVICE referenciados en TODAS las líneas del documento.
+  // Una sola query batch (Set dedupe global), failure-safe (si falla,
+  // los items usan fallback meta.lineCode/lineLabel — no rompe preview).
+  // Se ejecuta acá (post articleData, pre engine loop) para reutilizar
+  // los costComposition ya cargados sin extra fetch.
+  const catalogItemsMap = await buildCatalogItemsMapForCostLines(
+    jewelryId,
+    articleData.map(a => a.costComposition ?? []),
+  );
 
   // Cliente: tax overrides + reglas comerciales + balanceType (Fase 2A.7).
   // El select se extendió para que el preview exponga balanceType y reglas
@@ -2621,10 +2636,24 @@ export async function previewSale(
         line.articleId,
         pricing.unitCost ?? null,
       );
-      // 2) Bloque `composition` (metal/hechura/taxes).
+      // 2) Bloque `composition` (metal/hechura/taxes/products/services).
+      // F1.3 G4.1.4 — catalogItemsMap se construyó UNA VEZ globalmente arriba.
+      // Failure-isolation por línea: si buildComposition lanza por alguna razón
+      // inesperada (shape inválido, variante metal corrupta), NO rompemos todo
+      // el preview — esa línea queda con composition=null y el resto continúa.
       const metalVariantIdToFetch = resolveMetalVariantIdFromResult(pricing);
       const metalVariantInfo      = await fetchMetalVariantInfo(metalVariantIdToFetch);
-      const composition           = buildComposition(pricing, metalVariantInfo);
+      let composition: Awaited<ReturnType<typeof buildComposition>> | null = null;
+      try {
+        composition = buildComposition(pricing, metalVariantInfo, catalogItemsMap);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[sales/preview] buildComposition falló para línea articleId=${line.articleId}; ` +
+          `composition=null para esta línea, resto del preview sigue:`,
+          err,
+        );
+      }
       const appliedMermaPercent   = getAppliedMermaPercent(pricing);
 
       // FASE 1.1 G7 — flags explícitos de qué overrides aplicó el operador a
@@ -2703,7 +2732,10 @@ export async function previewSale(
             }
           : null,
         // ── Fase 2A.7 — paridad con articles/pricing-preview ─────────────
-        composition,
+        // F1.3 G4.1.4 — `composition ?? undefined` mantiene el contrato del
+        // SalePreviewLine type (composition?: Composition) cuando la línea
+        // sufrió failure-isolation arriba.
+        composition: composition ?? undefined,
         appliedMermaPercent,
         costBase:         costTaxResult.costBase,
         costTaxAmount:    costTaxResult.costTaxAmount,
