@@ -65,8 +65,9 @@ vi.mock("../../../lib/pricing-engine/pricing-engine.js", async () => {
   };
 });
 vi.mock("../../../lib/pricing-composition.js", () => ({
-  buildComposition:                () => ({ metal: null, hechura: null, products: [], services: [], taxes: [] }),
+  buildComposition:                () => ({ metal: null, hechura: null, metals: [], hechuras: [], products: [], services: [], taxes: [] }),
   fetchMetalVariantInfo:           vi.fn().mockResolvedValue({ purity: null, purityLabel: null, metalName: null }),
+  fetchMetalVariantInfoMap:        vi.fn().mockResolvedValue(new Map()),
   resolveMetalVariantIdFromResult: () => null,
   getAppliedMermaPercent:          () => null,
   buildCatalogItemsMapForCostLines: vi.fn().mockResolvedValue(new Map()),

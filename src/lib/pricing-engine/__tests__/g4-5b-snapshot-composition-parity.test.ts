@@ -160,12 +160,12 @@ describe("snapshot parity — preview ↔ persisted (composition + componentSale
       .toBe(result.componentSaleBreakdown!.hechura.salePreManualDiscount);
   });
 
-  it("baseline correct: snapshot version bumped a 4 (aditivo, no breaking)", async () => {
+  it("baseline correct: snapshot version bumped a 5 (aditivo con metals/hechuras arrays)", async () => {
     setupMetalHechuraList(600, 600);
     const result = await resolveFinalSalePrice("j1", { articleId: "a1" });
     const snap = buildPricingSnapshot(result);
-    expect(snap.snapshotVersion).toBe(4);
-    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(4);
+    expect(snap.snapshotVersion).toBe(5);
+    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(5);
   });
 });
 
@@ -349,7 +349,7 @@ describe("snapshot parity — cero cambio numérico", () => {
 
     const snapWithoutComposition = buildPricingSnapshot(result);
     const snapWithComposition    = buildPricingSnapshot(result, {
-      composition: { metal: null, hechura: null, products: [], services: [], taxes: [] },
+      composition: { metal: null, hechura: null, metals: [], hechuras: [], products: [], services: [], taxes: [] },
     });
 
     // Igual unitPrice / basePrice / discountAmount / taxAmount / totalWithTax.
@@ -374,6 +374,7 @@ describe("snapshot parity — cero cambio numérico", () => {
 
     const customComposition: Composition = {
       metal: null, hechura: null,
+      metals: [], hechuras: [],
       products: [{
         costLineId: "x", catalogItemId: null, catalogItemCode: null,
         catalogItemName: null, quantity: 1, unitValue: 10, totalValue: 10,

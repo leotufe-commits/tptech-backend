@@ -218,6 +218,11 @@ async function modoCostLines(
           // quotePrice expone el precio base (suggestedPrice) sobre el que se aplica la merma,
           // no el finalSalePrice. Esto permite que la fórmula del simulador sea coherente.
           quotePrice: suggestedPrice.toFixed(6),
+          // F1.3 G4.x #9-A — costLineId estable, persistente, snapshot-safe.
+          // Idéntico al patrón emitido para HECHURA/PRODUCT/SERVICE en el ELSE
+          // de abajo (línea 319). Necesario para `composition.metals[]` poder
+          // referenciar cada cost line individualmente sin depender del orden.
+          ...(line.id ? { costLineId: line.id } : {}),
         },
       });
     } else {

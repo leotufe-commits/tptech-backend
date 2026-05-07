@@ -48,6 +48,63 @@ export type CompositionHechuraBlock = {
   appliesTo:      string | null;
 };
 
+/**
+ * F1.3 G4.x #9-A — item de `composition.metals[]`. Uno por cada cost line
+ * de tipo METAL del artículo. El motor cost emite un step
+ * `COST_LINES_METAL` por línea (ver pricing-engine.cost.ts:211); este
+ * shape mapea cada step a un item visualizable.
+ *
+ * Reader-only (POLICY R4.5): cero matemática derivada. `lineCost` es
+ * `step.value` directo del motor (en moneda BASE del tenant).
+ *
+ * Notas de scope (decisiones D1/D2/D3 confirmadas):
+ *   · NO incluye `originalGrams`/`gramsManual`/`originalMermaPct`/etc.
+ *     Esos flags solo aplican al PRIMER item via override context y se
+ *     mantienen en el alias legacy `metal` (=metals[0] enriquecido).
+ *   · NO incluye `metalSale` (sale-side post-margen) — el motor agrega
+ *     ese valor solo en `metalHechuraBreakdown` agregado, no per item.
+ *     La UI lo muestra solo en el primer item via legacy.
+ */
+export type CompositionMetalItem = {
+  /** ArticleCostLine.id — estable, snapshot-safe. */
+  costLineId:        string | null;
+  /** MetalVariant.id de esta línea METAL. */
+  metalVariantId:    string | null;
+  /** Resuelto vía batch query desde MetalVariant + Metal. null si la
+   *  variante no se pudo resolver (ej. eliminada). */
+  metalName:         string | null;
+  purity:            number | null;
+  purityLabel:       string | null;
+  /** `quantity` original de la cost line (gramos físicos sin merma). */
+  appliedGrams:      number | null;
+  /** Merma efectiva aplicada por el motor (entity override > line). */
+  appliedMermaPct:   number | null;
+  /** Costo individual de esta línea = step.value del motor (en BASE).
+   *  La suma de `lineCost` de todos los items === metalCost agregado. */
+  lineCost:          number | null;
+};
+
+/**
+ * F1.3 G4.x #9-A — item de `composition.hechuras[]`. Uno por cada cost
+ * line de tipo HECHURA del artículo. Mismo patrón que CompositionMetalItem.
+ *
+ * Notas de scope:
+ *   · NO incluye `manual`/`originalAmount` — flags solo aplican al primer
+ *     item via override context (alias legacy `hechura`).
+ */
+export type CompositionHechuraItem = {
+  /** ArticleCostLine.id — estable, snapshot-safe. */
+  costLineId:        string | null;
+  /** Valor unitario aplicado de esta línea HECHURA (`unitValue × qty`
+   *  en moneda original; o convertido a BASE si hubo conversión). */
+  appliedAmount:     number | null;
+  /** Costo individual de esta línea = step.value del motor (en BASE).
+   *  La suma de `lineCost` de todos los items === hechuraCost agregado. */
+  lineCost:          number | null;
+  /** Etiqueta legible (label de la cost line, ej. "Mano de obra"). */
+  lineLabel:         string | null;
+};
+
 export type CompositionTaxItem = {
   id:        string;
   name:      string;
@@ -108,8 +165,28 @@ export type CompositionItemBlock = {
 };
 
 export type Composition = {
+  /**
+   * F1.3 G4.x #9-A — alias LEGACY equivalente a `metals[0] ?? null`.
+   *
+   * INVARIANTE GARANTIZADO POR `buildComposition`:
+   *   `composition.metal === composition.metals[0] ?? null`  (estructural)
+   * Cualquier consumer que dependa de `metal` como objeto único sigue
+   * funcionando. Para soportar múltiples METAL, leer `metals[]`.
+   *
+   * El alias enriquece el item con flags del costOverrideContext
+   * (originalGrams, gramsManual, etc.) que el motor solo trackea para
+   * el PRIMER METAL. Items 2+ son read-only display sin esos flags.
+   */
   metal:   CompositionMetalBlock | null;
+  /** F1.3 G4.x #9-A — alias LEGACY = `hechuras[0] ?? null`. Mismo
+   *  contrato que `metal`/`metals[]`. */
   hechura: CompositionHechuraBlock | null;
+  /** F1.3 G4.x #9-A — TODAS las cost lines de tipo METAL del artículo,
+   *  una por step `COST_LINES_METAL`. SIEMPRE array (nunca undefined),
+   *  vacío cuando el artículo no tiene METAL lines. */
+  metals:   CompositionMetalItem[];
+  /** F1.3 G4.x #9-A — TODAS las cost lines de tipo HECHURA. SIEMPRE array. */
+  hechuras: CompositionHechuraItem[];
   /** F1.3 G4.1 — array de cost lines de tipo PRODUCT (insumos / productos
    *  externos). Vacío cuando el artículo no tiene PRODUCT lines. La UI
    *  rendereiza un bloque por item (no bucketean en hechura). */
@@ -187,6 +264,68 @@ export function resolveMetalVariantIdFromResult(
     result?.costOverrideContext?.metalVariant?.originalId ??
     null
   );
+}
+
+/**
+ * F1.3 G4.x #9-A (D3 confirmado) — batch metalVariant info por id.
+ * UNA query con dedupe global, mismo patrón que
+ * `buildCatalogItemsMapForCostLines`. Failure-safe: si Prisma falla, Map
+ * vacío + warning, los items renderean con metalName=null.
+ *
+ * IMPORTANTE — cuándo llamar:
+ *   · UNA vez por preview (post-engine, pre-buildComposition).
+ *   · NO per item, NO dentro de buildComposition.
+ */
+export async function fetchMetalVariantInfoMap(
+  metalVariantIds: Array<string | null | undefined>,
+): Promise<Map<string, MetalVariantInfo>> {
+  const empty = new Map<string, MetalVariantInfo>();
+  const ids = new Set<string>();
+  for (const id of metalVariantIds) {
+    if (typeof id === "string" && id.length > 0) ids.add(id);
+  }
+  if (ids.size === 0) return empty;
+
+  try {
+    const rows = await prisma.metalVariant.findMany({
+      where:  { id: { in: [...ids] } },
+      select: {
+        id:     true,
+        purity: true,
+        name:   true,
+        metal:  { select: { name: true } },
+      },
+    });
+    const map = new Map<string, MetalVariantInfo>();
+    for (const mv of rows) {
+      const purityNum = mv.purity != null ? parseFloat(mv.purity.toString()) : null;
+      let label: string | null = null;
+      if (purityNum != null && purityNum > 0) {
+        if (purityNum <= 1) {
+          const k = Math.round(purityNum * 24);
+          label = `${k}k`;
+        } else {
+          label = `${Math.round(purityNum)}k`;
+        }
+      } else {
+        label = mv.name;
+      }
+      map.set(mv.id, {
+        purity:      purityNum,
+        purityLabel: label,
+        metalName:   mv.metal?.name ?? null,
+      });
+    }
+    return map;
+  } catch (err) {
+    // Failure-safety: NO romper composition por metalVariant lookup fallido.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[pricing-composition] metalVariant batch lookup falló; items con metalName=null:",
+      err,
+    );
+    return empty;
+  }
 }
 
 /**
@@ -300,6 +439,71 @@ export async function buildCatalogItemsMapForCostLines(
 }
 
 /**
+ * F1.3 G4.x #9-A — extrae `composition.metals[]` desde steps
+ * `COST_LINES_METAL` del motor cost. Uno por cost line de tipo METAL.
+ * Cero recálculo monetario (POLICY R4.5): `lineCost` es passthrough de
+ * `step.value` y `appliedGrams`/`appliedMermaPct` vienen de `step.meta`.
+ *
+ * `metalVariantInfoMap` (opcional) — pre-cargado por el caller via
+ * `fetchMetalVariantInfoMap` (1 query batch). Sin map, los items quedan
+ * con `metalName=null` (defensa: el render usa "—" o el variantId).
+ */
+export function extractCompositionMetals(
+  steps: PricingStep[] | null | undefined,
+  metalVariantInfoMap?: Map<string, MetalVariantInfo>,
+): CompositionMetalItem[] {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+  return steps
+    .filter(s => s && s.key === "COST_LINES_METAL" && s.status === "ok")
+    .map(s => {
+      const meta = (s.meta ?? {}) as Record<string, unknown>;
+      const variantId  = typeof meta.variantId === "string" ? meta.variantId : null;
+      const variantInfo = variantId ? metalVariantInfoMap?.get(variantId) : null;
+      const qtyNum   = meta.qty   != null ? Number(meta.qty)   : null;
+      const mermaNum = meta.merma != null ? Number(meta.merma) : null;
+      const lineCost = s.value != null ? Number(s.value) : null;
+      return {
+        costLineId:      typeof meta.costLineId === "string" ? meta.costLineId : null,
+        metalVariantId:  variantId,
+        metalName:       variantInfo?.metalName   ?? null,
+        purity:          variantInfo?.purity      ?? null,
+        purityLabel:     variantInfo?.purityLabel ?? null,
+        appliedGrams:    qtyNum   != null && Number.isFinite(qtyNum)   ? qtyNum   : null,
+        appliedMermaPct: mermaNum != null && Number.isFinite(mermaNum) ? mermaNum : null,
+        lineCost:        lineCost != null && Number.isFinite(lineCost) ? lineCost : null,
+      };
+    });
+}
+
+/**
+ * F1.3 G4.x #9-A — extrae `composition.hechuras[]` desde steps
+ * `COST_LINES_HECHURA` del motor cost. Mismo patrón que metals[].
+ */
+export function extractCompositionHechuras(
+  steps: PricingStep[] | null | undefined,
+): CompositionHechuraItem[] {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+  return steps
+    .filter(s => s && s.key === "COST_LINES_HECHURA" && s.status === "ok")
+    .map(s => {
+      const meta = (s.meta ?? {}) as Record<string, unknown>;
+      const lineCost = s.value != null ? Number(s.value) : null;
+      // appliedAmount: el motor cost emite `value = qty × unitValue` (post
+      // conversión moneda). Para HECHURA típica (qty=1, unitValue=monto),
+      // appliedAmount === lineCost.
+      const lineLabel = typeof meta.lineLabel === "string" && meta.lineLabel.length > 0
+        ? meta.lineLabel
+        : (typeof s.label === "string" && s.label.length > 0 ? s.label : null);
+      return {
+        costLineId:    typeof meta.costLineId === "string" ? meta.costLineId : null,
+        appliedAmount: lineCost != null && Number.isFinite(lineCost) ? lineCost : null,
+        lineCost:      lineCost != null && Number.isFinite(lineCost) ? lineCost : null,
+        lineLabel,
+      };
+    });
+}
+
+/**
  * F1.3 G4.1.1 — extrae bloques `products[]` o `services[]` desde
  * `result.steps[]` filtrando por la key correspondiente.
  *
@@ -398,35 +602,61 @@ export function buildComposition(
   result: SalePriceResult,
   mvi: MetalVariantInfo,
   catalogItems?: Map<string, { code: string; name: string }>,
+  metalVariantInfoMap?: Map<string, MetalVariantInfo>,
 ): Composition {
   const ctx = result.costOverrideContext;
 
+  // F1.3 G4.x #9-A — extracción primaria: arrays con TODAS las cost lines.
+  // Cero recálculo monetario; passthrough estructural de step.value/meta.
+  const metals   = extractCompositionMetals(result.steps, metalVariantInfoMap);
+  const hechuras = extractCompositionHechuras(result.steps);
+  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems);
+  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems);
+
+  // F1.3 G4.x #9-A — alias LEGACY `metal` y `hechura`. Garantiza el
+  // invariante: `composition.metal === composition.metals[0] ?? null`
+  // (estructural). El alias enriquece con flags del costOverrideContext
+  // que solo aplican al PRIMER METAL/HECHURA (ver D1: edición inline solo
+  // afecta al [0], los items 2+ son read-only).
+  //
+  // Cuando NO hay metals[]/hechuras[] (artículo sin cost lines de ese tipo)
+  // el alias respeta el comportamiento legacy: si el ctx tiene flags
+  // (override aplicado sin línea base), igual emite el bloque legacy.
+  const firstMetal   = metals[0]   ?? null;
+  const firstHechura = hechuras[0] ?? null;
+
   const metal: CompositionMetalBlock | null =
-    ctx?.grams || ctx?.mermaPercent || ctx?.metalVariant
+    firstMetal || ctx?.grams || ctx?.mermaPercent || ctx?.metalVariant
       ? {
-          originalGrams:     ctx?.grams?.original ?? null,
-          appliedGrams:      ctx?.grams?.applied  ?? null,
+          originalGrams:     ctx?.grams?.original ?? firstMetal?.appliedGrams    ?? null,
+          appliedGrams:      ctx?.grams?.applied  ?? firstMetal?.appliedGrams    ?? null,
           gramsManual:       !!ctx?.grams?.manual,
-          originalMermaPct:  ctx?.mermaPercent?.original ?? null,
-          appliedMermaPct:   ctx?.mermaPercent?.applied  ?? null,
+          originalMermaPct:  ctx?.mermaPercent?.original ?? firstMetal?.appliedMermaPct ?? null,
+          appliedMermaPct:   ctx?.mermaPercent?.applied  ?? firstMetal?.appliedMermaPct ?? null,
           mermaManual:       !!ctx?.mermaPercent?.manual,
-          originalVariantId: ctx?.metalVariant?.originalId ?? null,
-          appliedVariantId:  ctx?.metalVariant?.appliedId  ?? null,
+          originalVariantId: ctx?.metalVariant?.originalId ?? firstMetal?.metalVariantId ?? null,
+          appliedVariantId:  ctx?.metalVariant?.appliedId  ?? firstMetal?.metalVariantId ?? null,
           variantManual:     !!ctx?.metalVariant?.manual,
-          purity:            mvi.purity,
-          purityLabel:       mvi.purityLabel,
-          metalName:         mvi.metalName,
+          // mvi (resuelto del primer variantId via fetchMetalVariantInfo
+          // legacy) tiene precedencia sobre firstMetal.* para mantener el
+          // comportamiento exacto pre-9-A. Si el caller pasa
+          // metalVariantInfoMap, firstMetal.metalName/purity ya estarán
+          // resueltos desde ahí.
+          purity:            mvi.purity      ?? firstMetal?.purity      ?? null,
+          purityLabel:       mvi.purityLabel ?? firstMetal?.purityLabel ?? null,
+          metalName:         mvi.metalName   ?? firstMetal?.metalName   ?? null,
         }
       : null;
 
-  const hechura: CompositionHechuraBlock | null = ctx?.hechura
-    ? {
-        originalAmount: ctx.hechura.original,
-        appliedAmount:  ctx.hechura.applied,
-        manual:         !!ctx.hechura.manual,
-        appliesTo:      null,
-      }
-    : null;
+  const hechura: CompositionHechuraBlock | null =
+    firstHechura || ctx?.hechura
+      ? {
+          originalAmount: ctx?.hechura?.original ?? firstHechura?.appliedAmount ?? null,
+          appliedAmount:  ctx?.hechura?.applied  ?? firstHechura?.appliedAmount ?? null,
+          manual:         !!ctx?.hechura?.manual,
+          appliesTo:      null,
+        }
+      : null;
 
   const taxes: CompositionTaxItem[] = (result.taxBreakdown ?? []).map((t) => ({
     id:        t.taxId,
@@ -438,12 +668,7 @@ export function buildComposition(
     manual:    t.taxId === "OVERRIDE_MANUAL",
   }));
 
-  // F1.3 G4.1.1 — extraer products/services desde steps[] del motor.
-  // Cero recálculo monetario; passthrough estructural de step.value/meta.
-  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems);
-  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems);
-
-  return { metal, hechura, products, services, taxes };
+  return { metal, hechura, metals, hechuras, products, services, taxes };
 }
 
 /**

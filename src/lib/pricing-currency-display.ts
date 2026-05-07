@@ -250,6 +250,20 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
     convertFieldNumber(comp.hechura, "originalAmount", rate);
     convertFieldNumber(comp.hechura, "appliedAmount",  rate);
   }
+  // F1.3 G4.x #9-A — metals[]/hechuras[] arrays. Mismos campos
+  // monetarios que el alias legacy. Cero conversión de grams/merma/ids.
+  if (Array.isArray(comp.metals)) {
+    for (const m of comp.metals) {
+      convertFieldNumber(m, "lineCost", rate);
+      // NO: appliedGrams, appliedMermaPct, purity, ids ni labels.
+    }
+  }
+  if (Array.isArray(comp.hechuras)) {
+    for (const h of comp.hechuras) {
+      convertFieldNumber(h, "appliedAmount", rate);
+      convertFieldNumber(h, "lineCost",      rate);
+    }
+  }
   // F1.3 G4.1.3 — products/services arrays. Convertir SOLO los campos
   // monetarios (unitValue, totalValue, lineAdjAmount, y lineAdjValue
   // únicamente cuando type=FIXED_AMOUNT). PRESERVAR sin convertir:

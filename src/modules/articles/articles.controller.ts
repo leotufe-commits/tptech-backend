@@ -25,6 +25,7 @@ import {
   buildComposition,
   buildCatalogItemsMapForSteps,
   fetchMetalVariantInfo,
+  fetchMetalVariantInfoMap,
   resolveMetalVariantIdFromResult,
 } from "../../lib/pricing-composition.js";
 // Multimoneda en preview (Fase MM). El motor sigue calculando en moneda BASE;
@@ -1296,12 +1297,22 @@ export async function getPricingPreview(req: any, res: Response) {
   // F1.3 G4.1.3 — pre-carga catalog info para los PRODUCT/SERVICE
   // referenciados en `result.steps`. UNA SOLA query batch por request,
   // failure-safe (si falla, los items usan fallback meta.lineCode/lineLabel).
+  // F1.3 G4.x #9-A — además del fetch legacy del primer metalVariant
+  // (mantiene paridad pre-9-A), pre-cargamos metalVariantInfoMap con
+  // TODAS las variantes referenciadas en steps COST_LINES_METAL para
+  // que `composition.metals[]` traiga metalName/purity per item. UNA
+  // sola query batch (failure-safe).
   const metalVariantIdToFetch = resolveMetalVariantIdFromResult(result);
-  const [metalVariantInfo, catalogItemsMap] = await Promise.all([
+  const metalVariantIdsFromSteps = (result.steps ?? [])
+    .filter(s => s?.key === "COST_LINES_METAL" && s?.status === "ok")
+    .map(s => (s.meta as any)?.variantId)
+    .filter((v): v is string => typeof v === "string" && v.length > 0);
+  const [metalVariantInfo, metalVariantInfoMap, catalogItemsMap] = await Promise.all([
     fetchMetalVariantInfo(metalVariantIdToFetch),
+    fetchMetalVariantInfoMap(metalVariantIdsFromSteps),
     buildCatalogItemsMapForSteps(req.user.jewelryId, result.steps),
   ]);
-  const composition = buildComposition(result, metalVariantInfo, catalogItemsMap);
+  const composition = buildComposition(result, metalVariantInfo, catalogItemsMap, metalVariantInfoMap);
 
   // ── Document totals (paridad simulador↔factura) ─────────────────────────
   // Antes el frontend derivaba `documentTotals` localmente desde unitPrice +

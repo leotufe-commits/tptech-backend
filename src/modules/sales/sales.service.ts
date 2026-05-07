@@ -41,6 +41,7 @@ import {
   buildComposition,
   buildCatalogItemsMapForCostLines,
   fetchMetalVariantInfo,
+  fetchMetalVariantInfoMap,
   resolveMetalVariantIdFromResult,
   getAppliedMermaPercent,
 } from "../../lib/pricing-composition.js";
@@ -1842,9 +1843,20 @@ export async function resolveDraftSaleLinesPricing(
       // composition=null y la UI degrada a defaults seguros (sin crash).
       let composition: Awaited<ReturnType<typeof buildComposition>> | null = null;
       try {
+        // F1.3 G4.x #9-A — además del legacy fetch del primer variantId,
+        // batch query de TODAS las variantes referenciadas en steps METAL
+        // (uno por cost line). Permite que composition.metals[] traiga
+        // metalName/purity per item.
         const metalVariantIdToFetch = resolveMetalVariantIdFromResult(result);
-        const metalVariantInfo      = await fetchMetalVariantInfo(metalVariantIdToFetch);
-        composition = buildComposition(result, metalVariantInfo, catalogItemsMap);
+        const metalVariantIdsFromSteps = (result.steps ?? [])
+          .filter(s => s?.key === "COST_LINES_METAL" && s?.status === "ok")
+          .map(s => (s.meta as any)?.variantId)
+          .filter((v): v is string => typeof v === "string" && v.length > 0);
+        const [metalVariantInfo, metalVariantInfoMap] = await Promise.all([
+          fetchMetalVariantInfo(metalVariantIdToFetch),
+          fetchMetalVariantInfoMap(metalVariantIdsFromSteps),
+        ]);
+        composition = buildComposition(result, metalVariantInfo, catalogItemsMap, metalVariantInfoMap);
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn(
@@ -2656,11 +2668,20 @@ export async function previewSale(
       // persista junto con el resto del precio (paridad preview/persisted).
       // Failure-isolation por línea: si buildComposition lanza, esa línea
       // queda con composition=null y el resto del preview sigue.
+      // F1.3 G4.x #9-A — además del legacy fetch del primer variantId,
+      // batch query de TODAS las variantes referenciadas en steps METAL.
       const metalVariantIdToFetch = resolveMetalVariantIdFromResult(pricing);
-      const metalVariantInfo      = await fetchMetalVariantInfo(metalVariantIdToFetch);
+      const metalVariantIdsFromSteps = (pricing.steps ?? [])
+        .filter(s => s?.key === "COST_LINES_METAL" && s?.status === "ok")
+        .map(s => (s.meta as any)?.variantId)
+        .filter((v): v is string => typeof v === "string" && v.length > 0);
+      const [metalVariantInfo, metalVariantInfoMap] = await Promise.all([
+        fetchMetalVariantInfo(metalVariantIdToFetch),
+        fetchMetalVariantInfoMap(metalVariantIdsFromSteps),
+      ]);
       let composition: Awaited<ReturnType<typeof buildComposition>> | null = null;
       try {
-        composition = buildComposition(pricing, metalVariantInfo, catalogItemsMap);
+        composition = buildComposition(pricing, metalVariantInfo, catalogItemsMap, metalVariantInfoMap);
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn(

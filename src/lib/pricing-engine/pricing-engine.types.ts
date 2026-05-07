@@ -972,6 +972,32 @@ export interface SnapshotCompositionItemBlock {
   affectsStock:     boolean | null;
 }
 
+/**
+ * F1.3 G4.x #9-A — item de `composition.metals[]` persistido en snapshot v5+.
+ * Espejo de `CompositionMetalItem` de `pricing-composition.ts`.
+ */
+export interface SnapshotCompositionMetalItem {
+  costLineId:        string | null;
+  metalVariantId:    string | null;
+  metalName:         string | null;
+  purity:            number | null;
+  purityLabel:       string | null;
+  appliedGrams:      number | null;
+  appliedMermaPct:   number | null;
+  lineCost:          number | null;
+}
+
+/**
+ * F1.3 G4.x #9-A — item de `composition.hechuras[]` persistido en snapshot v5+.
+ * Espejo de `CompositionHechuraItem` de `pricing-composition.ts`.
+ */
+export interface SnapshotCompositionHechuraItem {
+  costLineId:        string | null;
+  appliedAmount:     number | null;
+  lineCost:          number | null;
+  lineLabel:         string | null;
+}
+
 export interface SnapshotCompositionTaxItem {
   id:        string;
   name:      string;
@@ -983,8 +1009,18 @@ export interface SnapshotCompositionTaxItem {
 }
 
 export interface SnapshotComposition {
+  /** Alias LEGACY = `metals[0] ?? null` (invariante garantizado por
+   *  `buildComposition`). Snapshot v4 readers que solo lean `metal` siguen
+   *  funcionando. v5+ readers prefieren leer `metals[]`. */
   metal:    SnapshotCompositionMetalBlock | null;
+  /** Alias LEGACY = `hechuras[0] ?? null`. */
   hechura:  SnapshotCompositionHechuraBlock | null;
+  /** F1.3 G4.x #9-A (snapshot v5) — TODAS las cost lines de tipo METAL.
+   *  SIEMPRE array (nunca undefined). Snapshots v4 leídos sin este campo
+   *  deben ser normalizados a `[]` por el reader (la UI hace `?? []`). */
+  metals:   SnapshotCompositionMetalItem[];
+  /** F1.3 G4.x #9-A (snapshot v5) — TODAS las cost lines de tipo HECHURA. */
+  hechuras: SnapshotCompositionHechuraItem[];
   products: SnapshotCompositionItemBlock[];
   services: SnapshotCompositionItemBlock[];
   taxes:    SnapshotCompositionTaxItem[];
@@ -1004,5 +1040,13 @@ export interface SnapshotComposition {
  *                  services[]/taxes) y `componentSaleBreakdown` (con
  *                  `salePreManualDiscount` por componente). Aditivos:
  *                  snapshots v3 son legibles — los campos nuevos quedan
- *                  `undefined` y la UI los normaliza a null. */
-export const PRICING_LINE_SNAPSHOT_VERSION = 4;
+ *                  `undefined` y la UI los normaliza a null.
+ *  v5 (F1.3 G4.x #9-A) — agrega `composition.metals[]` y
+ *                  `composition.hechuras[]` (arrays con TODAS las cost
+ *                  lines, no solo el primero). `composition.metal` y
+ *                  `composition.hechura` se mantienen como alias legacy
+ *                  (= arrays[0] ?? null). Aditivos: snapshots v4 leídos
+ *                  sin metals/hechuras se normalizan a [] (o derivados
+ *                  desde el alias legacy si existe). Cero cambio numérico
+ *                  en totales/precio final. */
+export const PRICING_LINE_SNAPSHOT_VERSION = 5;
