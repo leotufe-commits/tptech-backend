@@ -34,6 +34,7 @@ import type {
   PricingLineSnapshot,
   ComponentAdjustmentKind,
   ComponentSaleAdjustment,
+  ComponentSaleBreakdown,
   ComponentSaleDetail,
 } from "./pricing-engine.types.js";
 import { PRICING_LINE_SNAPSHOT_VERSION } from "./pricing-engine.types.js";
@@ -2367,19 +2368,41 @@ export async function resolveFinalSalePrice(
   // Se clampa a 0 para evitar finales negativos por redondeos acumulados.
   let componentSaleBreakdown: ComponentSaleDetail | null = null;
   if (componentBaseMetal != null && componentBaseHechura != null) {
-    const metalAdjSum   = componentMetalAdjs.reduce((acc, a) => acc + a.amount, 0);
-    const hechuraAdjSum = componentHechuraAdjs.reduce((acc, a) => acc + a.amount, 0);
+    // F1.3 G4.3 — Decimal-safe end-to-end. Acumulamos los amounts en Decimal
+    // y partimos los ajustes en dos buckets: manual vs no-manual. Luego:
+    //   final                 = base − Σ all
+    //   salePreManualDiscount = base − Σ non-manual   (= final + Σ manual)
+    // Sin parseFloat / Number / toFixed intermedios — solo `.toNumber()`
+    // final al asignar al campo `number`.
+    const buildBreakdown = (
+      baseValue: number,
+      adjs:      ComponentSaleAdjustment[],
+    ): ComponentSaleBreakdown => {
+      const baseD = new D(String(baseValue));
+      let allSum: Prisma.Decimal     = new D(0);
+      let nonManualSum: Prisma.Decimal = new D(0);
+      for (const a of adjs) {
+        const amtD = new D(String(a.amount));
+        allSum = allSum.plus(amtD);
+        if (a.kind !== "MANUAL_DISCOUNT") {
+          nonManualSum = nonManualSum.plus(amtD);
+        }
+      }
+      const finalD = baseD.minus(allSum);
+      const preD   = baseD.minus(nonManualSum);
+      // Clamp ≥ 0 en Decimal para evitar finales negativos por redondeos
+      // acumulados, sin coerción JS.
+      const zero = new D(0);
+      return {
+        base:                  baseValue,
+        adjustments:           adjs,
+        final:                 (finalD.lessThan(zero) ? zero : finalD).toNumber(),
+        salePreManualDiscount: (preD.lessThan(zero)   ? zero : preD).toNumber(),
+      };
+    };
     componentSaleBreakdown = {
-      metal: {
-        base:        componentBaseMetal,
-        adjustments: componentMetalAdjs,
-        final:       Math.max(0, componentBaseMetal - metalAdjSum),
-      },
-      hechura: {
-        base:        componentBaseHechura,
-        adjustments: componentHechuraAdjs,
-        final:       Math.max(0, componentBaseHechura - hechuraAdjSum),
-      },
+      metal:   buildBreakdown(componentBaseMetal,   componentMetalAdjs),
+      hechura: buildBreakdown(componentBaseHechura, componentHechuraAdjs),
     };
   }
   // `componentBaseSource` y `componentBaseEstimated` quedan disponibles si

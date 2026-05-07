@@ -190,6 +190,31 @@ export interface ComponentSaleBreakdown {
   base:        number;
   adjustments: ComponentSaleAdjustment[];
   final:       number;
+  /**
+   * F1.3 G4.3 — valor del componente ANTES del ajuste manual del operador.
+   *
+   * Fórmula (passthrough puro, cero heurística):
+   *   `salePreManualDiscount = base − Σ adjustments[kind ≠ MANUAL_DISCOUNT].amount`
+   *   (clampado a 0)
+   *
+   * Equivale a `final` cuando NO hay adjustment de `kind="MANUAL_DISCOUNT"`.
+   * Cuando hay manual discount/surcharge:
+   *   · pre = base − Σ (promo + qty + customerRule) — el valor que el motor
+   *     iba a emitir antes de que el operador aplique su override manual.
+   *   · final = pre − manualDiscountAmount (o + manualSurchargeAmount).
+   *
+   * Convención del campo: representa el componente INMEDIATAMENTE antes del
+   * último cut-point del orden inmutable de capas:
+   *
+   *     promo → qtyDiscount → customerRule → [CUT] → manualDiscount
+   *
+   * UI (POLICY R4.5 — passthrough): si `salePreManualDiscount === final` la
+   * fila "Pre-bonif." NO se renderea (cero ruido visual). El backend NUNCA
+   * decide visibilidad — la decisión vive en el componente reader-only.
+   *
+   * Tooltip recomendado: "Valor antes del ajuste manual del operador.".
+   */
+  salePreManualDiscount: number;
 }
 
 export interface ComponentSaleDetail {
