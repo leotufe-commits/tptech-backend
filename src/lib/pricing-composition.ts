@@ -14,7 +14,7 @@
 // ============================================================================
 
 import { prisma } from "./prisma.js";
-import type { SalePriceResult } from "./pricing-engine/pricing-engine.js";
+import type { SalePriceResult, PricingStep } from "./pricing-engine/pricing-engine.js";
 
 // ---------------------------------------------------------------------------
 // Tipos exportados
@@ -58,9 +58,65 @@ export type CompositionTaxItem = {
   manual:    boolean;
 };
 
+/**
+ * FASE F1.3 G4.1 — bloque per-item para PRODUCT y SERVICE.
+ *
+ * Cada cost line de tipo PRODUCT o SERVICE se expone como un item separado
+ * (no se bucketean en hechura como hacía el motor por convención interna).
+ * Permite a la UI mostrar cada componente del costo con su trazabilidad
+ * completa (catalog ref, cantidad, ajuste per-línea, impacto stock).
+ *
+ * Campos opcionales (`null` o ausentes) cuando el motor no los expone:
+ *   · `costLineId`, `catalogItemId`, `affectsStock` — requieren extensión
+ *     del motor (commit G4.1.2). Hoy quedan null por compatibilidad.
+ *   · `catalogItemCode` / `catalogItemName` — vienen del catálogo
+ *     pre-cargado por el caller (Map opcional pasado a buildComposition).
+ *
+ * POLICY R4.5 — la UI lee passthrough; cero cálculo monetario derivado.
+ */
+export type CompositionItemBlock = {
+  /** ArticleCostLine.id — null hasta que el motor lo exponga en step.meta. */
+  costLineId:       string | null;
+  /** Article.id referenciado (PRODUCT/SERVICE apuntan a otro artículo). */
+  catalogItemId:    string | null;
+  /** Código del catálogo (ej "PIEDRA-Z01"). Ya viene en step.meta.lineCode. */
+  catalogItemCode:  string | null;
+  /** Nombre legible (ej "Zafiro 0.5ct"). Resuelto desde catalog map o
+   *  fallback a step.meta.lineLabel. */
+  catalogItemName:  string | null;
+  /** Cantidad del componente (ej. 2 piedras). */
+  quantity:         number;
+  /** Valor unitario en moneda del componente. */
+  unitValue:        number;
+  /** Total del item = quantity × unitValue (lo computa el motor en step.value). */
+  totalValue:       number;
+  /** Moneda original del componente (null = moneda base del tenant). */
+  currencyId:       string | null;
+  /** Tipo de ajuste per-línea ("BONUS" o "SURCHARGE"), si lo hay. */
+  lineAdjKind:      "BONUS" | "SURCHARGE" | null;
+  /** Tipo del valor del ajuste ("PERCENTAGE" o "FIXED_AMOUNT"). */
+  lineAdjType:      "PERCENTAGE" | "FIXED_AMOUNT" | null;
+  /** Valor configurado del ajuste (ej. 10 cuando es PERCENTAGE 10%). */
+  lineAdjValue:     number | null;
+  /** Monto absoluto del ajuste — null hasta que el motor lo exponga
+   *  explícitamente (G4.1.2). Mientras tanto, la UI puede derivarlo
+   *  como display-only si lo necesita (no es cálculo monetario crítico). */
+  lineAdjAmount:    number | null;
+  /** Si esta cost line descuenta stock al confirmar venta (PRODUCT/SERVICE).
+   *  Default false — null hasta que el motor lo exponga (G4.1.2). */
+  affectsStock:     boolean | null;
+};
+
 export type Composition = {
   metal:   CompositionMetalBlock | null;
   hechura: CompositionHechuraBlock | null;
+  /** F1.3 G4.1 — array de cost lines de tipo PRODUCT (insumos / productos
+   *  externos). Vacío cuando el artículo no tiene PRODUCT lines. La UI
+   *  rendereiza un bloque por item (no bucketean en hechura). */
+  products: CompositionItemBlock[];
+  /** F1.3 G4.1 — array de cost lines de tipo SERVICE (servicios externos).
+   *  Mismo tratamiento que products. */
+  services: CompositionItemBlock[];
   taxes:   CompositionTaxItem[];
 };
 
@@ -134,6 +190,87 @@ export function resolveMetalVariantIdFromResult(
 }
 
 /**
+ * F1.3 G4.1.1 — extrae bloques `products[]` o `services[]` desde
+ * `result.steps[]` filtrando por la key correspondiente.
+ *
+ * El motor cost ya emite un step `COST_LINES_PRODUCT` / `COST_LINES_SERVICE`
+ * por cada cost line de ese tipo. Este helper los mapea al shape display
+ * sin recálculo monetario (POLICY R4.5).
+ *
+ * `catalogItems` es un Map opcional pre-cargado por el caller (1 query
+ * batch, evita N+1) que asocia `catalogItemId` → `{ code, name }` del
+ * artículo referenciado. Sin este map, el item queda con `catalogItemCode`
+ * tomado de `step.meta.lineCode` (lo que el motor ya emite) y
+ * `catalogItemName` derivado del label.
+ *
+ * Campos no expuestos hoy en step.meta (`costLineId`, `catalogItemId`,
+ * `affectsStock`, `lineAdjAmount`) quedan null. Commit G4.1.2 extenderá el
+ * motor para emitirlos. Mientras tanto, los items SE renderean con la info
+ * disponible — la UI no se rompe.
+ *
+ * TODO Frontend: si products/services > 3 items, evaluar colapsado del
+ * panel para evitar saturación visual.
+ */
+export function extractCompositionItems(
+  steps: PricingStep[] | null | undefined,
+  targetKey: "COST_LINES_PRODUCT" | "COST_LINES_SERVICE",
+  catalogItems?: Map<string, { code: string; name: string }>,
+): CompositionItemBlock[] {
+  if (!Array.isArray(steps) || steps.length === 0) return [];
+
+  return steps
+    .filter(s => s && s.key === targetKey && s.status === "ok")
+    .map(s => {
+      const meta = (s.meta ?? {}) as Record<string, unknown>;
+      const catalogId = (meta.catalogItemId ?? null) as string | null;
+      const catalogInfo = catalogId ? catalogItems?.get(catalogId) : null;
+
+      const lineCodeFromMeta = typeof meta.lineCode === "string" && meta.lineCode.length > 0
+        ? meta.lineCode
+        : null;
+      const lineLabelFromMeta = typeof meta.lineLabel === "string" && meta.lineLabel.length > 0
+        ? meta.lineLabel
+        : null;
+      const fallbackLabel = typeof s.label === "string" && s.label.length > 0
+        ? s.label
+        : null;
+
+      const adjKindRaw = typeof meta.lineAdjKind === "string" && meta.lineAdjKind.length > 0
+        ? meta.lineAdjKind
+        : null;
+      const adjKind: "BONUS" | "SURCHARGE" | null =
+        adjKindRaw === "BONUS" || adjKindRaw === "SURCHARGE" ? adjKindRaw : null;
+      const adjTypeRaw = typeof meta.lineAdjType === "string" && meta.lineAdjType.length > 0
+        ? meta.lineAdjType
+        : null;
+      const adjType: "PERCENTAGE" | "FIXED_AMOUNT" | null =
+        adjTypeRaw === "PERCENTAGE" || adjTypeRaw === "FIXED_AMOUNT" ? adjTypeRaw : null;
+
+      // step.value ya es qty × unitValue (post conversión moneda + ajuste)
+      // — lo provee el motor cost. Cero recálculo acá.
+      const totalValue = s.value != null ? Number(s.value) : 0;
+      const qty       = meta.qty       != null ? Number(meta.qty)       : 0;
+      const unitValue = meta.unitValue != null ? Number(meta.unitValue) : 0;
+
+      return {
+        costLineId:       (meta.costLineId ?? null) as string | null,
+        catalogItemId:    catalogId,
+        catalogItemCode:  catalogInfo?.code ?? lineCodeFromMeta,
+        catalogItemName:  catalogInfo?.name ?? lineLabelFromMeta ?? fallbackLabel,
+        quantity:         Number.isFinite(qty)       ? qty       : 0,
+        unitValue:        Number.isFinite(unitValue) ? unitValue : 0,
+        totalValue:       Number.isFinite(totalValue) ? totalValue : 0,
+        currencyId:       (meta.currencyId ?? null) as string | null,
+        lineAdjKind:      adjKind,
+        lineAdjType:      adjType,
+        lineAdjValue:     meta.lineAdjValue != null ? Number(meta.lineAdjValue) : null,
+        lineAdjAmount:    meta.lineAdjAmount != null ? Number(meta.lineAdjAmount) : null,
+        affectsStock:     typeof meta.affectsStock === "boolean" ? meta.affectsStock : null,
+      };
+    });
+}
+
+/**
  * Arma el bloque `composition` que aparece en los responses de preview.
  * Mismo shape que devolvía `articles.controller.ts:1257-1296` antes de la
  * extracción.
@@ -141,10 +278,16 @@ export function resolveMetalVariantIdFromResult(
  * El argumento `mvi` es el resultado de `fetchMetalVariantInfo`. Se pasa por
  * separado para que el caller controle cuándo hace la query (típicamente una
  * vez por línea, ya cacheable si hace falta optimizar).
+ *
+ * F1.3 G4.1.1 — agrega `products[]` y `services[]` extraídos de
+ * `result.steps[]`. Por defecto vacíos; cuando el caller pasa `catalogItems`
+ * map pre-cargado, los items incluyen `catalogItemCode` / `catalogItemName`
+ * resueltos. Sin map, caen al `lineCode` / `lineLabel` que ya emite el motor.
  */
 export function buildComposition(
   result: SalePriceResult,
   mvi: MetalVariantInfo,
+  catalogItems?: Map<string, { code: string; name: string }>,
 ): Composition {
   const ctx = result.costOverrideContext;
 
@@ -185,7 +328,12 @@ export function buildComposition(
     manual:    t.taxId === "OVERRIDE_MANUAL",
   }));
 
-  return { metal, hechura, taxes };
+  // F1.3 G4.1.1 — extraer products/services desde steps[] del motor.
+  // Cero recálculo monetario; passthrough estructural de step.value/meta.
+  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems);
+  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems);
+
+  return { metal, hechura, products, services, taxes };
 }
 
 /**
