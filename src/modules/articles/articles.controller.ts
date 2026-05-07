@@ -33,6 +33,8 @@ import {
   getCurrencyDisplayContext,
   buildResponseCurrencyMetadata,
   convertArticlePreviewResponseInPlace,
+  // FASE 1.1 G6 — converter de cost-lines/preview a la moneda solicitada.
+  convertCostPreviewResponseInPlace,
 } from "../../lib/pricing-currency-display.js";
 // Política de redondeo a nivel comprobante (modo UNIFIED). El simulador NO
 // aplica el redondeo doc (no hay comprobante), pero SÍ debe pasar
@@ -230,9 +232,27 @@ export async function previewCostLines(req: any, res: Response) {
   const lines = req.body?.lines;
   assert(Array.isArray(lines), "Se esperaba { lines: [...] }.");
   const manualAdjustment = req.body?.manualAdjustment ?? undefined;
-  return res.json(
-    await service.previewCostLines(id, req.user.jewelryId, { lines, manualAdjustment }),
-  );
+  // FASE 1.1 G6 — moneda de display. Si viene currencyId distinto a la base,
+  // el response se convierte in-place. Mismo patrón que pricing-preview.
+  const responseCurrencyId =
+    typeof req.body?.currencyId === "string" && req.body.currencyId
+      ? req.body.currencyId
+      : null;
+
+  const responseData = await service.previewCostLines(id, req.user.jewelryId, {
+    lines,
+    manualAdjustment,
+  });
+
+  const currencyCtx = await getCurrencyDisplayContext(req.user.jewelryId, responseCurrencyId);
+  if (currencyCtx?.applied) {
+    convertCostPreviewResponseInPlace(responseData, currencyCtx.rate);
+  }
+  if (currencyCtx) {
+    Object.assign(responseData as any, buildResponseCurrencyMetadata(currencyCtx));
+  }
+
+  return res.json(responseData);
 }
 
 // ===========================================================================

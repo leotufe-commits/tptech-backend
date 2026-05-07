@@ -507,6 +507,29 @@ export function convertArticlePreviewResponseInPlace(res: any, rate: number): vo
   convertSaleDocumentTotalsInPlace(res.documentTotals, rate);
 }
 
+/**
+ * FASE 1.1 G6 — convierte el response de `articles/:id/cost-lines/preview` a
+ * la moneda solicitada. Los campos monetarios (value/metalCost/hechuraCost
+ * + costBase/costTaxAmount/costWithTax) se dividen por la rate; gramos y
+ * purity NO se convierten (no son moneda).
+ */
+export function convertCostPreviewResponseInPlace(res: any, rate: number): void {
+  if (!res || rate === 1) return;
+  if (res.cost) {
+    convertFieldString(res.cost, "value",       rate);
+    convertFieldString(res.cost, "metalCost",   rate);
+    convertFieldString(res.cost, "hechuraCost", rate);
+    // totalGrams, metalGramsWithMerma, metalPurity → NO se convierten.
+  }
+  if (res.purchaseTaxes) {
+    // purchaseTaxes ya viene como objeto con campos string ("0.0000").
+    convertFieldString(res.purchaseTaxes, "costBase",      rate);
+    convertFieldString(res.purchaseTaxes, "costTaxAmount", rate);
+    convertFieldString(res.purchaseTaxes, "costWithTax",   rate);
+    convertCostTaxBreakdownItemsInPlace(res.purchaseTaxes.costTaxBreakdown, rate);
+  }
+}
+
 /** Response completo de `sales/preview`. */
 export function convertSalesPreviewResponseInPlace(res: any, rate: number): void {
   if (!res || rate === 1) return;
