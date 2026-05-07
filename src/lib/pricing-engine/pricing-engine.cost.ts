@@ -259,6 +259,12 @@ async function modoCostLines(
         lineValue = lineValue.mul(rateInfo.rate);
       }
 
+      // F1.3 G4.1.2 — capturar valor PRE-ajuste para computar el monto
+      // absoluto del adjustment (passthrough — el frontend NO recalcula).
+      // Convención de signo (alineada con ComponentSaleAdjustment.amount,
+      // types.ts:164-165): positivo cuando el adjustment REDUCE el valor
+      // (BONUS), negativo cuando lo AUMENTA (SURCHARGE).
+      const preAdjValue = lineValue;
       // Ajuste por línea (bonificación / recargo)
       lineValue = applyAdjustment(lineValue, line.lineAdjKind, line.lineAdjType, line.lineAdjValue);
       if (lineValue.lt(0)) lineValue = new Prisma.Decimal(0);
@@ -267,6 +273,17 @@ async function modoCostLines(
       // Regla del sistema: todo lo que NO es metal es "hechura" para cálculo de márgenes.
       // Esto incluye: HECHURA, PRODUCT, SERVICE, MANUAL.
       hechuraTotal = hechuraTotal.add(lineValue);
+
+      // F1.3 G4.1.2 — monto absoluto del ajuste, computado por el motor.
+      // Solo se incluye en meta cuando hubo adjustment (kind no vacío);
+      // así el frontend evita derivarlo y respeta el redondeo del motor.
+      const hasAdjustment = !!line.lineAdjKind && line.lineAdjKind !== "";
+      let lineAdjAmountStr: string | null = null;
+      if (hasAdjustment) {
+        // delta = pre - post. Positivo = reducción (BONUS); negativo = aumento (SURCHARGE).
+        const delta = preAdjValue.sub(lineValue);
+        lineAdjAmountStr = delta.toString();
+      }
 
       // Obtener código del artículo referenciado (solo para PRODUCT/SERVICE)
       const refCode: string | null =
@@ -289,7 +306,22 @@ async function modoCostLines(
           ...(conversionMeta ?? {}),
           ...(lineLabel ? { lineLabel }  : {}),
           ...(refCode   ? { lineCode: refCode } : {}),
-          ...(line.lineAdjKind && line.lineAdjKind !== "" ? { lineAdjKind: line.lineAdjKind, lineAdjType: line.lineAdjType, lineAdjValue: line.lineAdjValue } : {}),
+          ...(line.lineAdjKind && line.lineAdjKind !== ""
+            ? { lineAdjKind: line.lineAdjKind, lineAdjType: line.lineAdjType, lineAdjValue: line.lineAdjValue }
+            : {}),
+          // F1.3 G4.1.2 — campos nuevos para trazabilidad UI:
+          //   · costLineId — estable, persistente, snapshot-safe (NO orden/índice)
+          //   · catalogItemId — solo para PRODUCT/SERVICE (ref a otro Article)
+          //   · affectsStock — solo si está definido en la línea (semánticamente
+          //     sensible: undefined ≠ false, ver doc CostLineInput.affectsStock)
+          //   · lineAdjAmount — monto absoluto del ajuste (computado por motor,
+          //     ya respetando precisión Decimal). Solo cuando hasAdjustment.
+          ...(line.id            ? { costLineId:    line.id }            : {}),
+          ...(line.catalogItemId ? { catalogItemId: line.catalogItemId } : {}),
+          ...(typeof line.affectsStock === "boolean"
+            ? { affectsStock: line.affectsStock }
+            : {}),
+          ...(lineAdjAmountStr != null ? { lineAdjAmount: lineAdjAmountStr } : {}),
         },
       });
     }

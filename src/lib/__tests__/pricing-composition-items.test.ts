@@ -69,7 +69,8 @@ describe("extractCompositionItems — filtrado", () => {
     const steps = [
       makeStep({ status: "ok",      value: new D(100) }),
       makeStep({ status: "skipped", value: new D(200) }),
-      makeStep({ status: "error",   value: new D(300) }),
+      makeStep({ status: "missing", value: null }),
+      makeStep({ status: "partial", value: new D(50) }),
     ];
     const r = extractCompositionItems(steps, "COST_LINES_PRODUCT");
     expect(r).toHaveLength(1);

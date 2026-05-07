@@ -505,6 +505,13 @@ export interface BatchCostContext {
 // ---------------------------------------------------------------------------
 
 export interface CostLineInput {
+  /** F1.3 G4.1.2 — `ArticleCostLine.id` para trazabilidad estable.
+   *  Cuando proviene de Prisma (caso normal: `article.costComposition`),
+   *  este campo viene poblado y se propaga a `step.meta.costLineId`,
+   *  permitiendo a la UI identificar cada item de forma persistente
+   *  (no por índice ni orden, que son volátiles). Snapshot-safe.
+   *  Opcional para flujos sintéticos (extraCostLines de combos). */
+  id?: string | null;
   type: string;           // "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "MANUAL"
   /** Descripción/nombre de la línea ingresado por el usuario */
   label?: string | null;
@@ -518,6 +525,10 @@ export interface CostLineInput {
   mermaPercent?: any;
   /** ID de variante metálica; solo para type=METAL */
   metalVariantId?: string | null;
+  /** F1.3 G4.1.2 — ID del artículo del catálogo referenciado por esta cost
+   *  line (solo PRODUCT/SERVICE). Permite a la UI resolver code/name desde
+   *  un catalog map pre-cargado por el caller (1 query batch). */
+  catalogItemId?: string | null;
   /**
    * FASE 2: variante específica del componente referenciado (PRODUCT/SERVICE).
    * Si está presente, su `articleId` debe coincidir con `catalogItemId`. Hoy
@@ -525,6 +536,14 @@ export interface CostLineInput {
    * el resto del cálculo se sigue derivando del padre.
    */
   catalogVariantId?: string | null;
+  /** F1.3 G4.1.2 — `ArticleCostLine.affectsStock` para PRODUCT/SERVICE.
+   *  Indica si confirmar venta descuenta stock del componente referenciado.
+   *  IMPORTANTE: campo opcional. El motor distingue:
+   *    · `true` / `false` → valor explícito conocido → emit en step.meta.
+   *    · `undefined` → desconocido → NO emite (default `null` cliente).
+   *  POLICY: "no descuenta stock" es semánticamente sensible — preferimos
+   *  ausencia (null) antes que asumir false. */
+  affectsStock?: boolean;
   /** Ajuste por línea: "" | "BONUS" | "SURCHARGE" */
   lineAdjKind?: string | null;
   /** Tipo de valor del ajuste: "" | "PERCENTAGE" | "FIXED_AMOUNT" */
