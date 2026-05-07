@@ -2093,6 +2093,21 @@ export type SalePreviewLine = {
   lineTaxAmount:        number;            // qty × unitTaxAmount
   lineTotalWithTax:     number | null;     // lineTotal + lineTaxAmount
 
+  // ── FASE 1.1 G7 — flags explícitos de overrides aplicados a la línea ───
+  /** Subcampos: true si el operador overrideó ese aspecto.
+   *  · quantity: siempre false — qty es input directo, no overrideable.
+   *  · price:    line.manualPriceOverride != null
+   *  · discount: line.manualDiscountOverride != null
+   *  · tax:      line.taxOverride != null
+   *  POLICY.md §3 R3.4 — distingue los 3 tipos en lugar de inferir desde
+   *  priceSource="MANUAL_OVERRIDE" (que solo refleja el override de precio). */
+  manualOverridesApplied: {
+    quantity: boolean;
+    price:    boolean;
+    discount: boolean;
+    tax:      boolean;
+  };
+
   // ── Detalle de descuentos (Fase 5) ──────────────────────────────────────
   /** Descuento por cantidad por unidad, si aplicó. null si no. */
   quantityDiscountAmount:  number | null;
@@ -2612,6 +2627,19 @@ export async function previewSale(
       const composition           = buildComposition(pricing, metalVariantInfo);
       const appliedMermaPercent   = getAppliedMermaPercent(pricing);
 
+      // FASE 1.1 G7 — flags explícitos de qué overrides aplicó el operador a
+      // esta línea. POLICY.md §3 R3.4 pide flags por subcampo (price/discount/
+      // tax). El frontend antes inferia desde priceSource="MANUAL_OVERRIDE",
+      // pero ese flag no distingue entre los 3 tipos.
+      // `quantity` queda en `false` siempre — el motor nunca computa qty,
+      // es siempre input directo del operador.
+      const manualOverridesApplied = {
+        quantity: false,
+        price:    line.manualPriceOverride != null,
+        discount: line.manualDiscountOverride != null,
+        tax:      line.taxOverride != null,
+      };
+
       return {
         articleId:            line.articleId,
         variantId:            line.variantId ?? null,
@@ -2627,6 +2655,8 @@ export async function previewSale(
         unitTotalWithTax:     unitPrice != null ? round2(unitPrice + unitTaxAmount) : null,
         lineTaxAmount,
         lineTotalWithTax,
+        // FASE 1.1 G7 — flags de overrides explícitos.
+        manualOverridesApplied,
         quantityDiscountAmount:  n2(pricing.quantityDiscountAmount),
         promotionDiscountAmount: n2(pricing.promotionDiscountAmount),
         // Sprint 3 — POLICY.md §8 — capa 5 expuesta como campo singular.
