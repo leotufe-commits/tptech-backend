@@ -207,6 +207,11 @@ export type PriceSource =
   | "QUANTITY_DISCOUNT"
   | "PRICE_LIST"
   | "MANUAL_FALLBACK"
+  // FASE 1.1 G1 — línea MANUAL sin articleId (ítem libre / servicio puntual).
+  // El motor todavía la procesa fuera del flow normal en sales.service.ts:2349
+  // y devuelve un snapshot sintético con priceSource="MANUAL_LINE". Está en el
+  // union para que TypeScript no obligue el cast `as any` (POLICY §3 R3.6).
+  | "MANUAL_LINE"
   | "NONE";
 
 /**
