@@ -1289,12 +1289,34 @@ export async function listArticles(
       ? (stockMap.get(r.id) ?? { total: 0, byVariant: {} })
       : null;
     const gi = (r as any).groupItems?.[0];
+
+    // FASE 1.1 G4 — marginPercent y taxAmount per-row.
+    // Inputs ya disponibles en este scope. NO se hace cálculo nuevo: se
+    // expone la derivación que el frontend hacía en InventarioArticulos.tsx
+    // (POLICY.md R4.3 prohíbe inferir margen/tax desde resta en cliente).
+    // Ambos quedan null cuando los inputs no están disponibles.
+    const sale     = p?.resolvedSalePrice;
+    const saleTax  = p?.resolvedSalePriceWithTax;
+    const cost     = r.computedCostBase;
+    const marginPercent =
+      sale != null && cost != null && Number(sale) > 0
+        ? ((Number(sale) - Number(cost)) / Number(sale)) * 100
+        : null;
+    const taxAmount =
+      sale != null && saleTax != null
+        ? Number(saleTax) - Number(sale)
+        : null;
+
     return {
       ...r,
       resolvedSalePrice:        p?.resolvedSalePrice        ?? null,
       resolvedSalePriceWithTax: p?.resolvedSalePriceWithTax ?? null,
       resolvedPriceSource:      p?.resolvedPriceSource      ?? "NONE",
       resolvedPriceName:        p?.resolvedPriceName        ?? null,
+      // G4 — campos derivados expuestos. Permite al frontend renderear sin
+      // recalcular (POLICY.md R4.3). Decimales preservados por number simple.
+      marginPercent,
+      taxAmount,
       stockData: stockEntry,
       groupId:    gi?.groupId    ?? null,
       groupOrder: gi?.groupOrder ?? 0,
