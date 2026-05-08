@@ -107,6 +107,13 @@ export interface CostResult {
   metalPurity?: Prisma.Decimal | null;
   /** Desglose Metal/Hechura estructurado. Disponible cuando value != null. */
   breakdown?: PriceBreakdown | null;
+  /** F1.4 G5 #11-A — overrides per costLineId que el motor cost aplicó
+   *  efectivamente (post-validación). El caller (sale.ts) los persiste
+   *  en `SalePriceResult.costLineOverridesApplied`. */
+  costLineOverridesApplied?: CostLineOverride[];
+  /** F1.4 G5 #11-A — warnings internos sobre overrides inválidos
+   *  (NO mezclados con steps[] / partial visuals). */
+  debugWarnings?: DebugWarning[];
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +474,84 @@ export interface SalePriceResult {
       manual:   boolean;
     };
   };
+
+  /**
+   * F1.4 G5 #11-A — overrides per costLineId aplicados efectivamente al
+   * preview (post-validación, post-merge legacy/explicit). Es el array
+   * que el motor cost USÓ realmente, no necesariamente el que llegó del
+   * caller. Persistido en snapshot v6 para reproducibilidad histórica.
+   */
+  costLineOverridesApplied?: CostLineOverride[];
+
+  /**
+   * F1.4 G5 #11-A — warnings internos del motor sobre overrides inválidos
+   * (costLineId no encontrado, type mismatch, campo no aplicable al tipo).
+   * NO se mezclan con `alerts` (negocio) ni `steps` (cálculo) — esto es
+   * exclusivamente diagnóstico interno. La UI puede mostrarlo en una vista
+   * de debug si quiere; la UI normal lo ignora.
+   */
+  debugWarnings?: DebugWarning[];
+}
+
+// ---------------------------------------------------------------------------
+// F1.4 G5 #11-A — CostLineOverride
+// ---------------------------------------------------------------------------
+
+/**
+ * Override per cost line indexado por costLineId. Permite editar cantidad,
+ * valor unitario, merma, o ajuste de una cost line individual.
+ *
+ * Para semántica detallada de null vs undefined, validaciones, y precedencia
+ * con overrides legacy, ver `SaleOptions.costLineOverrides`.
+ */
+export interface CostLineOverride {
+  /** ArticleCostLine.id estable. Único campo obligatorio.
+   *  Si no matchea ningún cost line de la composición → ignorado + debugWarning. */
+  costLineId:        string;
+  /** Tipo confirmatorio. El motor valida que coincida con el tipo real de
+   *  la cost line — si difiere → todo el override se ignora + debugWarning. */
+  type:              "METAL" | "HECHURA" | "PRODUCT" | "SERVICE";
+  /** Pisa `quantity` de la cost line. null/undefined = no override.
+   *  Para METAL representa gramos; para resto, unidades/cantidad. */
+  quantityOverride?:    number | null;
+  /** Pisa `unitValue`. SOLO HECHURA/PRODUCT/SERVICE — METAL la ignora
+   *  (precio viene de MetalQuote autoritativa). null/undefined = no override. */
+  unitValueOverride?:   number | null;
+  /** Pisa `mermaPercent`. SOLO METAL — los demás tipos la ignoran.
+   *  null/undefined = no override. */
+  mermaPercentOverride?: number | null;
+  /** Reemplaza el `lineAdjKind` del cost line.
+   *   · undefined  → mantener original.
+   *   · null       → LIMPIAR el ajuste (sin bonif/recargo).
+   *   · "BONUS" / "SURCHARGE" → setear ese ajuste.
+   *  No aplica a METAL — si type=METAL se ignora + debugWarning. */
+  adjustmentKind?:   "BONUS" | "SURCHARGE" | null;
+  /** Tipo del valor del ajuste. Misma semántica de null/undefined que
+   *  adjustmentKind. */
+  adjustmentType?:   "PERCENTAGE" | "FIXED_AMOUNT" | null;
+  /** Valor del ajuste (% o monto fijo según adjustmentType). null/undefined
+   *  con la misma semántica. */
+  adjustmentValue?:  number | null;
+}
+
+/**
+ * Warning interno del motor — NO se mezcla con steps[] ni partial
+ * statuses visuales. Sirve para diagnóstico de overrides inválidos
+ * (costLineId inexistente, type mismatch, campo aplicado al tipo
+ * equivocado) sin contaminar la UI.
+ *
+ * El preview NUNCA se rompe por un warning — se ignora el campo
+ * problemático y se continúa el cálculo con los valores originales.
+ */
+export interface DebugWarning {
+  /** Código corto identificador. */
+  code:     "COST_LINE_OVERRIDE_NOT_FOUND"
+          | "COST_LINE_OVERRIDE_TYPE_MISMATCH"
+          | "COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE";
+  /** Mensaje legible (ES). */
+  message:  string;
+  /** Contexto opcional para debug. */
+  context?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +852,40 @@ export interface SalePriceOpts {
    * modifica.
    */
   hechuraOverrideAmount?: number | null;
+
+  /**
+   * F1.4 G5 #11-A — overrides per cost line indexados por costLineId.
+   *
+   * Permite editar cantidad / valor unitario / merma / ajuste de cost
+   * lines individuales sin tocar la ficha del artículo. El motor cost
+   * los aplica internamente vía `Map<costLineId, override>` (cero
+   * mentalidad de índice / findIndex).
+   *
+   * SEMÁNTICA DE NULL vs UNDEFINED:
+   *   · `undefined`  → no override (mantener valor original).
+   *   · `null` (en adjustment*) → LIMPIAR el ajuste (eliminar bonif/recargo).
+   *   · `null` (en quantity/unitValue/mermaPercent) → tratado como undefined.
+   *
+   * VALIDACIONES (centralizadas en validateCostLineOverride):
+   *   · `costLineId` debe existir en la composición → ignorar + debugWarning.
+   *   · `type` debe coincidir con el tipo real de la cost line → idem.
+   *   · `unitValueOverride` con type=METAL → ignorar campo + debugWarning
+   *     (METAL toma precio de MetalQuote, no editable).
+   *   · `mermaPercentOverride` con type≠METAL → ignorar + debugWarning.
+   *   · `adjustment*` con type=METAL → ignorar + debugWarning (motor cost
+   *     descarta lineAdj para METAL).
+   *
+   * PRECEDENCIA con overrides legacy (gramsOverride, mermaPercentOverride
+   * legacy, hechuraOverrideAmount):
+   *   · `costLineOverrides` SIEMPRE gana cuando hay match por costLineId.
+   *   · Legacy se sintetiza en costLineOverrides apuntando al primer
+   *     METAL/HECHURA si y solo si NO hay un explicit para ese costLineId.
+   *   · NO se hace additive merge ni fallback ambiguo.
+   *
+   * `metalVariantIdOverride` queda LEGACY-ONLY — no se incluye en este
+   * shape porque cambiar la variante implica recotizar (flow distinto).
+   */
+  costLineOverrides?: CostLineOverride[];
   /**
    * Uso INTERNO del motor — no debe ser provisto por callers externos.
    * Cuando un combo comercial resuelve el precio de sus componentes invoca
@@ -900,6 +1019,13 @@ export interface PricingLineSnapshot {
     metalVariant?: { originalId: string | null; appliedId: string | null; manual: boolean };
     hechura?:      { original: number | null; applied: number | null; manual: boolean };
   };
+
+  /** F1.4 G5 #11-A (snapshot v6) — overrides per costLineId que el motor
+   *  cost USÓ efectivamente (post-validación, post-merge legacy/explicit).
+   *  La `composition` persistida ya refleja el resultado post-override —
+   *  este array existe para que un reader histórico pueda saber QUÉ pidió
+   *  el operador (vs lo que el motor calculó). */
+  costLineOverridesApplied?: CostLineOverride[];
 
   // ── F1.3 G4.x #5b — composición + breakdown sale-side persistidos ─────────
   // Se agregan en snapshot v4 (aditivos, opcionales). Snapshots v3 se siguen
@@ -1048,5 +1174,11 @@ export interface SnapshotComposition {
  *                  (= arrays[0] ?? null). Aditivos: snapshots v4 leídos
  *                  sin metals/hechuras se normalizan a [] (o derivados
  *                  desde el alias legacy si existe). Cero cambio numérico
- *                  en totales/precio final. */
-export const PRICING_LINE_SNAPSHOT_VERSION = 5;
+ *                  en totales/precio final.
+ *  v6 (F1.4 G5 #11-A) — agrega `costLineOverridesApplied[]` (overrides
+ *                  per costLineId que el motor cost aplicó efectivamente,
+ *                  post-validación + post-merge con legacy). La
+ *                  `composition` ya refleja el resultado post-override
+ *                  (no requiere campo nuevo). Aditivo: snapshots v5 sin
+ *                  el array se leen con `costLineOverridesApplied=undefined`. */
+export const PRICING_LINE_SNAPSHOT_VERSION = 6;

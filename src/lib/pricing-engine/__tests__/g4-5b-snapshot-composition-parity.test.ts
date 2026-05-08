@@ -160,12 +160,12 @@ describe("snapshot parity — preview ↔ persisted (composition + componentSale
       .toBe(result.componentSaleBreakdown!.hechura.salePreManualDiscount);
   });
 
-  it("baseline correct: snapshot version bumped a 5 (aditivo con metals/hechuras arrays)", async () => {
+  it("baseline correct: snapshot version bumped a 6 (aditivo con costLineOverridesApplied)", async () => {
     setupMetalHechuraList(600, 600);
     const result = await resolveFinalSalePrice("j1", { articleId: "a1" });
     const snap = buildPricingSnapshot(result);
-    expect(snap.snapshotVersion).toBe(5);
-    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(5);
+    expect(snap.snapshotVersion).toBe(6);
+    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(6);
   });
 });
 

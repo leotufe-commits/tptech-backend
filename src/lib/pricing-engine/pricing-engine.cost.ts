@@ -44,7 +44,11 @@ async function modoCostLines(
   lines: CostLineInput[],
   steps: PricingStep[],
   entityMermaMap: Map<string, number> = new Map(),
-  ctx?: BatchCostContext
+  ctx?: BatchCostContext,
+  /** F1.4 G5 #11-A — overrides per costLineId. Map<costLineId, sanitized
+   *  override>. El motor aplica `effective*` SOLO a cost lines cuyo `id`
+   *  está en el map. Cero mutación del input. */
+  costLineOverrideMap?: Map<string, import("./pricing-engine.types.js").CostLineOverride>,
 ): Promise<{
   value: Prisma.Decimal | null;
   partial: boolean;
@@ -138,7 +142,16 @@ async function modoCostLines(
   let metalLinesSeen = 0;
 
   for (const line of lines) {
-    const qty = new Prisma.Decimal(line.quantity?.toString() ?? "0");
+    // F1.4 G5 #11-A — override per costLineId (cero mutación de `line`).
+    // Lookup O(1). Cuando hay match, los `effective*` reemplazan los
+    // valores originales sin mutar el objeto.
+    const ov = (costLineOverrideMap && typeof line.id === "string" && line.id.length > 0)
+      ? costLineOverrideMap.get(line.id)
+      : undefined;
+    const effectiveQtyRaw = ov?.quantityOverride != null
+      ? ov.quantityOverride
+      : line.quantity;
+    const qty = new Prisma.Decimal(effectiveQtyRaw?.toString() ?? "0");
 
     if (line.type === "METAL") {
       if (!line.metalVariantId) {
@@ -180,10 +193,20 @@ async function modoCostLines(
         purityHeterogeneous = true;
       }
 
-      // Merma efectiva: override de entidad > merma de línea > 0
+      // F1.4 G5 #11-A — merma efectiva con prioridad explícita:
+      //   1) costLineOverride.mermaPercentOverride (del array por costLineId)
+      //   2) entity merma override (config legacy global por variante)
+      //   3) merma de la línea (config artículo)
+      //   4) 0 (sin merma)
+      const lineOverrideMerma = ov?.mermaPercentOverride;
       const entityMerma = line.metalVariantId ? entityMermaMap.get(line.metalVariantId) : undefined;
-      const effectiveMerma = entityMerma != null ? entityMerma : (line.mermaPercent ?? 0);
-      const mermaSource    = entityMerma != null ? "entity" : "line";
+      const effectiveMerma = lineOverrideMerma != null
+        ? lineOverrideMerma
+        : (entityMerma != null ? entityMerma : (line.mermaPercent ?? 0));
+      const mermaSource =
+        lineOverrideMerma != null ? "costLineOverride"
+        : (entityMerma != null     ? "entity"
+        :                            "line");
       const mermaFactor = new Prisma.Decimal(1).add(
         new Prisma.Decimal(effectiveMerma.toString()).div(100)
       );
@@ -234,7 +257,11 @@ async function modoCostLines(
       // en confirmSale (ver sales.service.ts). Si en el futuro se necesita
       // recomputar el costo del componente con `weightOverride` de la
       // variante, se hace acá leyendo `line.catalogVariantId`.
-      const unitVal = new Prisma.Decimal(line.unitValue?.toString() ?? "0");
+      // F1.4 G5 #11-A — unitValue efectivo (override per costLineId gana).
+      const effectiveUnitValueRaw = ov?.unitValueOverride != null
+        ? ov.unitValueOverride
+        : line.unitValue;
+      const unitVal = new Prisma.Decimal(effectiveUnitValueRaw?.toString() ?? "0");
       let lineValue = qty.mul(unitVal);
 
       let conversionMeta: Record<string, string> | undefined;
@@ -270,8 +297,37 @@ async function modoCostLines(
       // types.ts:164-165): positivo cuando el adjustment REDUCE el valor
       // (BONUS), negativo cuando lo AUMENTA (SURCHARGE).
       const preAdjValue = lineValue;
-      // Ajuste por línea (bonificación / recargo)
-      lineValue = applyAdjustment(lineValue, line.lineAdjKind, line.lineAdjType, line.lineAdjValue);
+      // F1.4 G5 #11-A — adjustment efectivo aplicando override per costLineId.
+      //   · undefined  → mantener original.
+      //   · null       → LIMPIAR (sin bonif/recargo, equivale a kind="").
+      //   · valor      → reemplazar.
+      // Si el override tiene adjustmentKind=null, los 3 campos se limpian
+      // (resolveEffectiveAdjustment ya garantiza eso).
+      let effAdjKind:  unknown = line.lineAdjKind;
+      let effAdjType:  unknown = line.lineAdjType;
+      let effAdjValue: unknown = line.lineAdjValue;
+      if (ov && (
+        ov.adjustmentKind  !== undefined ||
+        ov.adjustmentType  !== undefined ||
+        ov.adjustmentValue !== undefined
+      )) {
+        if (ov.adjustmentKind === null) {
+          effAdjKind = null;
+          effAdjType = null;
+          effAdjValue = null;
+        } else {
+          if (ov.adjustmentKind  !== undefined) effAdjKind  = ov.adjustmentKind;
+          if (ov.adjustmentType  !== undefined) effAdjType  = ov.adjustmentType;
+          if (ov.adjustmentValue !== undefined) effAdjValue = ov.adjustmentValue;
+        }
+      }
+      // Ajuste por línea (bonificación / recargo) — usa los efectivos.
+      lineValue = applyAdjustment(
+        lineValue,
+        effAdjKind  as Parameters<typeof applyAdjustment>[1],
+        effAdjType  as Parameters<typeof applyAdjustment>[2],
+        effAdjValue as Parameters<typeof applyAdjustment>[3],
+      );
       if (lineValue.lt(0)) lineValue = new Prisma.Decimal(0);
 
       total = total.add(lineValue);
@@ -282,7 +338,7 @@ async function modoCostLines(
       // F1.3 G4.1.2 — monto absoluto del ajuste, computado por el motor.
       // Solo se incluye en meta cuando hubo adjustment (kind no vacío);
       // así el frontend evita derivarlo y respeta el redondeo del motor.
-      const hasAdjustment = !!line.lineAdjKind && line.lineAdjKind !== "";
+      const hasAdjustment = !!effAdjKind && effAdjKind !== "";
       let lineAdjAmountStr: string | null = null;
       if (hasAdjustment) {
         // delta = pre - post. Positivo = reducción (BONUS); negativo = aumento (SURCHARGE).
@@ -311,8 +367,8 @@ async function modoCostLines(
           ...(conversionMeta ?? {}),
           ...(lineLabel ? { lineLabel }  : {}),
           ...(refCode   ? { lineCode: refCode } : {}),
-          ...(line.lineAdjKind && line.lineAdjKind !== ""
-            ? { lineAdjKind: line.lineAdjKind, lineAdjType: line.lineAdjType, lineAdjValue: line.lineAdjValue }
+          ...(effAdjKind && effAdjKind !== ""
+            ? { lineAdjKind: effAdjKind, lineAdjType: effAdjType, lineAdjValue: effAdjValue }
             : {}),
           // F1.3 G4.1.2 — campos nuevos para trazabilidad UI:
           //   · costLineId — estable, persistente, snapshot-safe (NO orden/índice)
@@ -366,6 +422,10 @@ export async function calculateCostFromLines(
     value?: any;
   },
   ctx?: BatchCostContext,
+  /** F1.4 G5 #11-A — overrides per costLineId. Cuando se pasa, el motor
+   *  aplica los `effective*` correspondientes vía Map<id, override>.
+   *  Cero mutación del input `lines`. */
+  costLineOverrides?: ReadonlyArray<import("./pricing-engine.types.js").CostLineOverride>,
 ): Promise<CostResult> {
   const steps: PricingStep[] = [];
 
@@ -380,10 +440,23 @@ export async function calculateCostFromLines(
     return { value: null, mode: "COST_LINES", partial: true, steps };
   }
 
-  const linesResult = await modoCostLines(jewelryId, lines, steps, new Map(), ctx);
+  // F1.4 G5 #11-A — construir Map<costLineId, override sanitizado>.
+  // Los warnings van al `debugWarnings` del CostResult — NO a steps[].
+  const { buildCostLineOverrideMap } = await import("./pricing-engine.cost-line-overrides.js");
+  const { map: ovMap, applied: ovApplied, warnings: ovWarnings } =
+    Array.isArray(costLineOverrides) && costLineOverrides.length > 0
+      ? buildCostLineOverrideMap(costLineOverrides, lines)
+      : { map: new Map(), applied: [], warnings: [] };
+
+  const linesResult = await modoCostLines(jewelryId, lines, steps, new Map(), ctx, ovMap);
 
   if (linesResult.value === null) {
-    return { value: null, mode: "COST_LINES", partial: true, steps };
+    return {
+      value: null, mode: "COST_LINES", partial: true, steps,
+      // Mantener trazabilidad de overrides incluso cuando no hay valor.
+      ...(ovApplied.length > 0 ? { costLineOverridesApplied: ovApplied } : {}),
+      ...(ovWarnings.length > 0 ? { debugWarnings: ovWarnings } : {}),
+    };
   }
 
   const adjusted = applyAdjustment(
@@ -421,6 +494,9 @@ export async function calculateCostFromLines(
     metalGramsWithMerma: linesResult.metalGramsWithMerma,
     // Sprint 3 — POLICY.md §8 — alimenta pureGramsBase en el motor de venta.
     metalPurity:         linesResult.metalPurity,
+    // F1.4 G5 #11-A — trazabilidad de overrides aplicados + warnings.
+    ...(ovApplied.length > 0 ? { costLineOverridesApplied: ovApplied } : {}),
+    ...(ovWarnings.length > 0 ? { debugWarnings: ovWarnings } : {}),
   };
 }
 

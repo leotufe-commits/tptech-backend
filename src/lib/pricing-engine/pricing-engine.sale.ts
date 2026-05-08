@@ -19,6 +19,8 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma.js";
 import { resolvePriceList, resolvePriceListById, applyPriceList, applyRounding, type MetalHechuraDetail } from "./pricing-engine.pricelist.js";
 import { calculateCostFromLines, enrichCostMetalSteps, buildBatchCostContext, getArticleMetalVariantIds } from "./pricing-engine.cost.js";
+// F1.4 G5 #11-A — helper para unificar overrides legacy + explicit.
+import { unifyCostLineOverrides } from "./pricing-engine.cost-line-overrides.js";
 import type {
   SalePriceResult,
   SalePriceOpts,
@@ -1077,6 +1079,27 @@ export async function resolveFinalSalePrice(
   const composedLines = opts.extraCostLines && opts.extraCostLines.length > 0
     ? [...workLines, ...opts.extraCostLines]
     : workLines;
+  // F1.4 G5 #11-A — unificar overrides legacy (gramsOverride, etc.) +
+  // explicit (opts.costLineOverrides). Explicit gana cuando hay match
+  // por costLineId. NO additive merge. NO mutación de baseLines/workLines
+  // (los workLines siguen siendo los originales — el motor cost aplica
+  // los `effective*` per costLineId internamente).
+  const unifiedCostLineOverrides = unifyCostLineOverrides(
+    composedLines,
+    {
+      // Solo se sintetizan los legacy SI no fueron ya consumidos arriba
+      // mutando workLines. El flow legacy actual sigue mutando workLines
+      // (mantener compat). Para evitar double-apply, NO sintetizamos
+      // legacy cuando workLines ya difiere de baseLines (manualOverrides
+      // legacy ya consumieron).
+      // Los workLines mutados ya tienen los valores aplicados → sintetizar
+      // legacy SOLO desde opts puro y dejar que costLineOverrides puro
+      // (los explicit) actúe sobre composedLines. Como workLines puede
+      // estar mutado, es seguro pasar undefined acá: los legacy ya están
+      // aplicados vía workLines.
+    },
+    opts.costLineOverrides,
+  );
   const costResult = await calculateCostFromLines(
     jewelryId,
     composedLines,
@@ -1085,6 +1108,8 @@ export async function resolveFinalSalePrice(
       type:  (article as any).manualAdjustmentType,
       value: (article as any).manualAdjustmentValue,
     },
+    undefined,  // ctx
+    unifiedCostLineOverrides,
   );
 
   // Resolver totalGrams: variant.weightOverride tiene prioridad
@@ -2500,6 +2525,10 @@ export async function resolveFinalSalePrice(
     taxExemptByEntity: entityTaxExempt,
     appliedRounding,
     costOverrideContext: Object.keys(overrideContext).length > 0 ? overrideContext : undefined,
+    // F1.4 G5 #11-A — trazabilidad de costLineOverrides aplicados +
+    // warnings internos (NO se mezclan con alerts/steps visuales).
+    costLineOverridesApplied: costResult.costLineOverridesApplied,
+    debugWarnings:            costResult.debugWarnings,
   };
 
   return finalize(base, policyConfig);
@@ -2924,6 +2953,12 @@ export function buildPricingSnapshot(
       : null,
 
     costOverrideContext: result.costOverrideContext,
+    // F1.4 G5 #11-A — snapshot v6 persiste array de overrides aplicados.
+    // La `composition` ya refleja el resultado post-override (no requiere
+    // campo nuevo). Aditivo: snapshots v5 leídos sin el array funcionan.
+    ...(result.costLineOverridesApplied && result.costLineOverridesApplied.length > 0
+      ? { costLineOverridesApplied: result.costLineOverridesApplied }
+      : {}),
 
     // F1.3 G4.x #5b — paridad preview/persisted (aditivo, snapshot v4).
     // `composition` viene del caller (pricing-composition.ts); el motor solo
