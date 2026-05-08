@@ -130,7 +130,7 @@ describe("F1.4 #11-A — validateCostLineOverride", () => {
     const r = validateCostLineOverride(ov, line);
     expect(r.applicable).toBe(true);
     expect(r.sanitized.unitValueOverride).toBeUndefined();
-    expect(r.warnings[0].code).toBe("COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE");
+    expect(r.warnings[0].code).toBe("COST_LINE_OVERRIDE_INVALID_FIELD");
   });
 
   it("baseline correct: METAL + adjustment* → todos los campos borrados + 1 warning", () => {
@@ -392,7 +392,7 @@ describe("F1.4 #11-A — debugWarnings aislados de steps[]", () => {
     ]);
     // unitValueOverride ignorado para METAL → cost = 1×100 = 100.
     expect(r.value?.toNumber()).toBeCloseTo(100, 4);
-    expect(r.debugWarnings?.[0]?.code).toBe("COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE");
+    expect(r.debugWarnings?.[0]?.code).toBe("COST_LINE_OVERRIDE_INVALID_FIELD");
   });
 });
 

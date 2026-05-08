@@ -954,9 +954,29 @@ export async function resolveFinalSalePrice(
   // vez.
   const overrideContext: NonNullable<SalePriceResult["costOverrideContext"]> = {};
 
-  // Encontramos la primera línea METAL y la primera HECHURA. La gran mayoría
-  // de los artículos tienen una de cada — si hay varias, los overrides
-  // aplican solo a la primera (decisión de UX simple para esta fase).
+  // ─────────────────────────────────────────────────────────────────
+  // F1.4 #11-B — DEUDA TÉCNICA / LEGACY CLEANUP FUTURO
+  // ─────────────────────────────────────────────────────────────────
+  // El bloque que sigue (findIndex + mutación de workLines) es el path
+  // LEGACY de overrides singleton (gramsOverride, mermaPercentOverride,
+  // metalVariantIdOverride, hechuraOverrideAmount). Solo aplica al PRIMER
+  // METAL/HECHURA de la composición.
+  //
+  // OBJETIVO FINAL (NO en 11-B):
+  //   · Eliminar `findIndex` y mutación de workLines.
+  //   · Migrar gramsOverride/mermaPercentOverride/hechuraOverrideAmount
+  //     a entries sintetizados en `costLineOverrides` (lo que hace
+  //     `unifyCostLineOverrides` cuando se le pasa el legacy).
+  //   · `metalVariantIdOverride` requiere flow distinto (recotización)
+  //     y queda LEGACY-ONLY hasta nueva decisión de producto.
+  //   · UNIFY como única source of truth: el motor cost aplica overrides
+  //     SOLO desde costLineOverrides — sin paths paralelos.
+  //
+  // Hasta que se migre, este bloque sigue activo Y `unifyCostLineOverrides`
+  // se llama con `legacy={}` (vacío) abajo para evitar double-apply: los
+  // workLines ya tienen los valores aplicados, los explicit del usuario
+  // se agregan como costLineOverrides puros.
+  // ─────────────────────────────────────────────────────────────────
   const metalIdx   = baseLines.findIndex((l: any) => l?.type === "METAL");
   const hechuraIdx = baseLines.findIndex((l: any) => l?.type === "HECHURA");
   const metalLine   = metalIdx   >= 0 ? baseLines[metalIdx]   : null;
@@ -2525,10 +2545,43 @@ export async function resolveFinalSalePrice(
     taxExemptByEntity: entityTaxExempt,
     appliedRounding,
     costOverrideContext: Object.keys(overrideContext).length > 0 ? overrideContext : undefined,
-    // F1.4 G5 #11-A — trazabilidad de costLineOverrides aplicados +
-    // warnings internos (NO se mezclan con alerts/steps visuales).
-    costLineOverridesApplied: costResult.costLineOverridesApplied,
-    debugWarnings:            costResult.debugWarnings,
+    // F1.4 G5 #11-B — `costLineOverridesApplied` debe persistir el RESULTADO
+    // FINAL UNIFICADO: legacy sintetizado (gramsOverride/mermaPercent/hechura)
+    // + explicit del usuario, todo resuelto a entries por costLineId.
+    // Esto garantiza reproducibilidad histórica exacta — un reader del
+    // snapshot puede reconstruir el cálculo sin necesidad de inspeccionar
+    // gramsOverride / hechuraOverrideAmount legacy en paralelo.
+    //
+    // Nota: el cost engine YA aplicó solo `opts.costLineOverrides` puros
+    // (sin legacy sintetizado) porque los legacy mutaron `workLines` arriba
+    // (deuda técnica documentada en líneas ~957). Este paso NO re-aplica
+    // — solo construye el tracking unificado para reproducibilidad.
+    costLineOverridesApplied: (() => {
+      const explicit = costResult.costLineOverridesApplied ?? [];
+      const hasAnyLegacy =
+        opts.gramsOverride         != null ||
+        opts.mermaPercentOverride  != null ||
+        opts.hechuraOverrideAmount != null;
+      if (!hasAnyLegacy) {
+        return explicit.length > 0 ? explicit : undefined;
+      }
+      // Sintetizar legacy + mergear con explicit. unifyCostLineOverrides
+      // ya garantiza explicit > legacy por costLineId.
+      const unified = unifyCostLineOverrides(
+        baseLines,
+        {
+          gramsOverride:         opts.gramsOverride,
+          mermaPercentOverride:  opts.mermaPercentOverride,
+          hechuraOverrideAmount: opts.hechuraOverrideAmount,
+        },
+        explicit,
+      );
+      // Filtrar entries vacíos (puede haber synth con todos los campos
+      // null si el caller envía legacy=null como "limpiar" — semantica
+      // legacy actual no genera ese caso, defensivo).
+      return unified.length > 0 ? unified : undefined;
+    })(),
+    debugWarnings: costResult.debugWarnings,
   };
 
   return finalize(base, policyConfig);

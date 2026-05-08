@@ -544,13 +544,18 @@ export interface CostLineOverride {
  * problemático y se continúa el cálculo con los valores originales.
  */
 export interface DebugWarning {
-  /** Código corto identificador. */
+  /** Código corto identificador. Set cerrado — sin strings libres. */
   code:     "COST_LINE_OVERRIDE_NOT_FOUND"
           | "COST_LINE_OVERRIDE_TYPE_MISMATCH"
-          | "COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE";
+          | "COST_LINE_OVERRIDE_INVALID_FIELD";
   /** Mensaje legible (ES). */
   message:  string;
-  /** Contexto opcional para debug. */
+  /** F1.4 #11-B — costLineId del override que disparó el warning.
+   *  Permite al frontend indexar warnings por costLineId si quisiera
+   *  mostrarlos en una vista de debug. null cuando el override no
+   *  apunta a ningún costLineId real (caso `NOT_FOUND`). */
+  costLineId?: string | null;
+  /** Contexto opcional para debug profundo (no se loggea por default). */
   context?: Record<string, unknown>;
 }
 

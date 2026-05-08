@@ -59,9 +59,10 @@ export function validateCostLineOverride(
       applicable: false,
       sanitized:  override,
       warnings:   [{
-        code:    "COST_LINE_OVERRIDE_NOT_FOUND",
-        message: `costLineId "${override.costLineId}" no existe en la composición — override ignorado`,
-        context: { costLineId: override.costLineId, type: override.type },
+        code:       "COST_LINE_OVERRIDE_NOT_FOUND",
+        message:    `costLineId "${override.costLineId}" no existe en la composición — override ignorado`,
+        costLineId: override.costLineId ?? null,
+        context:    { type: override.type },
       }],
     };
   }
@@ -73,9 +74,10 @@ export function validateCostLineOverride(
       applicable: false,
       sanitized:  override,
       warnings:   [{
-        code:    "COST_LINE_OVERRIDE_TYPE_MISMATCH",
-        message: `costLineId "${override.costLineId}": override.type="${override.type}" no coincide con la cost line real (type="${line.type}") — override ignorado`,
-        context: { costLineId: override.costLineId, requestedType: override.type, actualType: line.type },
+        code:       "COST_LINE_OVERRIDE_TYPE_MISMATCH",
+        message:    `costLineId "${override.costLineId}": override.type="${override.type}" no coincide con la cost line real (type="${line.type}") — override ignorado`,
+        costLineId: override.costLineId,
+        context:    { requestedType: override.type, actualType: line.type },
       }],
     };
   }
@@ -87,9 +89,10 @@ export function validateCostLineOverride(
   if (line.type === "METAL") {
     if (sanitized.unitValueOverride !== undefined && sanitized.unitValueOverride !== null) {
       warnings.push({
-        code:    "COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE",
-        message: `costLineId "${override.costLineId}": unitValueOverride no aplica a METAL (precio viene de MetalQuote) — campo ignorado`,
-        context: { costLineId: override.costLineId, field: "unitValueOverride", type: "METAL" },
+        code:       "COST_LINE_OVERRIDE_INVALID_FIELD",
+        message:    `costLineId "${override.costLineId}": unitValueOverride no aplica a METAL (precio viene de MetalQuote) — campo ignorado`,
+        costLineId: override.costLineId,
+        context:    { field: "unitValueOverride", type: "METAL" },
       });
       delete (sanitized as unknown as Record<string, unknown>).unitValueOverride;
     }
@@ -99,9 +102,10 @@ export function validateCostLineOverride(
       sanitized.adjustmentValue !== undefined
     ) {
       warnings.push({
-        code:    "COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE",
-        message: `costLineId "${override.costLineId}": adjustment* no aplica a METAL (motor cost descarta lineAdj para METAL) — campos ignorados`,
-        context: { costLineId: override.costLineId, type: "METAL" },
+        code:       "COST_LINE_OVERRIDE_INVALID_FIELD",
+        message:    `costLineId "${override.costLineId}": adjustment* no aplica a METAL (motor cost descarta lineAdj para METAL) — campos ignorados`,
+        costLineId: override.costLineId,
+        context:    { field: "adjustment*", type: "METAL" },
       });
       delete (sanitized as unknown as Record<string, unknown>).adjustmentKind;
       delete (sanitized as unknown as Record<string, unknown>).adjustmentType;
@@ -111,9 +115,10 @@ export function validateCostLineOverride(
     // HECHURA / PRODUCT / SERVICE — mermaPercentOverride no aplica.
     if (sanitized.mermaPercentOverride !== undefined && sanitized.mermaPercentOverride !== null) {
       warnings.push({
-        code:    "COST_LINE_OVERRIDE_FIELD_NOT_APPLICABLE",
-        message: `costLineId "${override.costLineId}": mermaPercentOverride solo aplica a METAL (type actual: ${line.type}) — campo ignorado`,
-        context: { costLineId: override.costLineId, field: "mermaPercentOverride", type: line.type },
+        code:       "COST_LINE_OVERRIDE_INVALID_FIELD",
+        message:    `costLineId "${override.costLineId}": mermaPercentOverride solo aplica a METAL (type actual: ${line.type}) — campo ignorado`,
+        costLineId: override.costLineId,
+        context:    { field: "mermaPercentOverride", type: line.type },
       });
       delete (sanitized as unknown as Record<string, unknown>).mermaPercentOverride;
     }
