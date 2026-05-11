@@ -34,7 +34,12 @@ beforeEach(() => {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeStep(key: string, value: number, meta: Record<string, unknown> = {}, label = "step") {
+// Fixtures sintéticos — `value: number` y `meta` literales son aceptados por
+// los extractores en runtime (parsean strings/numbers indistintamente). Para
+// satisfacer el chequeo de tipos `PricingStep` (que requiere `Decimal`), el
+// helper devuelve `any` — el cast NO afecta a runtime ni al test, solo
+// silencia el chequeo estricto del build.
+function makeStep(key: string, value: number, meta: Record<string, unknown> = {}, label = "step"): any {
   return { key, label, status: "ok" as const, value, meta };
 }
 
@@ -46,7 +51,9 @@ function makeResult(steps: any[]): any {
   };
 }
 
-const noMvi = { purity: null, purityLabel: null, metalName: null };
+// `MetalVariantInfo` requiere `variantName` (Fase 2.4). Los tests de Fase
+// 1.3 no validan ese campo — lo emitimos como null para satisfacer el tipo.
+const noMvi = { purity: null, purityLabel: null, metalName: null, variantName: null };
 
 // =============================================================================
 // 1. extractCompositionMetals — múltiples METAL
@@ -65,8 +72,8 @@ describe("F1.3 #9-A — extractCompositionMetals", () => {
       }, "Línea de metal"),
     ];
     const map = new Map([
-      ["mv-1", { purity: 0.75, purityLabel: "18k", metalName: "Oro" }],
-      ["mv-2", { purity: 0.925, purityLabel: "22k", metalName: "Plata" }],
+      ["mv-1", { purity: 0.75, purityLabel: "18k", metalName: "Oro", variantName: null }],
+      ["mv-2", { purity: 0.925, purityLabel: "22k", metalName: "Plata", variantName: null }],
     ]);
     const items = extractCompositionMetals(steps, map);
     expect(items).toHaveLength(2);
@@ -172,8 +179,8 @@ describe("F1.3 #9-A — buildComposition arrays + alias legacy", () => {
       makeStep("COST_LINES_METAL", 400, { costLineId: "cl-m2", variantId: "mv-2", qty: "2.00", merma: 0 }),
     ]);
     const map = new Map([
-      ["mv-1", { purity: 0.75, purityLabel: "18k", metalName: "Oro" }],
-      ["mv-2", { purity: 0.925, purityLabel: "22k", metalName: "Plata" }],
+      ["mv-1", { purity: 0.75, purityLabel: "18k", metalName: "Oro", variantName: null }],
+      ["mv-2", { purity: 0.925, purityLabel: "22k", metalName: "Plata", variantName: null }],
     ]);
     const comp = buildComposition(result, noMvi, undefined, map);
     expect(comp.metals).toHaveLength(2);
