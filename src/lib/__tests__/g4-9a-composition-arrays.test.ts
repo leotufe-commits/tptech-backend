@@ -74,11 +74,19 @@ describe("F1.3 #9-A — extractCompositionMetals", () => {
       costLineId:      "cl-m1",
       metalVariantId:  "mv-1",
       metalName:       "Oro",
+      // Fase 2.4 — variantName propagado desde MetalVariantInfo del map.
+      // Este fixture no setea variantName en el map → null (fallback al
+      // "Oro 18k" derivado en frontend).
+      variantName:     null,
       purity:          0.75,
       purityLabel:     "18k",
       appliedGrams:    1.30,
       appliedMermaPct: 5,
       lineCost:        600,
+      // F1.5 #A++ — sin metalSaleFactor (caller no lo pasó) → lineSale null.
+      lineSale:        null,
+      // Fase 2.3 — quotePrice propagado desde step.meta (base por gramo).
+      quotePrice:      400,
     });
     expect(items[1].metalVariantId).toBe("mv-2");
     expect(items[1].metalName).toBe("Plata");
@@ -130,7 +138,19 @@ describe("F1.3 #9-A — extractCompositionHechuras", () => {
       costLineId:    "cl-h1",
       appliedAmount: 200,
       lineCost:      200,
+      // F1.5 #A+ — sin hechuraSaleFactor (caller no lo pasó) → null.
+      lineSale:      null,
       lineLabel:     "Mano de obra",
+      // Fase 2.3.1 — `unitValue` propagado desde meta.unitValue. El step
+      // del fixture trae unitValue:"200", así que llega como 200 (BASE
+      // pre-ajuste; sin ajuste configurado coincide con appliedAmount).
+      unitValue:     200,
+      // Fase 2.2 — 4 campos lineAdj* propagados desde step.meta.
+      // En este fixture no hay ajuste configurado → quedan null.
+      lineAdjKind:   null,
+      lineAdjType:   null,
+      lineAdjValue:  null,
+      lineAdjAmount: null,
     });
     expect(items[1].costLineId).toBe("cl-h2");
     expect(items[1].lineLabel).toBe("Pulido");

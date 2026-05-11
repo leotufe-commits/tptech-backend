@@ -864,6 +864,12 @@ export async function resolveFinalSalePrice(
       manualAdjustmentValue: true,
       costComposition: {
         select: {
+          // F1.3 G4.1.2 — `id` necesario para que `step.meta.costLineId`
+          // se propague al frontend (trazabilidad estable per cost line,
+          // requerido por `SaleCompositionEditableGrid` para `isEditable`).
+          // Sin esto, `composition.metals[].costLineId` viene null y la
+          // grilla queda read-only en runtime.
+          id: true,
           type: true,
           label: true,
           quantity: true,
@@ -2863,6 +2869,10 @@ export async function evaluatePricingPolicy(
         manualAdjustmentValue: true,
         costComposition: {
           select: {
+            // Consistencia con resolveFinalSalePrice — `id` necesario si la
+            // política llega a evaluar overrides per costLineId en el futuro.
+            // Aditivo y barato; mantiene paridad cross-paths del motor.
+            id: true,
             type: true, label: true,
             quantity: true, unitValue: true, currencyId: true, mermaPercent: true, metalVariantId: true,
             lineAdjKind: true, lineAdjType: true, lineAdjValue: true,

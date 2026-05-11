@@ -227,12 +227,12 @@ describe("snapshot parity — products/services preservan todos los campos", () 
     } as any;
 
     const catalogMap = new Map([
-      ["art-P", { code: "ZAF-01-cat", name: "Zafiro 0.5ct (catálogo)" }],
-      ["art-S", { code: "ENG-01-cat", name: "Engaste profesional (catálogo)" }],
+      ["art-P", { code: "ZAF-01-cat", name: "Zafiro 0.5ct (catálogo)", sku: "ZAF-01-sku" }],
+      ["art-S", { code: "ENG-01-cat", name: "Engaste profesional (catálogo)", sku: "ENG-01-sku" }],
     ]);
     const composition = buildComposition(
       fakeResult,
-      { purity: null, purityLabel: null, metalName: null },
+      { purity: null, purityLabel: null, metalName: null, variantName: null },
       catalogMap,
     );
     // Construimos el snapshot directamente con la composition armada.
@@ -245,6 +245,8 @@ describe("snapshot parity — products/services preservan todos los campos", () 
       costLineId:      "cl-p1",
       catalogItemId:   "art-P",
       catalogItemCode: "ZAF-01-cat",
+      // Fase 2.4 — SKU del Article catálogo (resuelto desde el map).
+      catalogItemSku:  "ZAF-01-sku",
       catalogItemName: "Zafiro 0.5ct (catálogo)",
       quantity:        2,
       unitValue:       50,
@@ -255,6 +257,8 @@ describe("snapshot parity — products/services preservan todos los campos", () 
       lineAdjValue:    10,
       lineAdjAmount:   5,
       affectsStock:    true,
+      // F1.5 #A+ — sin metalHechuraBreakdown en fakeResult → factor null → lineSale null.
+      lineSale:        null,
     });
     // Services
     const s = snap.composition!.services[0];
@@ -262,6 +266,7 @@ describe("snapshot parity — products/services preservan todos los campos", () 
       costLineId:      "cl-s1",
       catalogItemId:   "art-S",
       catalogItemCode: "ENG-01-cat",
+      catalogItemSku:  "ENG-01-sku",
       catalogItemName: "Engaste profesional (catálogo)",
       quantity:        1,
       unitValue:       80,
@@ -272,6 +277,7 @@ describe("snapshot parity — products/services preservan todos los campos", () 
       lineAdjValue:    20,
       lineAdjAmount:   20,
       affectsStock:    false,
+      lineSale:        null,
     });
   });
 });
@@ -376,10 +382,10 @@ describe("snapshot parity — cero cambio numérico", () => {
       metal: null, hechura: null,
       metals: [], hechuras: [],
       products: [{
-        costLineId: "x", catalogItemId: null, catalogItemCode: null,
+        costLineId: "x", catalogItemId: null, catalogItemCode: null, catalogItemSku: null,
         catalogItemName: null, quantity: 1, unitValue: 10, totalValue: 10,
         currencyId: null, lineAdjKind: null, lineAdjType: null,
-        lineAdjValue: null, lineAdjAmount: null, affectsStock: null,
+        lineAdjValue: null, lineAdjAmount: null, affectsStock: null, lineSale: null,
       }],
       services: [], taxes: [],
     };

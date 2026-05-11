@@ -24,6 +24,13 @@ export type MetalVariantInfo = {
   purity:      number | null;
   purityLabel: string | null;
   metalName:   string | null;
+  /**
+   * Fase 2.4 — nombre comercial completo de la variante (= `MetalVariant.name`),
+   * tal como aparece en la pantalla Divisas/Variantes (ej. "Oro 18 Kilates",
+   * "Chafalonia 18 Kilates"). El frontend lo prefiere para el primary en
+   * la fila METAL; cae a `metalName + purityLabel` cuando falta.
+   */
+  variantName: string | null;
 };
 
 export type CompositionMetalBlock = {
@@ -73,6 +80,13 @@ export type CompositionMetalItem = {
   /** Resuelto vía batch query desde MetalVariant + Metal. null si la
    *  variante no se pudo resolver (ej. eliminada). */
   metalName:         string | null;
+  /**
+   * Fase 2.4 — nombre comercial completo de la variante (= `MetalVariant.name`).
+   * Ejemplo: "Oro 18 Kilates" / "Chafalonia 18 Kilates". El frontend lo
+   * usa como primary en la fila METAL; cae a `metalName + purityLabel`
+   * cuando falta (snapshots viejos).
+   */
+  variantName:       string | null;
   purity:            number | null;
   purityLabel:       string | null;
   /** `quantity` original de la cost line (gramos físicos sin merma). */
@@ -82,6 +96,33 @@ export type CompositionMetalItem = {
   /** Costo individual de esta línea = step.value del motor (en BASE).
    *  La suma de `lineCost` de todos los items === metalCost agregado. */
   lineCost:          number | null;
+  /**
+   * F1.5 #A++ — sale-side per cost-line METAL (passthrough). Calculado por el
+   * motor como `lineCost × (metalSale / metalCost)` desde el
+   * `metalHechuraBreakdown`. NO es derivación frontend: el motor agrupa todos
+   * los METAL bajo un único `metalCost`/`metalSale` y el margen aplica
+   * uniformemente al bucket, por lo tanto exponer el sale-side per línea es
+   * passthrough del cálculo que el motor ya hace internamente.
+   *
+   * Paridad garantizada (modulo redondeo Decimal):
+   *   `Σ metals[i].lineSale === metalHechuraBreakdown.metalSale`.
+   *
+   * `null` cuando no se pudo derivar (sin breakdown, lista MARGIN_TOTAL sin
+   * desglose, snapshot legacy pre v7). Resuelve el bug "los metales muestran
+   * '—' en Vista comercial cuando hay múltiples metales" y elimina el
+   * prorrateo manual del Simulador (POLICY R4.1).
+   */
+  lineSale:          number | null;
+  /**
+   * Fase 2.3 — precio por gramo BASE (sin merma aplicada). Viene de
+   * `step.meta.quotePrice` que el motor cost emite directo desde la
+   * `MetalQuote.suggestedPrice`. El frontend lo usa como columna
+   * "Val. unit." (base) en METAL — antes la columna mostraba post-merma
+   * por falta de este campo.
+   *
+   * lineCost === appliedGrams × quotePrice × (1 + appliedMermaPct/100).
+   */
+  quotePrice:        number | null;
 };
 
 /**
@@ -95,14 +136,55 @@ export type CompositionMetalItem = {
 export type CompositionHechuraItem = {
   /** ArticleCostLine.id — estable, snapshot-safe. */
   costLineId:        string | null;
-  /** Valor unitario aplicado de esta línea HECHURA (`unitValue × qty`
-   *  en moneda original; o convertido a BASE si hubo conversión). */
+  /** Valor unitario aplicado de esta línea HECHURA (`step.value` del motor
+   *  POST-ajuste). NOTA: este campo trae el valor con bonif/recargo ya
+   *  aplicado. Para mostrar el valor BASE pre-ajuste, usar `unitValue`. */
   appliedAmount:     number | null;
+  /**
+   * Fase 2.3.1 — valor unitario BASE (pre-ajuste). Viene de
+   * `meta.unitValue` del cost engine (idéntico a `meta.unitValue` que ya
+   * exponen PRODUCT/SERVICE). Sin este campo, la UI mostraba el valor
+   * post-ajuste como si fuera base.
+   *
+   * lineCost (post-ajuste) === unitValue × qty + lineAdjAmount (signed).
+   */
+  unitValue:         number | null;
   /** Costo individual de esta línea = step.value del motor (en BASE).
    *  La suma de `lineCost` de todos los items === hechuraCost agregado. */
   lineCost:          number | null;
+  /**
+   * F1.5 #A+ — sale-side per línea (passthrough). Calculado por el motor como
+   * `lineCost × adjFactorGlobalCost × (1 + hechuraMarginPct/100)`. NO es
+   * derivación frontend: el motor agrupa HECHURA+PRODUCT+SERVICE bajo
+   * `hechuraCost` (cost.ts:334-336) y el margen sale-side `hechuraMarginPct`
+   * aplica al bucket entero, por lo tanto exponer el sale-side per línea
+   * es passthrough del cálculo que el motor ya hace internamente.
+   *
+   * Paridad garantizada (sin redondeo intermedio):
+   *   `Σ products.lineSale + Σ services.lineSale + Σ hechuras.lineSale ===
+   *    hechuraSale del metalHechuraBreakdown`.
+   *
+   * `null` cuando no se pudo derivar (sin breakdown, sin margen, sin
+   * lineCost). Snapshots viejos (pre v7) caen aquí. */
+  lineSale:          number | null;
   /** Etiqueta legible (label de la cost line, ej. "Mano de obra"). */
   lineLabel:         string | null;
+  // Fase 2.2 — paridad con PRODUCT/SERVICE: el motor cost SÍ emite
+  // `meta.lineAdjKind/Type/Value/Amount` para HECHURA cuando la cost line
+  // del artículo trae ajuste configurado. Antes el extractor los descartaba
+  // y el frontend no podía mostrar "Bonif/Recargo" original en la columna
+  // AJUSTE. Aditivo, opcional — snapshots viejos sin estos campos quedan
+  // en `null`.
+  /** "BONUS" | "SURCHARGE" | null. */
+  lineAdjKind:       "BONUS" | "SURCHARGE" | null;
+  /** "PERCENTAGE" | "FIXED_AMOUNT" | null. */
+  lineAdjType:       "PERCENTAGE" | "FIXED_AMOUNT" | null;
+  /** Valor del ajuste (% o monto fijo según `lineAdjType`). */
+  lineAdjValue:      number | null;
+  /** Monto absoluto resultante del ajuste (post motor cost; ya redondeado).
+   *  Frontend lo muestra como "−ARS X" (BONUS) o "+ARS X" (SURCHARGE)
+   *  sin recalcular. */
+  lineAdjAmount:     number | null;
 };
 
 export type CompositionTaxItem = {
@@ -113,6 +195,37 @@ export type CompositionTaxItem = {
   appliesTo: string;
   taxAmount: number;
   manual:    boolean;
+};
+
+/**
+ * Fase 2.5 — bloque de "Ajuste global de costo" (Article.manualAdjustment*).
+ *
+ * Es el ajuste que el operador configura en el modal del artículo
+ * (Bonificación / Recargo) y aplica sobre la SUMA de todas las cost
+ * lines (post merma metal y post lineAdj de cada componente). Se traduce
+ * en `step.meta.adjustmentKind/Type/Value` del step `COST_LINES_FINAL`.
+ *
+ * Distinto de:
+ *   · `lineAdj*` per cost line (PRODUCT/SERVICE/HECHURA) — Fase 2.2.
+ *   · `lineManualDiscount` per línea de venta (appliesTo=TOTAL) — Fase 2.x.
+ *   · `channel/coupon/payment/shipping/globalDiscount` (doc-level).
+ *
+ * Cuando el artículo no tiene ajuste configurado (`kind=""`), este bloque
+ * queda `null` y la UI oculta el chip.
+ */
+export type CompositionCostAdjustment = {
+  /** "BONUS" | "SURCHARGE". null cuando no hay ajuste configurado. */
+  kind:   "BONUS" | "SURCHARGE" | null;
+  /** "PERCENTAGE" | "FIXED_AMOUNT". null cuando no hay ajuste. */
+  type:   "PERCENTAGE" | "FIXED_AMOUNT" | null;
+  /** Valor configurado (% o monto fijo según `type`). */
+  value:  number | null;
+  /**
+   * Monto absoluto del impacto del ajuste (signed: positivo = reducción,
+   * negativo = aumento). Calculado por el motor como
+   * `sumLines - adjustedTotal`. Cero recálculo en frontend.
+   */
+  amount: number | null;
 };
 
 /**
@@ -138,6 +251,14 @@ export type CompositionItemBlock = {
   catalogItemId:    string | null;
   /** Código del catálogo (ej "PIEDRA-Z01"). Ya viene en step.meta.lineCode. */
   catalogItemCode:  string | null;
+  /**
+   * Fase 2.4 — SKU del Article catálogo referenciado (= `Article.sku`).
+   * Distinto a `catalogItemCode` (= `Article.code`). El frontend lo prefiere
+   * en la columna COMPONENTE; cae a `catalogItemCode` cuando falta.
+   * Resuelto desde el catalog map; null si el Article fue eliminado o el
+   * map no se pudo construir.
+   */
+  catalogItemSku:   string | null;
   /** Nombre legible (ej "Zafiro 0.5ct"). Resuelto desde catalog map o
    *  fallback a step.meta.lineLabel. */
   catalogItemName:  string | null;
@@ -162,6 +283,14 @@ export type CompositionItemBlock = {
   /** Si esta cost line descuenta stock al confirmar venta (PRODUCT/SERVICE).
    *  Default false — null hasta que el motor lo exponga (G4.1.2). */
   affectsStock:     boolean | null;
+  /**
+   * F1.5 #A+ — sale-side per línea (passthrough). Ver `CompositionHechuraItem.lineSale`
+   * para la definición completa. PRODUCT/SERVICE comparten margen con HECHURA
+   * porque el motor los agrupa en el mismo bucket (`cost.ts:334-336`).
+   *
+   * `null` cuando no se pudo derivar (sin breakdown, sin margen, sin totalValue).
+   * Snapshots viejos (pre v7) caen aquí. */
+  lineSale:         number | null;
 };
 
 export type Composition = {
@@ -195,6 +324,14 @@ export type Composition = {
    *  Mismo tratamiento que products. */
   services: CompositionItemBlock[];
   taxes:   CompositionTaxItem[];
+  /**
+   * Fase 2.5 — ajuste global de costo del artículo (Bonif/Recargo del modal).
+   * `null` cuando el artículo no tiene `manualAdjustmentKind` configurado
+   * o cuando el step `COST_LINES_FINAL` no fue emitido (caso degenerado).
+   * Aditivo / opcional: snapshots viejos sin este campo lo leen como
+   * `undefined` → frontend lo trata igual que `null` (oculto).
+   */
+  costAdjustment?: CompositionCostAdjustment | null;
 };
 
 // ---------------------------------------------------------------------------
@@ -205,6 +342,7 @@ const EMPTY_METAL_VARIANT_INFO: MetalVariantInfo = {
   purity:      null,
   purityLabel: null,
   metalName:   null,
+  variantName: null,
 };
 
 /**
@@ -248,6 +386,9 @@ export async function fetchMetalVariantInfo(
     purity:      purityNum,
     purityLabel: label,
     metalName:   mv.metal?.name ?? null,
+    // Fase 2.4 — el SELECT ya trae `mv.name`. Lo exponemos directo
+    // (sin trim/transformación; cero matemática nueva).
+    variantName: mv.name ?? null,
   };
 }
 
@@ -314,6 +455,8 @@ export async function fetchMetalVariantInfoMap(
         purity:      purityNum,
         purityLabel: label,
         metalName:   mv.metal?.name ?? null,
+        // Fase 2.4 — paridad con `fetchMetalVariantInfo`.
+        variantName: mv.name ?? null,
       });
     }
     return map;
@@ -343,18 +486,23 @@ export async function fetchMetalVariantInfoMap(
 async function loadCatalogItemsByIds(
   jewelryId: string,
   ids: Set<string>,
-): Promise<Map<string, { code: string; name: string }>> {
-  const empty = new Map<string, { code: string; name: string }>();
+): Promise<Map<string, { code: string; name: string; sku: string }>> {
+  const empty = new Map<string, { code: string; name: string; sku: string }>();
   if (!jewelryId || ids.size === 0) return empty;
 
   try {
     const items = await prisma.article.findMany({
       where:  { jewelryId, id: { in: [...ids] }, deletedAt: null },
-      select: { id: true, code: true, name: true },
+      select: { id: true, code: true, name: true, sku: true },
     });
-    const map = new Map<string, { code: string; name: string }>();
+    const map = new Map<string, { code: string; name: string; sku: string }>();
     for (const a of items) {
-      map.set(a.id, { code: a.code ?? "", name: a.name ?? "" });
+      map.set(a.id, {
+        code: a.code ?? "",
+        name: a.name ?? "",
+        // Fase 2.4 — `Article.sku` (nullable en schema, queda "" como fallback).
+        sku:  a.sku  ?? "",
+      });
     }
     return map;
   } catch (err) {
@@ -384,9 +532,9 @@ async function loadCatalogItemsByIds(
 export async function buildCatalogItemsMapForSteps(
   jewelryId: string,
   steps: PricingStep[] | null | undefined,
-): Promise<Map<string, { code: string; name: string }>> {
+): Promise<Map<string, { code: string; name: string; sku: string }>> {
   if (!Array.isArray(steps) || steps.length === 0) {
-    return new Map<string, { code: string; name: string }>();
+    return new Map<string, { code: string; name: string; sku: string }>();
   }
   const ids = new Set<string>();
   for (const s of steps) {
@@ -423,9 +571,9 @@ export async function buildCatalogItemsMapForSteps(
 export async function buildCatalogItemsMapForCostLines(
   jewelryId: string,
   costLinesByArticle: Array<Array<{ catalogItemId?: string | null }>> | null | undefined,
-): Promise<Map<string, { code: string; name: string }>> {
+): Promise<Map<string, { code: string; name: string; sku: string }>> {
   if (!Array.isArray(costLinesByArticle) || costLinesByArticle.length === 0) {
-    return new Map<string, { code: string; name: string }>();
+    return new Map<string, { code: string; name: string; sku: string }>();
   }
   const ids = new Set<string>();
   for (const lines of costLinesByArticle) {
@@ -451,6 +599,7 @@ export async function buildCatalogItemsMapForCostLines(
 export function extractCompositionMetals(
   steps: PricingStep[] | null | undefined,
   metalVariantInfoMap?: Map<string, MetalVariantInfo>,
+  metalSaleFactor: number | null = null,
 ): CompositionMetalItem[] {
   if (!Array.isArray(steps) || steps.length === 0) return [];
   return steps
@@ -462,15 +611,32 @@ export function extractCompositionMetals(
       const qtyNum   = meta.qty   != null ? Number(meta.qty)   : null;
       const mermaNum = meta.merma != null ? Number(meta.merma) : null;
       const lineCost = s.value != null ? Number(s.value) : null;
+      // Fase 2.3 — precio base por gramo (pre-merma). El motor lo emite
+      // como `meta.quotePrice` (string fixed(6)). Frontend lo usa como
+      // columna "Val. unit." en METAL.
+      const quotePriceNum = meta.quotePrice != null ? Number(meta.quotePrice) : null;
+      const lineCostFinite = lineCost != null && Number.isFinite(lineCost) ? lineCost : null;
+      // F1.5 #A++ — sale-side per cost-line METAL. Passthrough exacto:
+      // lineSale = lineCost × (metalSale / metalCost). El motor ya emitió ambos
+      // agregados en el breakdown; este factor se computó una vez en
+      // computeMetalSaleFactor() y aplica linealmente.
+      const lineSale =
+        lineCostFinite != null && metalSaleFactor != null && Number.isFinite(metalSaleFactor)
+          ? lineCostFinite * metalSaleFactor
+          : null;
       return {
         costLineId:      typeof meta.costLineId === "string" ? meta.costLineId : null,
         metalVariantId:  variantId,
         metalName:       variantInfo?.metalName   ?? null,
+        // Fase 2.4 — variantName del MetalVariant (nombre comercial).
+        variantName:     variantInfo?.variantName ?? null,
         purity:          variantInfo?.purity      ?? null,
         purityLabel:     variantInfo?.purityLabel ?? null,
         appliedGrams:    qtyNum   != null && Number.isFinite(qtyNum)   ? qtyNum   : null,
         appliedMermaPct: mermaNum != null && Number.isFinite(mermaNum) ? mermaNum : null,
-        lineCost:        lineCost != null && Number.isFinite(lineCost) ? lineCost : null,
+        lineCost:        lineCostFinite,
+        lineSale,
+        quotePrice:      quotePriceNum != null && Number.isFinite(quotePriceNum) ? quotePriceNum : null,
       };
     });
 }
@@ -478,9 +644,14 @@ export function extractCompositionMetals(
 /**
  * F1.3 G4.x #9-A — extrae `composition.hechuras[]` desde steps
  * `COST_LINES_HECHURA` del motor cost. Mismo patrón que metals[].
+ *
+ * F1.5 #A+ — recibe `hechuraSaleFactor` (passthrough del motor) para emitir
+ * `lineSale` per fila. Cuando es null, todos los items quedan con `lineSale=null`.
+ * Ver `computeHechuraSaleFactor` para cómo se deriva.
  */
 export function extractCompositionHechuras(
   steps: PricingStep[] | null | undefined,
+  hechuraSaleFactor: number | null = null,
 ): CompositionHechuraItem[] {
   if (!Array.isArray(steps) || steps.length === 0) return [];
   return steps
@@ -494,11 +665,35 @@ export function extractCompositionHechuras(
       const lineLabel = typeof meta.lineLabel === "string" && meta.lineLabel.length > 0
         ? meta.lineLabel
         : (typeof s.label === "string" && s.label.length > 0 ? s.label : null);
+      // Fase 2.2 — propagar lineAdj* del step.meta. Para HECHURA típica
+      // (qty=1, sin ajuste) los 4 quedan null.
+      const adjKindRaw  = typeof meta.lineAdjKind === "string" && meta.lineAdjKind.length > 0
+        ? meta.lineAdjKind : null;
+      const adjKind: "BONUS" | "SURCHARGE" | null =
+        adjKindRaw === "BONUS" || adjKindRaw === "SURCHARGE" ? adjKindRaw : null;
+      const adjTypeRaw  = typeof meta.lineAdjType === "string" && meta.lineAdjType.length > 0
+        ? meta.lineAdjType : null;
+      const adjType: "PERCENTAGE" | "FIXED_AMOUNT" | null =
+        adjTypeRaw === "PERCENTAGE" || adjTypeRaw === "FIXED_AMOUNT" ? adjTypeRaw : null;
+      // Fase 2.3.1 — propagar `meta.unitValue` como BASE pre-ajuste. Mismo
+      // patrón que `extractCompositionItems` (PRODUCT/SERVICE).
+      const unitValueRaw = meta.unitValue != null ? Number(meta.unitValue) : null;
+      const lineCostFinite = lineCost != null && Number.isFinite(lineCost) ? lineCost : null;
+      const lineSale =
+        lineCostFinite != null && hechuraSaleFactor != null && Number.isFinite(hechuraSaleFactor)
+          ? lineCostFinite * hechuraSaleFactor
+          : null;
       return {
         costLineId:    typeof meta.costLineId === "string" ? meta.costLineId : null,
-        appliedAmount: lineCost != null && Number.isFinite(lineCost) ? lineCost : null,
-        lineCost:      lineCost != null && Number.isFinite(lineCost) ? lineCost : null,
+        appliedAmount: lineCostFinite,
+        unitValue:     unitValueRaw != null && Number.isFinite(unitValueRaw) ? unitValueRaw : null,
+        lineCost:      lineCostFinite,
+        lineSale,
         lineLabel,
+        lineAdjKind:   adjKind,
+        lineAdjType:   adjType,
+        lineAdjValue:  meta.lineAdjValue  != null ? Number(meta.lineAdjValue)  : null,
+        lineAdjAmount: meta.lineAdjAmount != null ? Number(meta.lineAdjAmount) : null,
       };
     });
 }
@@ -528,7 +723,8 @@ export function extractCompositionHechuras(
 export function extractCompositionItems(
   steps: PricingStep[] | null | undefined,
   targetKey: "COST_LINES_PRODUCT" | "COST_LINES_SERVICE",
-  catalogItems?: Map<string, { code: string; name: string }>,
+  catalogItems?: Map<string, { code: string; name: string; sku: string }>,
+  hechuraSaleFactor: number | null = null,
 ): CompositionItemBlock[] {
   if (!Array.isArray(steps) || steps.length === 0) return [];
 
@@ -565,11 +761,22 @@ export function extractCompositionItems(
       const totalValue = s.value != null ? Number(s.value) : 0;
       const qty       = meta.qty       != null ? Number(meta.qty)       : 0;
       const unitValue = meta.unitValue != null ? Number(meta.unitValue) : 0;
+      const totalValueFinite = Number.isFinite(totalValue) ? totalValue : null;
+      const lineSale =
+        totalValueFinite != null && hechuraSaleFactor != null && Number.isFinite(hechuraSaleFactor)
+          ? totalValueFinite * hechuraSaleFactor
+          : null;
 
       return {
         costLineId:       (meta.costLineId ?? null) as string | null,
         catalogItemId:    catalogId,
         catalogItemCode:  catalogInfo?.code ?? lineCodeFromMeta,
+        // Fase 2.4 — SKU del Article catálogo. null si el map no tiene el id
+        // o si el Article no tiene sku configurado (string vacío también →
+        // se trata como null en el frontend para el fallback).
+        catalogItemSku:   catalogInfo?.sku && catalogInfo.sku.length > 0
+                          ? catalogInfo.sku
+                          : null,
         catalogItemName:  catalogInfo?.name ?? lineLabelFromMeta ?? fallbackLabel,
         quantity:         Number.isFinite(qty)       ? qty       : 0,
         unitValue:        Number.isFinite(unitValue) ? unitValue : 0,
@@ -580,8 +787,137 @@ export function extractCompositionItems(
         lineAdjValue:     meta.lineAdjValue != null ? Number(meta.lineAdjValue) : null,
         lineAdjAmount:    meta.lineAdjAmount != null ? Number(meta.lineAdjAmount) : null,
         affectsStock:     typeof meta.affectsStock === "boolean" ? meta.affectsStock : null,
+        lineSale,
       };
     });
+}
+
+/**
+ * Fase 2.5 — extrae el ajuste global de costo del artículo desde el step
+ * `COST_LINES_FINAL` que el motor cost emite (ver `pricing-engine.cost.ts`).
+ *
+ * Reglas:
+ *   · Si el step no existe → retorna null (artículo sin cost lines, p.ej.).
+ *   · Si `kind` no es "BONUS"/"SURCHARGE" (string vacío de DB) → retorna null.
+ *   · `amount` = `meta.sumLines - step.value` (signed: positivo = reducción
+ *     bonificación; negativo = aumento recargo). Cero recálculo: usa los
+ *     dos números que el motor ya emitió.
+ *   · Cuando step.value o meta.sumLines no son números válidos, `amount`
+ *     queda null y la UI cae a "—" en el monto.
+ */
+export function extractCompositionCostAdjustment(
+  steps: PricingStep[] | null | undefined,
+): CompositionCostAdjustment | null {
+  if (!Array.isArray(steps) || steps.length === 0) return null;
+  const step = steps.find(s => s && s.key === "COST_LINES_FINAL");
+  if (!step) return null;
+
+  const meta = (step.meta ?? {}) as Record<string, unknown>;
+  const kindRaw = typeof meta.adjustmentKind === "string" && meta.adjustmentKind.length > 0
+    ? meta.adjustmentKind : null;
+  const kind: "BONUS" | "SURCHARGE" | null =
+    kindRaw === "BONUS" || kindRaw === "SURCHARGE" ? kindRaw : null;
+  if (!kind) return null;     // sin ajuste → no exponemos el bloque.
+
+  const typeRaw = typeof meta.adjustmentType === "string" && meta.adjustmentType.length > 0
+    ? meta.adjustmentType : null;
+  const type: "PERCENTAGE" | "FIXED_AMOUNT" | null =
+    typeRaw === "PERCENTAGE" || typeRaw === "FIXED_AMOUNT" ? typeRaw : null;
+
+  const value = meta.adjustmentValue != null ? Number(meta.adjustmentValue) : null;
+  const adjusted = step.value != null ? Number(step.value) : null;
+  const sumLines = meta.sumLines != null ? Number(meta.sumLines) : null;
+  // amount = sumLines - adjusted. BONUS reduce → adjusted < sumLines → +.
+  // SURCHARGE aumenta → adjusted > sumLines → −.
+  // Convención del frontend: positivo = reducción (BONUS), negativo = aumento.
+  const amount =
+    sumLines != null && Number.isFinite(sumLines) &&
+    adjusted != null && Number.isFinite(adjusted)
+      ? sumLines - adjusted
+      : null;
+
+  return {
+    kind,
+    type,
+    value: value != null && Number.isFinite(value) ? value : null,
+    amount,
+  };
+}
+
+/**
+ * F1.5 #A+ — calcula el factor que convierte `lineCost` (pre ajuste global)
+ * en `lineSale` (precio venta per fila). Passthrough exacto del cálculo
+ * interno del motor:
+ *
+ *   `lineSale = lineCost × adjFactor × (1 + hechuraMarginPct/100)`
+ *
+ * Donde:
+ *   · `adjFactor` = `COST_LINES_FINAL.value / COST_LINES_FINAL.meta.sumLines`
+ *     (efecto del ajuste global de costo BONUS/SURCHARGE sobre cada línea).
+ *   · `hechuraMarginPct` viene de `result.metalHechuraBreakdown` — margen
+ *     que el motor aplica al bucket HECHURA+PRODUCT+SERVICE.
+ *
+ * Retorna `null` cuando alguno de los inputs falta o no es derivable
+ * (snapshot legacy, lista MARGIN_TOTAL sin desglose, etc.). Los items
+ * entonces emiten `lineSale=null` y la UI cae a "—" (POLICY R4.5: cero
+ * matemática derivada en frontend).
+ *
+ * Paridad verificable:
+ *   Σ lineSale(productos+servicios+hechuras) === hechuraSale del breakdown
+ *   (tolerancia ≤ 0.01 por redondeo Decimal interno).
+ */
+/**
+ * F1.5 #A++ — calcula el factor que convierte `lineCost` de METAL en
+ * `lineSale` per fila. Passthrough exacto del breakdown agregado:
+ *
+ *   `lineSale = lineCost × (metalSale / metalCost)`
+ *
+ * El motor ya aplicó margen + ajuste global al bucket METAL completo (todas
+ * las cost-lines comparten metalMarginPct); este factor distribuye el
+ * sale-side per línea sin matemática nueva. La paridad
+ * `Σ metals[i].lineSale === metalSale` se garantiza por construcción
+ * (factor uniforme).
+ *
+ * Retorna `null` cuando:
+ *   · no hay `metalHechuraBreakdown` (lista MARGIN_TOTAL sin desglose).
+ *   · `metalCost` es 0 o no finito (división indefinida).
+ *   · `metalSale` es null o no finito.
+ *
+ * En esos casos los `metals[i].lineSale` quedan null y la UI muestra "—"
+ * (mismo patrón que F1.5 #A+ para HECHURA/PRODUCT/SERVICE).
+ */
+export function computeMetalSaleFactor(
+  result: SalePriceResult | null | undefined,
+): number | null {
+  const br = result?.metalHechuraBreakdown;
+  if (!br) return null;
+  const metalCost = br.metalCost;
+  const metalSale = br.metalSale;
+  if (metalCost == null || !Number.isFinite(metalCost) || metalCost === 0) return null;
+  if (metalSale == null || !Number.isFinite(metalSale)) return null;
+  return metalSale / metalCost;
+}
+
+export function computeHechuraSaleFactor(
+  result: SalePriceResult | null | undefined,
+): number | null {
+  const hechuraMarginPct = result?.metalHechuraBreakdown?.hechuraMarginPct;
+  if (hechuraMarginPct == null || !Number.isFinite(hechuraMarginPct)) return null;
+
+  // adjFactor desde el step COST_LINES_FINAL. Cuando no hay ajuste global,
+  // adjusted === sumLines → adjFactor = 1.
+  const finalStep = (result?.steps ?? []).find(s => s && s.key === "COST_LINES_FINAL");
+  let adjFactor = 1;
+  if (finalStep) {
+    const meta = (finalStep.meta ?? {}) as Record<string, unknown>;
+    const adjusted = finalStep.value != null ? Number(finalStep.value) : null;
+    const sumLines = meta.sumLines != null ? Number(meta.sumLines) : null;
+    if (adjusted != null && sumLines != null && Number.isFinite(adjusted)
+        && Number.isFinite(sumLines) && sumLines !== 0) {
+      adjFactor = adjusted / sumLines;
+    }
+  }
+  return adjFactor * (1 + hechuraMarginPct / 100);
 }
 
 /**
@@ -601,17 +937,27 @@ export function extractCompositionItems(
 export function buildComposition(
   result: SalePriceResult,
   mvi: MetalVariantInfo,
-  catalogItems?: Map<string, { code: string; name: string }>,
+  catalogItems?: Map<string, { code: string; name: string; sku: string }>,
   metalVariantInfoMap?: Map<string, MetalVariantInfo>,
 ): Composition {
   const ctx = result.costOverrideContext;
 
   // F1.3 G4.x #9-A — extracción primaria: arrays con TODAS las cost lines.
   // Cero recálculo monetario; passthrough estructural de step.value/meta.
-  const metals   = extractCompositionMetals(result.steps, metalVariantInfoMap);
-  const hechuras = extractCompositionHechuras(result.steps);
-  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems);
-  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems);
+  // F1.5 #A+ — hechuraSaleFactor permite exponer `lineSale` per HECHURA/
+  // PRODUCT/SERVICE (passthrough del margen y ajuste global que el motor
+  // ya calcula internamente).
+  // F1.5 #A++ — metalSaleFactor permite exponer `lineSale` per METAL
+  // (passthrough del margen METAL del breakdown). Reemplaza el prorrateo
+  // manual que hoy hace el Simulador (POLICY R4.1).
+  const hechuraSaleFactor = computeHechuraSaleFactor(result);
+  const metalSaleFactor   = computeMetalSaleFactor(result);
+  const metals   = extractCompositionMetals(result.steps, metalVariantInfoMap, metalSaleFactor);
+  const hechuras = extractCompositionHechuras(result.steps, hechuraSaleFactor);
+  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems, hechuraSaleFactor);
+  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems, hechuraSaleFactor);
+  // Fase 2.5 — ajuste global de costo extraído del step COST_LINES_FINAL.
+  const costAdjustment = extractCompositionCostAdjustment(result.steps);
 
   // F1.3 G4.x #9-A — alias LEGACY `metal` y `hechura`. Garantiza el
   // invariante: `composition.metal === composition.metals[0] ?? null`
@@ -668,7 +1014,7 @@ export function buildComposition(
     manual:    t.taxId === "OVERRIDE_MANUAL",
   }));
 
-  return { metal, hechura, metals, hechuras, products, services, taxes };
+  return { metal, hechura, metals, hechuras, products, services, taxes, costAdjustment };
 }
 
 /**

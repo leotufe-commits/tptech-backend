@@ -34,6 +34,8 @@ import {
   type ComponentSaleDetail,
   // Sprint 3 — capa 10 del orden inmutable: resolución oficial del envío.
   resolveShippingAmount,
+  // F1.4 G5 #11-A — override per costLineId (Fase 1 plumbing HTTP).
+  type CostLineOverride,
 } from "../../lib/pricing-engine/pricing-engine.js";
 // Helper compartido entre articles y sales para armar el bloque
 // `composition` (metal/hechura/taxes). Vive fuera del motor.
@@ -189,6 +191,26 @@ export type CreateSaleLineInput = {
   appliedPromotionId?: string | null;
   /** @deprecated legacy — el motor lo emite, no lo lee. */
   appliedDiscountId?: string | null;
+
+  // ── Fase 1.5 — overrides de composición que viajan a DRAFT ───────────────
+  // Aplican sobre la composición de costo de esta línea (no tocan el
+  // artículo maestro). El motor los recibe en `resolveDraftSaleLinesPricing`
+  // y los serializa en `pricingSnapshot.costLineOverridesApplied`. Eso
+  // garantiza que `confirmSale` pueda recomputar costo / margen con los
+  // mismos overrides → preview ↔ draft ↔ confirm ↔ recompute paritarios.
+  /** Legacy — pisa los gramos del primer METAL. */
+  gramsOverride?:          number | null;
+  /** Legacy — pisa el % de merma del primer METAL. */
+  mermaPercentOverride?:   number | null;
+  /** Legacy — cambia la variante del primer METAL (recotiza). */
+  metalVariantIdOverride?: string | null;
+  /** Legacy — pisa el monto unitario del primer HECHURA. */
+  hechuraOverrideAmount?:  number | null;
+  /**
+   * F1.4 G5 #11-A — overrides per costLineId. Pisa los legacy cuando hay
+   * match por id. El motor unifica vía `unifyCostLineOverrides`.
+   */
+  costLineOverrides?: CostLineOverride[];
 };
 
 export type CreateSaleInput = {
@@ -461,6 +483,13 @@ export async function createSale(
       quantity:  line.quantity,
       legacyClientUnitPrice:   line.unitPrice,
       legacyClientDiscountPct: line.discountPct,
+      // Fase 1.5 — los overrides viajan al snapshot persistido para que
+      // confirm/recompute mantengan paridad con preview.
+      gramsOverride:          line.gramsOverride          ?? null,
+      mermaPercentOverride:   line.mermaPercentOverride   ?? null,
+      metalVariantIdOverride: line.metalVariantIdOverride ?? null,
+      hechuraOverrideAmount:  line.hechuraOverrideAmount  ?? null,
+      costLineOverrides:      line.costLineOverrides,
     })),
     { clientId: body.clientId ?? null },
   );
@@ -584,6 +613,12 @@ export async function updateSale(
         quantity:  line.quantity,
         legacyClientUnitPrice:   line.unitPrice,
         legacyClientDiscountPct: line.discountPct,
+        // Fase 1.5 — paridad con createSale: los overrides viajan a draft.
+        gramsOverride:          line.gramsOverride          ?? null,
+        mermaPercentOverride:   line.mermaPercentOverride   ?? null,
+        metalVariantIdOverride: line.metalVariantIdOverride ?? null,
+        hechuraOverrideAmount:  line.hechuraOverrideAmount  ?? null,
+        costLineOverrides:      line.costLineOverrides,
       })),
       { clientId: effectiveClientId },
     );
@@ -720,6 +755,12 @@ export async function confirmSale(
       category: { select: { mermaPercent: true } },
       costComposition: {
         select: {
+          // Fase 1.5 — `id` requerido para que `calculateCostFromLines` pueda
+          // re-aplicar los `costLineOverrides` del snapshot frozen al confirmar
+          // (paridad preview ↔ confirm). Sin esto, el motor recibe líneas sin
+          // costLineId y el match `unifyCostLineOverrides` falla → overrides
+          // ignorados al recomputar costo → margen inconsistente.
+          id: true,
           type: true, label: true, quantity: true, unitValue: true, currencyId: true,
           mermaPercent: true, metalVariantId: true, lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
           catalogItemId: true, catalogVariantId: true, affectsStock: true,
@@ -803,6 +844,20 @@ export async function confirmSale(
       // El precio queda frozen pero el costo refleja el momento de confirmación
       // (cotizaciones de metal pueden haber cambiado). Margen = unitPrice
       // (frozen) − unitCost (fresh).
+      //
+      // Fase 1.5 — paridad de overrides en confirm:
+      // El snapshot frozen del DRAFT trae `costLineOverridesApplied` (post
+      // unify legacy + explicit). Lo reaplicamos al costo fresco para que:
+      //   · `unitCost` refleje los mismos overrides que `unitPrice` frozen,
+      //   · `unitMargin = unitPrice − unitCost` sea coherente,
+      //   · una eventual recompute (sale legada / re-confirm) dé idénticos
+      //     totales.
+      // Sin esto, el margen se desplazaría al confirmar — sin que el
+      // operador haya cambiado nada.
+      const frozenCostLineOverrides =
+        Array.isArray((snap as any).costLineOverridesApplied)
+          ? ((snap as any).costLineOverridesApplied as CostLineOverride[])
+          : undefined;
       const costResult = await calculateCostFromLines(
         jewelryId,
         (artCost as any).costComposition as CostLineInput[],
@@ -812,6 +867,7 @@ export async function confirmSale(
           value: (artCost as any).manualAdjustmentValue,
         },
         batchCostCtx,
+        frozenCostLineOverrides,
       );
 
       const clientTaxExempt          = (sale.client as any)?.taxExempt ?? false;
@@ -875,6 +931,19 @@ export async function confirmSale(
         appliedPromotionId:   snap.appliedPromotionId   ?? (line as any).appliedPromotionId ?? null,
         appliedPromotionName: snap.appliedPromotionName ?? promotionNameMap.get(snap.appliedPromotionId ?? (line as any).appliedPromotionId ?? "") ?? null,
         appliedDiscountId:    snap.appliedDiscountId    ?? (line as any).appliedDiscountId  ?? null,
+        // Fase 1.5 — preservar overrides aplicados en el snapshot CONFIRMED.
+        // Tomamos el array que el motor cost devolvió ahora (`costResult`)
+        // — si hubo overrides en DRAFT, vuelven a aparecer porque los
+        // pasamos arriba a `calculateCostFromLines`. Fallback al snapshot
+        // frozen del draft cuando el costResult no expone el campo (modo
+        // legacy / sin overrides). Esto cierra paridad preview ↔ confirm.
+        ...((costResult as any).costLineOverridesApplied
+          && Array.isArray((costResult as any).costLineOverridesApplied)
+          && (costResult as any).costLineOverridesApplied.length > 0
+            ? { costLineOverridesApplied: (costResult as any).costLineOverridesApplied }
+            : (frozenCostLineOverrides && frozenCostLineOverrides.length > 0
+                ? { costLineOverridesApplied: frozenCostLineOverrides }
+                : {})),
         resolvedAt,
       };
 
@@ -1682,6 +1751,16 @@ export type DraftSaleLineInput = {
   legacyClientUnitPrice?: number;
   /** Solo para compatibilidad: ignorado como fuente principal. */
   legacyClientDiscountPct?: number;
+
+  // ── Fase 1.5 — overrides de composición que viajan a DRAFT ───────────────
+  // Mismas reglas que `SalePreviewLineInput` y `CreateSaleLineInput`. El
+  // motor los aplica al resolver el snapshot persistido para que confirm /
+  // recompute mantengan paridad con preview.
+  gramsOverride?:          number | null;
+  mermaPercentOverride?:   number | null;
+  metalVariantIdOverride?: string | null;
+  hechuraOverrideAmount?:  number | null;
+  costLineOverrides?:      CostLineOverride[];
 };
 
 export type DraftSaleLineOpts = {
@@ -1791,6 +1870,16 @@ export async function resolveDraftSaleLinesPricing(
         categoryTotal: m?.categoryId ? categoryTotals.get(m.categoryId) : undefined,
         brandTotal:    m?.brand      ? brandTotals.get(m.brand)         : undefined,
         groupTotal:    lineGid       ? groupTotals.get(lineGid)          : undefined,
+        // Fase 1.5 — overrides per-line viajan al motor en DRAFT. El
+        // snapshot resultante (`buildPricingSnapshot`) preserva
+        // `costLineOverridesApplied`, así confirm/recompute pueden
+        // reaplicar los mismos overrides sobre el costo fresco y mantener
+        // paridad con preview.
+        gramsOverride:          line.gramsOverride          ?? null,
+        mermaPercentOverride:   line.mermaPercentOverride   ?? null,
+        metalVariantIdOverride: line.metalVariantIdOverride ?? null,
+        hechuraOverrideAmount:  line.hechuraOverrideAmount  ?? null,
+        costLineOverrides:      line.costLineOverrides,
         suppressListDeferredRounding,
       });
 
@@ -2069,6 +2158,21 @@ export type SalePreviewLineInput = {
   metalVariantIdOverride?: string | null;
   /** Pisa el monto unitario de la línea HECHURA. */
   hechuraOverrideAmount?: number | null;
+  /**
+   * F1.4 G5 #11-A — overrides per costLineId.
+   *
+   * Array indexado por `costLineId`. Pisa los overrides legacy cuando
+   * hay match (ver `unifyCostLineOverrides`). Permite editar quantity,
+   * unitValue, mermaPercent y adjustment de cost lines individuales sin
+   * tocar la ficha del artículo.
+   *
+   * Validaciones (delegadas al motor — `validateCostLineOverride`):
+   *   · `costLineId` desconocido → ignorado + debugWarning.
+   *   · type mismatch / campos no aplicables → idem.
+   *
+   * Pase 100% transparente: el controller no valida — el motor sí.
+   */
+  costLineOverrides?: CostLineOverride[];
 };
 
 export type SalePreviewInput = {
@@ -2546,6 +2650,11 @@ export async function previewSale(
         mermaPercentOverride:   line.mermaPercentOverride   ?? null,
         metalVariantIdOverride: line.metalVariantIdOverride ?? null,
         hechuraOverrideAmount:  line.hechuraOverrideAmount  ?? null,
+        // F1.4 G5 #11-A — overrides per costLineId (Fase 1 plumbing). El
+        // motor unifica con los legacy de arriba: explicit gana cuando hay
+        // match por costLineId. Validaciones (id desconocido / type
+        // mismatch / campo inválido) las hace el motor → debugWarnings.
+        costLineOverrides:      line.costLineOverrides,
         // Anti doble redondeo: si el tenant tiene redondeo doc activo, el
         // motor IGNORA el redondeo diferido (NET/TOTAL) de la lista.
         suppressListDeferredRounding: docRoundingPolicy.suppressListDeferredRounding,

@@ -183,7 +183,7 @@ describe("extractCompositionItems — catalog map opcional", () => {
 
   it("baseline correct: con catalog map, prefiere catalog code/name sobre meta", () => {
     const catalog = new Map([
-      ["art-1", { code: "CATALOG-CODE", name: "Catalog Name Resolved" }],
+      ["art-1", { code: "CATALOG-CODE", name: "Catalog Name Resolved", sku: "CAT-SKU" }],
     ]);
     const steps = [makeStep({
       value: new D(100),
@@ -203,7 +203,7 @@ describe("extractCompositionItems — catalog map opcional", () => {
 
   it("baseline correct: catalog map sin entrada para el id, cae a meta", () => {
     const catalog = new Map([
-      ["other-id", { code: "X", name: "Y" }],
+      ["other-id", { code: "X", name: "Y", sku: "" }],
     ]);
     const steps = [makeStep({
       value: new D(100),

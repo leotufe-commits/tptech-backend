@@ -1091,6 +1091,12 @@ export interface SnapshotCompositionItemBlock {
   costLineId:       string | null;
   catalogItemId:    string | null;
   catalogItemCode:  string | null;
+  /**
+   * Fase 2.4 — SKU del Article referenciado (`Article.sku`). Aditivo y
+   * opcional: snapshots viejos sin este campo lo leen como undefined →
+   * frontend cae al `catalogItemCode` legacy.
+   */
+  catalogItemSku?:  string | null;
   catalogItemName:  string | null;
   quantity:         number;
   unitValue:        number;
@@ -1101,6 +1107,15 @@ export interface SnapshotCompositionItemBlock {
   lineAdjValue:     number | null;
   lineAdjAmount:    number | null;
   affectsStock:     boolean | null;
+  /**
+   * F1.5 #A+ — sale-side per fila (snapshot v7+). Aditivo y opcional:
+   * snapshots viejos sin este campo lo leen como undefined → frontend cae
+   * a "—" en las columnas comerciales (Precio Unit. Venta / Margen /
+   * Venta línea). Cuando está poblado, garantiza:
+   *   Σ products.lineSale + Σ services.lineSale + Σ hechuras.lineSale
+   *     === hechuraSale del metalHechuraBreakdown.
+   */
+  lineSale?:        number | null;
 }
 
 /**
@@ -1116,6 +1131,21 @@ export interface SnapshotCompositionMetalItem {
   appliedGrams:      number | null;
   appliedMermaPct:   number | null;
   lineCost:          number | null;
+  // Fase 2.3 — espejo de `CompositionMetalItem.quotePrice`. Aditivo y
+  // opcional: snapshots viejos sin este campo lo leen como undefined →
+  // frontend cae a "—" para "Val. unit." de METAL.
+  quotePrice?:       number | null;
+  // Fase 2.4 — nombre comercial de la variante (= MetalVariant.name).
+  // Aditivo y opcional. Snapshots viejos sin este campo caen al fallback
+  // `metalName + purityLabel` en frontend.
+  variantName?:      string | null;
+  /**
+   * F1.5 #A++ — sale-side per cost-line de METAL (snapshot v7+). Aditivo y
+   * opcional: snapshots viejos sin este campo lo leen como undefined →
+   * frontend cae al `metalSaleCanonical` (count===1) o "—" (count>1).
+   * Garantiza Σ metals[i].lineSale === metalHechuraBreakdown.metalSale.
+   */
+  lineSale?:         number | null;
 }
 
 /**
@@ -1127,6 +1157,22 @@ export interface SnapshotCompositionHechuraItem {
   appliedAmount:     number | null;
   lineCost:          number | null;
   lineLabel:         string | null;
+  // Fase 2.2 — espejo del extendido `CompositionHechuraItem`. Aditivo,
+  // opcional. Snapshots v5 viejos sin estos campos los leen como undefined
+  // (retrocompat byte-a-byte; el reader frontend ya tolera null).
+  lineAdjKind?:      "BONUS" | "SURCHARGE" | null;
+  lineAdjType?:      "PERCENTAGE" | "FIXED_AMOUNT" | null;
+  lineAdjValue?:     number | null;
+  lineAdjAmount?:    number | null;
+  // Fase 2.3.1 — base unit value pre-ajuste. Aditivo y opcional: snapshots
+  // viejos sin este campo lo leen como undefined → frontend cae al
+  // `appliedAmount` legacy (post-ajuste) que ya estaba allí.
+  unitValue?:        number | null;
+  /**
+   * F1.5 #A+ — sale-side per fila HECHURA (snapshot v7+). Ver
+   * `SnapshotCompositionItemBlock.lineSale` para definición completa.
+   */
+  lineSale?:         number | null;
 }
 
 export interface SnapshotCompositionTaxItem {
@@ -1155,6 +1201,15 @@ export interface SnapshotComposition {
   products: SnapshotCompositionItemBlock[];
   services: SnapshotCompositionItemBlock[];
   taxes:    SnapshotCompositionTaxItem[];
+  // Fase 2.5 — espejo de `Composition.costAdjustment`. Aditivo y opcional:
+  // snapshots v5/v6 viejos sin este campo lo leen como undefined → frontend
+  // lo trata igual que `null` (oculto).
+  costAdjustment?: {
+    kind:   "BONUS" | "SURCHARGE" | null;
+    type:   "PERCENTAGE" | "FIXED_AMOUNT" | null;
+    value:  number | null;
+    amount: number | null;
+  } | null;
 }
 
 /** Versión actual del shape de PricingLineSnapshot. Bump al agregar campos

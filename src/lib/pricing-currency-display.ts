@@ -255,6 +255,11 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
   if (Array.isArray(comp.metals)) {
     for (const m of comp.metals) {
       convertFieldNumber(m, "lineCost", rate);
+      // Fase 2.3 — `quotePrice` (precio por gramo BASE pre-merma) es
+      // monetario y necesita conversión. Sin esto, VAL. UNIT. METAL
+      // queda en moneda base mientras el resto del response viene en la
+      // moneda elegida → mezcla visual.
+      convertFieldNumber(m, "quotePrice", rate);
       // NO: appliedGrams, appliedMermaPct, purity, ids ni labels.
     }
   }
@@ -262,6 +267,16 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
     for (const h of comp.hechuras) {
       convertFieldNumber(h, "appliedAmount", rate);
       convertFieldNumber(h, "lineCost",      rate);
+      // Fase 2.3.1 — `unitValue` BASE pre-ajuste es monetario.
+      convertFieldNumber(h, "unitValue",     rate);
+      // Fase 2.2 — monto absoluto del ajuste de HECHURA. Mismo tratamiento
+      // que products/services: convertir siempre `lineAdjAmount`, y
+      // `lineAdjValue` SOLO cuando el ajuste es FIXED_AMOUNT (PERCENTAGE
+      // queda intacto).
+      convertFieldNumber(h, "lineAdjAmount", rate);
+      if (h?.lineAdjType === "FIXED_AMOUNT") {
+        convertFieldNumber(h, "lineAdjValue", rate);
+      }
     }
   }
   // F1.3 G4.1.3 — products/services arrays. Convertir SOLO los campos
@@ -282,6 +297,14 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
       if (it?.lineAdjType === "FIXED_AMOUNT") {
         convertFieldNumber(it, "lineAdjValue", rate);
       }
+    }
+  }
+  // Fase 2.5 — `costAdjustment` global del artículo. `amount` es siempre
+  // monto absoluto (signed); `value` solo se convierte si es FIXED_AMOUNT.
+  if (comp.costAdjustment) {
+    convertFieldNumber(comp.costAdjustment, "amount", rate);
+    if (comp.costAdjustment.type === "FIXED_AMOUNT") {
+      convertFieldNumber(comp.costAdjustment, "value", rate);
     }
   }
   if (Array.isArray(comp.taxes)) {

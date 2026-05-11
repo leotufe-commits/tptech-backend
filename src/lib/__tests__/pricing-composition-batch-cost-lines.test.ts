@@ -159,6 +159,75 @@ describe("convertCompositionInPlace — multi-currency en products/services", ()
     expect(comp.products[0].lineAdjValue).toBe(10);    // % NO se convierte
   });
 
+  it("Fase 2.4 — convierte metals[].quotePrice (Fase 2.3)", () => {
+    const comp: any = {
+      metals: [
+        {
+          metalVariantId: "mv-1",
+          appliedGrams:   2,           // gramos NO se convierten
+          appliedMermaPct: 1.5,        // % NO se convierte
+          purity:         0.75,        // ratio NO se convierte
+          lineCost:       400,         // ya cubierto por legacy
+          quotePrice:     200,         // Fase 2.3 — debe convertirse
+        },
+      ],
+    };
+    convertCompositionInPlace(comp, 2);
+    // Monetarios convertidos.
+    expect(comp.metals[0].lineCost).toBe(200);
+    expect(comp.metals[0].quotePrice).toBe(100);
+    // No-monetarios preservados.
+    expect(comp.metals[0].appliedGrams).toBe(2);
+    expect(comp.metals[0].appliedMermaPct).toBe(1.5);
+    expect(comp.metals[0].purity).toBe(0.75);
+  });
+
+  it("Fase 2.4 — convierte hechuras[].unitValue / lineAdjAmount / lineAdjValue (FIXED_AMOUNT)", () => {
+    const comp: any = {
+      hechuras: [
+        // BONUS PERCENTAGE — lineAdjValue NO se convierte (es %).
+        {
+          appliedAmount: 900, lineCost: 900,
+          unitValue: 1000,                   // Fase 2.3.1 — debe convertirse
+          lineAdjAmount: 100,                // Fase 2.2 — debe convertirse
+          lineAdjType:  "PERCENTAGE",
+          lineAdjValue: 10,                  // % — NO se convierte
+        },
+        // SURCHARGE FIXED_AMOUNT — lineAdjValue SÍ se convierte (es monto).
+        {
+          appliedAmount: 220, lineCost: 220,
+          unitValue: 200,
+          lineAdjAmount: 20,
+          lineAdjType:  "FIXED_AMOUNT",
+          lineAdjValue: 20,
+        },
+      ],
+    };
+    convertCompositionInPlace(comp, 2);
+    // Item 1 — BONUS %.
+    expect(comp.hechuras[0].appliedAmount).toBe(450);
+    expect(comp.hechuras[0].lineCost).toBe(450);
+    expect(comp.hechuras[0].unitValue).toBe(500);
+    expect(comp.hechuras[0].lineAdjAmount).toBe(50);
+    expect(comp.hechuras[0].lineAdjValue).toBe(10);   // % NO se convierte
+    // Item 2 — SURCHARGE FIXED_AMOUNT.
+    expect(comp.hechuras[1].unitValue).toBe(100);
+    expect(comp.hechuras[1].lineAdjAmount).toBe(10);
+    expect(comp.hechuras[1].lineAdjValue).toBe(10);   // monto fijo SÍ
+  });
+
+  it("Fase 2.4 — rate=1 no convierte ningún campo nuevo (sin double-conversion)", () => {
+    const comp: any = {
+      metals:   [{ lineCost: 400, quotePrice: 200, appliedGrams: 2 }],
+      hechuras: [{ unitValue: 1000, lineAdjAmount: 100, lineAdjType: "FIXED_AMOUNT", lineAdjValue: 100 }],
+    };
+    convertCompositionInPlace(comp, 1);
+    expect(comp.metals[0].quotePrice).toBe(200);
+    expect(comp.hechuras[0].unitValue).toBe(1000);
+    expect(comp.hechuras[0].lineAdjAmount).toBe(100);
+    expect(comp.hechuras[0].lineAdjValue).toBe(100);
+  });
+
   it("baseline correct: rounding drift bajo conversión repetida → no divergencia", () => {
     // Si el converter se llamara dos veces por error, los valores serían
     // dividos doblemente. Test garantiza que UNA sola pasada.

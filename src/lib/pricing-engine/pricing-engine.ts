@@ -129,4 +129,9 @@ export type {
   ComponentAdjustmentKind,
   MetalHechuraBreakdownSource,
   PriceSource,
+  // F1.4 G5 #11-A — overrides per costLineId expuestos para que los
+  // call-sites (sales.service, articles.controller) los tipen sin
+  // importar el archivo interno (CLAUDE.md — siempre vía barrel).
+  CostLineOverride,
+  DebugWarning,
 } from "./pricing-engine.types.js";

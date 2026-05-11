@@ -49,10 +49,12 @@ es:
 
 👉 `src/lib/pricing-engine/`
 
-El motor está partido por dominio (`pricing-engine.cost.ts`, `.sale.ts`, `.pricelist.ts`, `.channel.ts`, `.coupon.ts`, `.payment.ts`, `.currency.ts`, `.balance.ts`, `.document.ts`). **Importar siempre desde el barrel `pricing-engine.ts`**, nunca un archivo interno.
+El motor está partido por dominio (`pricing-engine.cost.ts`, `.cost-line-overrides.ts`, `.sale.ts`, `.pricelist.ts`, `.channel.ts`, `.coupon.ts`, `.payment.ts`, `.shipping.ts`, `.currency.ts`, `.balance.ts`, `.document.ts`). **Importar siempre desde el barrel `pricing-engine.ts`**, nunca un archivo interno.
 
 Notas sobre los archivos menos obvios:
 
+* `.types.ts` → tipos compartidos del motor (no contiene lógica).
+* `.cost-line-overrides.ts` → resolución de overrides sobre líneas de costo (usado por snapshot v6).
 * `.balance.ts` → arma el desglose metal/hechura (`buildBalanceBreakdownFromPrice`) usado en snapshots de balance.
 * `.document.ts` → arma el snapshot completo de documentos (`buildDocumentPricingSnapshot`); es lo que consumen las hooks de confirmación.
 
@@ -150,7 +152,7 @@ Al confirmar un documento:
 
 ### Hooks de confirmación
 
-Los efectos colaterales al confirmar un documento (emitir comprobante, mover cuenta corriente, etc.) viven en `src/lib/document-hooks/`. Hoy existe `sale.hook.ts` (`onSaleConfirmed`) que emite Receipt + ReceiptLine + CurrentAccountMovement junto con el snapshot.
+Los efectos colaterales al confirmar un documento (emitir comprobante, mover cuenta corriente, etc.) viven en `src/lib/document-hooks/`. **Hoy solo existe `sale.hook.ts`** (`onSaleConfirmed`) que emite Receipt + ReceiptLine + CurrentAccountMovement junto con el snapshot. Los flujos de **purchase** y **cross-settlement** todavía no tienen hook propio — si necesitás efectos colaterales para esos, hay que crear el archivo equivalente (no asumir que existe).
 
 Reglas:
 
@@ -284,8 +286,8 @@ npm run prisma:migrate:dev   # crea + aplica migración local
 npm run prisma:migrate:deploy
 
 # Tests (Vitest)
-npm test                     # corre toda la suite una vez
-npm run test:watch
+npm test                     # corre vitest run (toda la suite una sola vez, NO modo watch)
+npm run test:watch           # vitest en modo watch interactivo
 npm run test:coverage
 npx vitest run <archivo>     # un único archivo (ej: src/lib/pricing-engine/__tests__/sale.test.ts)
 npx vitest run <archivo> -t "<nombre>"   # un único test por nombre dentro del archivo
@@ -323,6 +325,8 @@ Cobertura por archivo (en `src/lib/pricing-engine/__tests__/`):
 * `src/modules/sales/__tests__/preview-confirm-parity.test.ts` — paridad entre preview de venta y confirmación final (vive en el módulo `sales`, no en `pricing-engine`)
 
 ⚠️ Tras editar `prisma/schema.prisma`: correr `prisma:generate` y reiniciar `npm run dev` a mano (tsx watch no recarga `node_modules/@prisma/client`).
+
+⚠️ **Migración pendiente sin trackear**: existe `prisma/migrations/20260506230228/` no commiteada. Antes de crear una migración nueva o avanzar trabajo de schema, verificar qué contiene esa carpeta (commitearla, descartarla o aplicarla según corresponda) — si no, podés terminar con dos migraciones en conflicto.
 
 ---
 
@@ -410,7 +414,7 @@ Todo módulo nuevo debe:
 
 # 🗺️ Mapa de dominios
 
-`src/modules/` agrupa ~40 módulos. Para orientarse rápido:
+`src/modules/` agrupa ~36 módulos. Para orientarse rápido:
 
 | Dominio | Módulos |
 |---|---|
