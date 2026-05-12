@@ -64,7 +64,7 @@ Ver `src/lib/pricing-engine/README.md` para el contrato completo (orden de capas
 
 Solo estos módulos están autorizados a importar `pricing-engine`:
 
-`articles`, `sales`, `purchases`, `cross-settlements`, `dashboard`, `article-groups`, y futuros módulos de comprobantes/pagos/cuenta corriente (lectura de snapshots).
+`articles`, `sales`, `purchases`, `cross-settlements`, `dashboard`, `article-groups`, `receipts`, y futuros módulos de pagos/cuenta corriente (lectura de snapshots).
 
 Cualquier otro módulo que necesite un cálculo comercial debe pedirlo a uno de estos, **no** importar el motor por su cuenta.
 
@@ -291,6 +291,7 @@ npm run test:watch           # vitest en modo watch interactivo
 npm run test:coverage
 npx vitest run <archivo>     # un único archivo (ej: src/lib/pricing-engine/__tests__/sale.test.ts)
 npx vitest run <archivo> -t "<nombre>"   # un único test por nombre dentro del archivo
+npx vitest run -t "<patron>"             # busca tests por nombre en toda la suite (útil si no recordás el archivo)
 npx vitest run <archivo> --coverage      # coverage de un único archivo
 
 # TypeScript
@@ -311,7 +312,9 @@ Los tests viven co-locados en carpetas `__tests__/`:
 
 ## Tests del pricing-engine
 
-Cobertura por archivo (en `src/lib/pricing-engine/__tests__/`):
+El motor tiene **más de 30 tests** en `src/lib/pricing-engine/__tests__/`. Para ver el listado actualizado, leer ese directorio directamente — no se enumera acá para evitar que la doc quede desactualizada.
+
+Tests clave para orientarse (ejemplos representativos):
 
 * `cost.test.ts` — cálculo de costo desde ArticleCostLine
 * `sale.test.ts` — motor de venta (resolveFinalSalePrice y capas)
@@ -319,10 +322,12 @@ Cobertura por archivo (en `src/lib/pricing-engine/__tests__/`):
 * `integration.test.ts` — flujo end-to-end del motor
 * `simulator-vs-invoice-parity.test.ts` — paridad simulador ↔ factura
 * `endpoint-parity.test.ts` — paridad entre endpoints que consumen el motor
-* `document-totals.test.ts` — totales de documentos confirmados
-* `document-breakdown.test.ts` — breakdown por línea de documento
+* `document-totals.test.ts` / `document-breakdown.test.ts` — totales y breakdown por línea de documento confirmado
 * `cross-flow-consistency.test.ts` — consistencia entre flujos (venta, compra, cross-settlement)
-* `src/modules/sales/__tests__/preview-confirm-parity.test.ts` — paridad entre preview de venta y confirmación final (vive en el módulo `sales`, no en `pricing-engine`)
+
+Tests de paridad fuera del motor:
+
+* `src/modules/sales/__tests__/preview-confirm-parity.test.ts` — paridad entre preview de venta y confirmación final (vive en el módulo `sales`).
 
 ⚠️ Tras editar `prisma/schema.prisma`: correr `prisma:generate` y reiniciar `npm run dev` a mano (tsx watch no recarga `node_modules/@prisma/client`).
 
