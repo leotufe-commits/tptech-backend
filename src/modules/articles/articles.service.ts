@@ -391,6 +391,7 @@ const ARTICLE_LIST_SELECT = {
       type:             true,
       label:            true,
       quantity:         true,
+      quantityUnit:     true,
       unitValue:        true,
       currencyId:       true,
       mermaPercent:     true,
@@ -588,6 +589,7 @@ const ARTICLE_DETAIL_SELECT = {
       type: true,
       label: true,
       quantity: true,
+      quantityUnit: true,
       unitValue: true,
       currencyId: true,
       metalVariantId: true,
@@ -1870,6 +1872,7 @@ export async function createArticle(jewelryId: string, data: any) {
           type:          VALID_TYPES.has(l.type) ? (l.type as any) : "MANUAL",
           label:         l.label ?? "",
           quantity:      l.quantity,
+          quantityUnit:  l.quantityUnit ?? "",
           unitValue:     l.unitValue,
           currencyId:    l.type === "METAL" ? null : (l.currencyId ?? null),
           mermaPercent:  l.type === "METAL" ? (l.mermaPercent ?? null) : null,
@@ -2181,6 +2184,7 @@ export async function updateArticle(articleId: string, jewelryId: string, data: 
             type:          VALID_TYPES_SET.has(l.type) ? (l.type as any) : "MANUAL",
             label:         l.label ?? "",
             quantity:      l.quantity,
+            quantityUnit:  l.quantityUnit ?? "",
             unitValue:     l.unitValue,
             currencyId:    l.type === "METAL" ? null : (l.currencyId ?? null),
             mermaPercent:  l.type === "METAL" ? (l.mermaPercent ?? null) : null,
@@ -2272,7 +2276,7 @@ export async function cloneArticle(sourceId: string, jewelryId: string) {
       notes: true,
       costComposition: {
         select: {
-          type: true, label: true, quantity: true, unitValue: true,
+          type: true, label: true, quantity: true, quantityUnit: true, unitValue: true,
           currencyId: true, mermaPercent: true, metalVariantId: true,
           catalogItemId: true, catalogVariantId: true,
           lineAdjKind: true, lineAdjType: true,
@@ -2373,6 +2377,7 @@ export async function cloneArticle(sourceId: string, jewelryId: string) {
           type:             l.type,
           label:            l.label,
           quantity:         l.quantity,
+          quantityUnit:     (l as { quantityUnit?: string }).quantityUnit ?? "",
           unitValue:        l.unitValue,
           currencyId:       l.currencyId,
           mermaPercent:     l.mermaPercent,
@@ -3595,6 +3600,11 @@ export type CostLineInput = {
   type: string;
   label: string;
   quantity: number;
+  /** Unidad seleccionada por el operador en el modal del artículo (ej. "u",
+   *  "g", "hr", "min"). Display-only — el motor la propaga como passthrough
+   *  en `step.meta.quantityUnit` sin afectar cálculos. Default `""` =
+   *  legacy / sin selección (frontend cae a fallback). */
+  quantityUnit?: string | null;
   unitValue: number;
   currencyId?: string | null;
   mermaPercent?: number | null;
@@ -3652,6 +3662,7 @@ export async function setCostLines(
           type:           l.type as any,
           label:          l.label ?? "",
           quantity:       l.quantity,
+          quantityUnit:   l.quantityUnit ?? "",
           unitValue:      l.unitValue,
           currencyId:     l.type === "METAL" ? null : (l.currencyId ?? null),
           mermaPercent:   l.type === "METAL" ? (l.mermaPercent ?? null) : null,

@@ -1971,7 +1971,7 @@ export async function exportArticlesGuided(
         preferredSupplier: { select: { code: true, displayName: true } },
         costComposition: {
           select: {
-            type: true, label: true, quantity: true, unitValue: true, mermaPercent: true,
+            type: true, label: true, quantity: true, quantityUnit: true, unitValue: true, mermaPercent: true,
             lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
             currency:    { select: { code: true, name: true } },
             metalVariant: { select: { name: true, metal: { select: { name: true } } } },

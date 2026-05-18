@@ -195,18 +195,23 @@ async function modoCostLines(
 
       // F1.4 G5 #11-A — merma efectiva con prioridad explícita:
       //   1) costLineOverride.mermaPercentOverride (del array por costLineId)
-      //   2) entity merma override (config legacy global por variante)
-      //   3) merma de la línea (config artículo)
+      //   2) entity merma override (EntityMermaOverride del cliente por variante)
+      //   3) merma de la línea (config artículo / catálogo)
       //   4) 0 (sin merma)
+      // FASE F2 — fuente única de resolución de merma. El bloque de re-cómputo
+      // que vivía en pricing-engine.sale.ts:1322+ se eliminó: hoy `entityMermaMap`
+      // viene desde sale.ts (cargado del clientId) y la prioridad vive acá.
       const lineOverrideMerma = ov?.mermaPercentOverride;
       const entityMerma = line.metalVariantId ? entityMermaMap.get(line.metalVariantId) : undefined;
+      const catalogMerma = line.mermaPercent;
       const effectiveMerma = lineOverrideMerma != null
         ? lineOverrideMerma
-        : (entityMerma != null ? entityMerma : (line.mermaPercent ?? 0));
-      const mermaSource =
+        : (entityMerma != null ? entityMerma : (catalogMerma ?? 0));
+      const mermaSource: "costLineOverride" | "entity" | "line" | "default" =
         lineOverrideMerma != null ? "costLineOverride"
         : (entityMerma != null     ? "entity"
-        :                            "line");
+        : (catalogMerma != null && Number(catalogMerma) > 0 ? "line"
+        :                            "default"));
       const mermaFactor = new Prisma.Decimal(1).add(
         new Prisma.Decimal(effectiveMerma.toString()).div(100)
       );
@@ -364,6 +369,12 @@ async function modoCostLines(
           // — usados por el frontend para mostrar la fórmula "qty × unitValue = value".
           qty:        qty.toString(),
           unitValue:  unitVal.toString(),
+          // Unidad seleccionada por el operador en el modal del artículo
+          // (ej. "u", "g", "hr"). Passthrough display — NO participa en
+          // ningún cálculo. Solo se incluye cuando viene poblado.
+          ...(typeof line.quantityUnit === "string" && line.quantityUnit.length > 0
+              ? { quantityUnit: line.quantityUnit }
+              : {}),
           ...(conversionMeta ?? {}),
           ...(lineLabel ? { lineLabel }  : {}),
           ...(refCode   ? { lineCode: refCode } : {}),
@@ -426,6 +437,12 @@ export async function calculateCostFromLines(
    *  aplica los `effective*` correspondientes vía Map<id, override>.
    *  Cero mutación del input `lines`. */
   costLineOverrides?: ReadonlyArray<import("./pricing-engine.types.js").CostLineOverride>,
+  /** FASE F2 — merma del cliente por variante (cargada desde
+   *  `EntityMermaOverride` por `sale.ts` cuando hay `clientId`). El motor
+   *  la usa como nivel 2 en la prioridad de resolución:
+   *  manual > cliente > catálogo > 0. Default: Map vacío (solo cuando se
+   *  llama fuera de un flujo con cliente). */
+  entityMermaMap?: Map<string, number>,
 ): Promise<CostResult> {
   const steps: PricingStep[] = [];
 
@@ -448,7 +465,14 @@ export async function calculateCostFromLines(
       ? buildCostLineOverrideMap(costLineOverrides, lines)
       : { map: new Map(), applied: [], warnings: [] };
 
-  const linesResult = await modoCostLines(jewelryId, lines, steps, new Map(), ctx, ovMap);
+  const linesResult = await modoCostLines(
+    jewelryId,
+    lines,
+    steps,
+    entityMermaMap ?? new Map(),
+    ctx,
+    ovMap,
+  );
 
   if (linesResult.value === null) {
     return {

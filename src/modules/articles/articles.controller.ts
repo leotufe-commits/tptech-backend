@@ -938,6 +938,7 @@ export async function getSalePrice(req: any, res: Response) {
     unitCost:                fmt(r.unitCost),
     unitMargin:              fmt(r.unitMargin),
     marginPercent:           fmt(r.marginPercent),
+    markupPercent:           fmt(r.markupPercent),
     costPartial:             r.costPartial,
     costMode:                r.costMode,
   });
@@ -994,13 +995,13 @@ export async function getPricingPreview(req: any, res: Response) {
     ? parseFloat(String(taxOverrideValueRaw))
     : NaN;
   const taxOverrideAppliesToRaw = s(req.query.taxOverrideAppliesTo);
-  const taxOverrideAppliesTo: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL" | undefined =
-    taxOverrideAppliesToRaw === "METAL"   ||
-    taxOverrideAppliesToRaw === "HECHURA" ||
-    taxOverrideAppliesToRaw === "PRODUCT" ||
-    taxOverrideAppliesToRaw === "SERVICE" ||
-    taxOverrideAppliesToRaw === "TOTAL"
-      ? taxOverrideAppliesToRaw
+  const APPLIES_TO_DOMAIN = new Set([
+    "TOTAL", "METAL", "HECHURA", "METAL_Y_HECHURA",
+    "SUBTOTAL_AFTER_DISCOUNT", "SUBTOTAL_BEFORE_DISCOUNT", "PRODUCT", "SERVICE",
+  ]);
+  const taxOverrideAppliesTo: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | undefined =
+    taxOverrideAppliesToRaw != null && APPLIES_TO_DOMAIN.has(taxOverrideAppliesToRaw)
+      ? (taxOverrideAppliesToRaw as any)
       : undefined;
   const taxOverride =
     taxOverrideMode && Number.isFinite(taxOverrideValue) && taxOverrideValue >= 0
@@ -1028,13 +1029,9 @@ export async function getPricingPreview(req: any, res: Response) {
     ? parseFloat(String(manualDiscountValueRaw))
     : NaN;
   const manualDiscountAppliesToRaw = s(req.query.manualDiscountAppliesTo);
-  const manualDiscountAppliesTo: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL" | undefined =
-    manualDiscountAppliesToRaw === "METAL"   ||
-    manualDiscountAppliesToRaw === "HECHURA" ||
-    manualDiscountAppliesToRaw === "PRODUCT" ||
-    manualDiscountAppliesToRaw === "SERVICE" ||
-    manualDiscountAppliesToRaw === "TOTAL"
-      ? manualDiscountAppliesToRaw
+  const manualDiscountAppliesTo: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | undefined =
+    manualDiscountAppliesToRaw != null && APPLIES_TO_DOMAIN.has(manualDiscountAppliesToRaw)
+      ? (manualDiscountAppliesToRaw as any)
       : undefined;
   const manualDiscount =
     manualDiscountMode && Number.isFinite(manualDiscountValue) && manualDiscountValue >= 0
@@ -1416,6 +1413,7 @@ export async function getPricingPreview(req: any, res: Response) {
     appliedPromotionName:    result.appliedPromotionName,
     appliedDiscountId:       result.appliedDiscountId,
     marginPercent:           fmt(result.marginPercent),
+    markupPercent:           fmt(result.markupPercent),
     unitCost:                fmt(result.unitCost),
     unitMargin:              fmt(result.unitMargin),
     costPartial:             result.costPartial,

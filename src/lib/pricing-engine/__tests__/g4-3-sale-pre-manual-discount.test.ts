@@ -329,3 +329,133 @@ describe("salePreManualDiscount — clamp a 0", () => {
     expect(h.final).toBe(0);
   });
 });
+
+// ============================================================================
+// FIX bonificación por base ("Aplica a") — METAL/HECHURA usan VALOR DE VENTA
+// del componente (metalHechuraBreakdown), no proporción de costo. Total /
+// Metal / Hechura deben dar descuentos DISTINTOS. Bug previo: METAL/HECHURA
+// colapsaban a TOTAL (sin cost breakdown) → "Aplica a" no cambiaba nada.
+// ============================================================================
+describe("manualDiscountOverride — base por componente (venta)", () => {
+  // Artículo metal+hechura: venta metal=600, venta hechura=400, total=1000.
+  it("10% sobre TOTAL / METAL / HECHURA → finales y descuentos DISTINTOS", async () => {
+    setupMetalHechuraList(600, 400);
+    const total = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL" },
+    });
+    setupMetalHechuraList(600, 400);
+    const metal = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL" },
+    });
+    setupMetalHechuraList(600, 400);
+    const hechura = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "HECHURA" },
+    });
+
+    const A = total.unitPrice!.toNumber();   // 1000 − 10%·1000 = 900
+    const B = metal.unitPrice!.toNumber();   // 1000 − 10%·600  = 940
+    const C = hechura.unitPrice!.toNumber(); // 1000 − 10%·400  = 960
+
+    expect(A).toBeCloseTo(900, 4);
+    expect(B).toBeCloseTo(940, 4);
+    expect(C).toBeCloseTo(960, 4);
+    // A, B, C distintos entre sí (el bug los igualaba).
+    expect(new Set([A, B, C]).size).toBe(3);
+  });
+
+  it("cambiar SOLO appliesTo (mismo 10%) recalcula el precio final", async () => {
+    setupMetalHechuraList(600, 400);
+    const m1 = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL" },
+    })).unitPrice!.toNumber();
+    setupMetalHechuraList(600, 400);
+    const h1 = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "HECHURA" },
+    })).unitPrice!.toNumber();
+    expect(m1).not.toBe(h1);
+  });
+
+  it("determinístico (paridad preview↔confirm): mismos inputs → mismo resultado", async () => {
+    setupMetalHechuraList(600, 400);
+    const a = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL" },
+    })).unitPrice!.toNumber();
+    setupMetalHechuraList(600, 400);
+    const b = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL" },
+    })).unitPrice!.toNumber();
+    expect(a).toBe(b);
+  });
+});
+
+// ============================================================================
+// Bonificación MANUAL por línea funciona SIN cliente, y la precedencia de
+// base es: od.appliesTo > discountAppliesToOverride > TOTAL (cliente NO es
+// requisito; su commercialApplyOn gobierna solo su propia capa).
+// ============================================================================
+describe("manualDiscountOverride — sin cliente + precedencia de base", () => {
+  it("SIN cliente: 10% TOTAL/METAL/HECHURA → finales distintos", async () => {
+    setupMetalHechuraList(600, 400); // venta metal=600, hechura=400, total=1000
+    const tot = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL" },
+    })).unitPrice!.toNumber();
+    setupMetalHechuraList(600, 400);
+    const met = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL" },
+    })).unitPrice!.toNumber();
+    setupMetalHechuraList(600, 400);
+    const hec = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "HECHURA" },
+    })).unitPrice!.toNumber();
+    expect(tot).toBeCloseTo(900, 4);
+    expect(met).toBeCloseTo(940, 4);
+    expect(hec).toBeCloseTo(960, 4);
+    expect(new Set([tot, met, hec]).size).toBe(3);
+  });
+
+  it("SIN cliente: precedencia #2 — od sin appliesTo + discountAppliesToOverride=METAL → base METAL", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10 } as any, // sin appliesTo
+      discountAppliesToOverride: "METAL",
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(940, 4); // 1000 − 10%·600
+  });
+
+  it("precedencia #1 gana: od.appliesTo=HECHURA + discountAppliesToOverride=METAL → HECHURA", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "HECHURA" },
+      discountAppliesToOverride: "METAL",
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(960, 4); // 1000 − 10%·400
+  });
+
+  it("CON cliente: la bonificación manual sigue usando su base (independiente del cliente)", async () => {
+    setupMetalHechuraList(600, 400);
+    mockPrisma.commercialEntity.findFirst.mockResolvedValue({
+      taxExempt: false, taxApplyOnOverride: null,
+      commercialRuleType: null, commercialValueType: null,
+      commercialValue: null, commercialApplyOn: "HECHURA", taxOverrides: [],
+    });
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1", clientId: "c1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL" },
+    });
+    // Cliente sin regla activa (ruleType null) → no aporta descuento; el
+    // manual METAL manda igual: 1000 − 10%·600 = 940.
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(940, 4);
+  });
+});

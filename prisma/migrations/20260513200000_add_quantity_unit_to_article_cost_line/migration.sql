@@ -1,0 +1,11 @@
+-- Agrega columna `quantityUnit` a ArticleCostLine para persistir la unidad
+-- seleccionada por el operador en el modal del artículo (ej. "u", "g", "hr",
+-- "min"). Display-only — el motor la propaga como passthrough en
+-- `step.meta.quantityUnit` sin afectar cálculos.
+--
+-- Aditivo y backward-compat:
+--   · Default "" para todas las filas existentes (legacy).
+--   · El frontend cae al fallback "Unidades" cuando el valor es "".
+--   · El motor lee el campo pero solo lo copia al step.meta — no participa
+--     en ningún cálculo monetario.
+ALTER TABLE "ArticleCostLine" ADD COLUMN "quantityUnit" TEXT NOT NULL DEFAULT '';

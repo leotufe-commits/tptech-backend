@@ -34,6 +34,13 @@ vi.mock("../../../lib/pricing-engine/pricing-engine.js", () => ({
   computeLineTaxes:               vi.fn(),
   applySalesChannelAdjustment:    vi.fn(),
   applyCouponAdjustment:          vi.fn(),
+  // F17 — sales.service ahora llama computePurchaseTaxes también en el
+  // path de draft/createSale para persistir el bloque de impuestos de
+  // costo en el snapshot v7. Devolvemos un resultado neutro acá; los
+  // tests específicos de F17 viven en pricing-engine/__tests__.
+  computePurchaseTaxes: vi.fn().mockResolvedValue({
+    costBase: null, costTaxAmount: null, costWithTax: null, costTaxBreakdown: [],
+  }),
 }));
 
 // Otros imports transitivos de sales.service.ts que pueden tener efectos

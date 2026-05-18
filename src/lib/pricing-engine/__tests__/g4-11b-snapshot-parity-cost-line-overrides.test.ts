@@ -156,19 +156,19 @@ beforeEach(() => {
 });
 
 // =============================================================================
-// 1. Snapshot version v6
+// 1. Snapshot version v7 (F17 — aditivo: costBase/costTaxAmount/costWithTax)
 // =============================================================================
 
-describe("F1.4 #11-B — snapshot version v6", () => {
-  it("baseline correct: PRICING_LINE_SNAPSHOT_VERSION === 6", () => {
-    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(6);
+describe("F1.4 #11-B / F17 — snapshot version v7", () => {
+  it("baseline correct: PRICING_LINE_SNAPSHOT_VERSION === 7", () => {
+    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(7);
   });
 
-  it("baseline correct: nuevo snapshot lleva snapshotVersion=6", async () => {
+  it("baseline correct: nuevo snapshot lleva snapshotVersion=7", async () => {
     setupCost(1000);
     const result = await resolveFinalSalePrice("j1", { articleId: "a1" });
     const snap = buildPricingSnapshot(result);
-    expect(snap.snapshotVersion).toBe(6);
+    expect(snap.snapshotVersion).toBe(7);
   });
 });
 

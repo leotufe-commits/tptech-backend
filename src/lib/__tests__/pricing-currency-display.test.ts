@@ -178,3 +178,99 @@ describe("pricing-currency-display — simetría de moneda articles vs sales", (
     expect(res.documentTotals).toBeUndefined();
   });
 });
+
+// ============================================================================
+// FIX moneda cruzada — `composition[].lineSale` DEBE convertirse igual que
+// `lineCost`. Bug observado: documento en USD (base ARS) → márgenes absurdos
+// (+295.900%) en "Composición del costo del artículo" porque `lineCost`
+// venía convertido y `lineSale` quedaba en BASE → margen mezcla USD/ARS.
+// ============================================================================
+
+/** Línea de venta sintética con composición. Invariantes del contrato:
+ *   · Σ metals[].lineSale            === metalHechuraBreakdown.metalSale
+ *   · Σ (hechuras+products+services).lineSale === metalHechuraBreakdown.hechuraSale
+ *  Valores múltiplos de RATE para comparación exacta tras /RATE. */
+function makeSalesLineWithComposition() {
+  return {
+    unitCost: 800, unitMargin: 200, marginPercent: 25, basePrice: 1000,
+    metalHechuraBreakdown: {
+      metalCost: 500, metalSale: 600, metalMarginPct: 20,
+      hechuraCost: 220, hechuraSale: 315, hechuraMarginPct: 43.18,
+    },
+    composition: {
+      metals: [
+        { lineCost: 300, lineSale: 360, quotePrice: 50, appliedGrams: 6, appliedMermaPct: 0 },
+        { lineCost: 200, lineSale: 240, quotePrice: 40, appliedGrams: 5, appliedMermaPct: 0 },
+      ],
+      hechuras: [
+        { lineCost: 100, lineSale: 200, appliedAmount: 100, lineLabel: "Hechura" },
+      ],
+      products: [
+        { catalogItemName: "P", quantity: 1, unitValue: 80, totalValue: 80, lineSale: 90,
+          lineAdjKind: null, lineAdjType: null, lineAdjValue: null, lineAdjAmount: null },
+      ],
+      services: [
+        { catalogItemName: "S", quantity: 1, unitValue: 20, totalValue: 20, lineSale: 25,
+          lineAdjKind: null, lineAdjType: null, lineAdjValue: null, lineAdjAmount: null },
+      ],
+    },
+  };
+}
+
+describe("pricing-currency-display — composition[].lineSale en multimoneda", () => {
+  it("documento moneda base (rate=1) → noop: lineSale/lineCost intactos (Caso A: ARS+ARS)", () => {
+    const res: any = { lines: [makeSalesLineWithComposition()] };
+    convertSalesPreviewResponseInPlace(res, 1);
+    const c = res.lines[0].composition;
+    expect(c.metals[0].lineSale).toBe(360);
+    expect(c.metals[0].lineCost).toBe(300);
+    expect(c.hechuras[0].lineSale).toBe(200);
+    expect(c.products[0].lineSale).toBe(90);
+    expect(c.services[0].lineSale).toBe(25);
+  });
+
+  it("documento NO base (rate≠1) → lineSale se convierte igual que lineCost (Casos B/C/D)", () => {
+    const res: any = { lines: [makeSalesLineWithComposition()] };
+    convertSalesPreviewResponseInPlace(res, RATE);
+    const c = res.lines[0].composition;
+    // metals[]
+    expect(c.metals[0].lineSale).toBeCloseTo(360 / RATE, 4);
+    expect(c.metals[1].lineSale).toBeCloseTo(240 / RATE, 4);
+    // hechuras[] / products[] / services[]
+    expect(c.hechuras[0].lineSale).toBeCloseTo(200 / RATE, 4);
+    expect(c.products[0].lineSale).toBeCloseTo(90  / RATE, 4);
+    expect(c.services[0].lineSale).toBeCloseTo(25  / RATE, 4);
+  });
+
+  it("invariante Σ metals[].lineSale === metalHechuraBreakdown.metalSale (post-conversión)", () => {
+    const res: any = { lines: [makeSalesLineWithComposition()] };
+    convertSalesPreviewResponseInPlace(res, RATE);
+    const l = res.lines[0];
+    const sumMetalSale = l.composition.metals.reduce((a: number, m: any) => a + m.lineSale, 0);
+    expect(sumMetalSale).toBeCloseTo(l.metalHechuraBreakdown.metalSale, 4);
+    const sumHechuraSale =
+      l.composition.hechuras.reduce((a: number, h: any) => a + h.lineSale, 0) +
+      l.composition.products.reduce((a: number, p: any) => a + p.lineSale, 0) +
+      l.composition.services.reduce((a: number, s: any) => a + s.lineSale, 0);
+    expect(sumHechuraSale).toBeCloseTo(l.metalHechuraBreakdown.hechuraSale, 4);
+  });
+
+  it("margen % por fila NO es absurdo: ratio lineSale/lineCost invariante a la conversión", () => {
+    const before = makeSalesLineWithComposition();
+    const res: any = { lines: [makeSalesLineWithComposition()] };
+    convertSalesPreviewResponseInPlace(res, RATE);
+    const m0b = before.composition.metals[0];
+    const m0a = res.lines[0].composition.metals[0];
+    const pctBefore = ((m0b.lineSale - m0b.lineCost) / m0b.lineCost) * 100; // 20%
+    const pctAfter  = ((m0a.lineSale - m0a.lineCost) / m0a.lineCost) * 100;
+    expect(pctAfter).toBeCloseTo(pctBefore, 6); // mismo % — sin mezcla de monedas
+    expect(Math.abs(pctAfter)).toBeLessThan(1000); // jamás +295.900%
+  });
+
+  it("marginPercent por línea NO se convierte (es un %, no moneda)", () => {
+    const res: any = { lines: [makeSalesLineWithComposition()] };
+    convertSalesPreviewResponseInPlace(res, RATE);
+    expect(res.lines[0].marginPercent).toBe(25);
+    expect(res.lines[0].metalHechuraBreakdown.metalMarginPct).toBe(20);
+  });
+});

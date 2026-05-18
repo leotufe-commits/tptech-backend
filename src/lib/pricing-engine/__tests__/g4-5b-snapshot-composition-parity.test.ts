@@ -160,12 +160,12 @@ describe("snapshot parity — preview ↔ persisted (composition + componentSale
       .toBe(result.componentSaleBreakdown!.hechura.salePreManualDiscount);
   });
 
-  it("baseline correct: snapshot version bumped a 6 (aditivo con costLineOverridesApplied)", async () => {
+  it("baseline correct: snapshot version bumped a 7 (F17 aditivo con costBase/costTaxAmount/costWithTax/costTaxBreakdown)", async () => {
     setupMetalHechuraList(600, 600);
     const result = await resolveFinalSalePrice("j1", { articleId: "a1" });
     const snap = buildPricingSnapshot(result);
-    expect(snap.snapshotVersion).toBe(6);
-    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(6);
+    expect(snap.snapshotVersion).toBe(7);
+    expect(PRICING_LINE_SNAPSHOT_VERSION).toBe(7);
   });
 });
 
@@ -227,8 +227,8 @@ describe("snapshot parity — products/services preservan todos los campos", () 
     } as any;
 
     const catalogMap = new Map([
-      ["art-P", { code: "ZAF-01-cat", name: "Zafiro 0.5ct (catálogo)", sku: "ZAF-01-sku" }],
-      ["art-S", { code: "ENG-01-cat", name: "Engaste profesional (catálogo)", sku: "ENG-01-sku" }],
+      ["art-P", { code: "ZAF-01-cat", name: "Zafiro 0.5ct (catálogo)", sku: "ZAF-01-sku", unitOfMeasure: "" }],
+      ["art-S", { code: "ENG-01-cat", name: "Engaste profesional (catálogo)", sku: "ENG-01-sku", unitOfMeasure: "" }],
     ]);
     const composition = buildComposition(
       fakeResult,
@@ -250,6 +250,8 @@ describe("snapshot parity — products/services preservan todos los campos", () 
       catalogItemName: "Zafiro 0.5ct (catálogo)",
       quantity:        2,
       unitValue:       50,
+      // `unitValueBase = unitValue × rate` (sin conversión → rate=1).
+      unitValueBase:   50,
       totalValue:      100,
       currencyId:      null,
       lineAdjKind:     "BONUS",
@@ -270,6 +272,7 @@ describe("snapshot parity — products/services preservan todos los campos", () 
       catalogItemName: "Engaste profesional (catálogo)",
       quantity:        1,
       unitValue:       80,
+      unitValueBase:   80,
       totalValue:      80,
       currencyId:      "USD",
       lineAdjKind:     "SURCHARGE",

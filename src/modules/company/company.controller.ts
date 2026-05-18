@@ -153,6 +153,16 @@ export async function updateMyJewelry(req: Request, res: Response) {
       // ── Formato de campos ───────────────────────────────────────────────
       phoneFormat:    data.phoneFormat    ?? undefined,
       documentFormat: data.documentFormat ?? undefined,
+      // Formato numérico visual (JSON). Validación liviana: debe ser objeto
+      // con `region` válida; el detalle de presets lo valida el frontend.
+      // NUNCA se guardan strings formateados, solo la config.
+      numberFormat:
+        data.numberFormat &&
+        typeof data.numberFormat === "object" &&
+        !Array.isArray(data.numberFormat) &&
+        ["AR", "US", "CUSTOM"].includes(String(data.numberFormat.region))
+          ? data.numberFormat
+          : undefined,
       // ────────────────────────────────────────────────────────────────────
 
       // ── Política de alertas de precio ───────────────────────────────────

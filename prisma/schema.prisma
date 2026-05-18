@@ -79,6 +79,9 @@ model Jewelry {
   // ── Formatos de campo ─────────────────────────────────────────────────────
   phoneFormat                String                     @default("raw")    // raw | national_ar | intl_ar | intl_ar_mobile
   documentFormat             String                     @default("raw")    // raw | cuit_cuil | dni | digits_only
+  // Formato numérico visual por tenant. JSON: { region, custom:{thousands,decimal}, presets:{...} }.
+  // SOLO display/input — la DB y el pricing-engine siguen usando números puros.
+  numberFormat               Json?
 
   deletedAt                  DateTime?
   auditLogs                  AuditLog[]
@@ -1834,6 +1837,11 @@ model ArticleCostLine {
   type             CostLineType @default(MANUAL)
   label            String       @default("")
   quantity         Decimal      @default(1)  @db.Decimal(14, 4)
+  // Code de la unidad seleccionada por el operador en el modal del artículo
+  // (ej. "u", "g", "hr", "min"). Solo display — el motor lo propaga como
+  // passthrough en `step.meta.quantityUnit` sin afectar cálculos. Default
+  // `""` = legacy / sin selección (frontend cae a fallback).
+  quantityUnit     String       @default("")
   unitValue        Decimal      @default(0)  @db.Decimal(18, 6)
   currencyId       String?                                        // null = moneda base del tenant
   mermaPercent     Decimal?                  @db.Decimal(5, 2)   // solo para type=METAL

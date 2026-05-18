@@ -413,7 +413,7 @@ export async function confirmPurchase(
         costComposition: {
           orderBy: { sortOrder: "asc" as const },
           select: {
-            type: true, label: true, quantity: true, unitValue: true,
+            type: true, label: true, quantity: true, quantityUnit: true, unitValue: true,
             currencyId: true, mermaPercent: true, metalVariantId: true,
             lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
           },

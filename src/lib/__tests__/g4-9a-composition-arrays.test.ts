@@ -94,6 +94,10 @@ describe("F1.3 #9-A — extractCompositionMetals", () => {
       lineSale:        null,
       // Fase 2.3 — quotePrice propagado desde step.meta (base por gramo).
       quotePrice:      400,
+      // FASE F2 — el step de este fixture no setea meta.mermaSource → null.
+      mermaSource:     null,
+      // FASE F3 — appliedGrams (1.30) × quotePrice (400) = 520.
+      lineCostBase:    520,
     });
     expect(items[1].metalVariantId).toBe("mv-2");
     expect(items[1].metalName).toBe("Plata");
@@ -152,6 +156,11 @@ describe("F1.3 #9-A — extractCompositionHechuras", () => {
       // del fixture trae unitValue:"200", así que llega como 200 (BASE
       // pre-ajuste; sin ajuste configurado coincide con appliedAmount).
       unitValue:     200,
+      // `unitValueBase = unitValue × rate`. Sin conversión → rate=1 → 200.
+      unitValueBase: 200,
+      // Paridad con PRODUCT/SERVICE — `quantity` propagado desde meta.qty.
+      // El fixture trae qty:"1".
+      quantity:      1,
       // Fase 2.2 — 4 campos lineAdj* propagados desde step.meta.
       // En este fixture no hay ajuste configurado → quedan null.
       lineAdjKind:   null,
@@ -165,6 +174,114 @@ describe("F1.3 #9-A — extractCompositionHechuras", () => {
 
   it("baseline correct: sin steps HECHURA → array vacío", () => {
     expect(extractCompositionHechuras([])).toEqual([]);
+  });
+
+  it("propaga `quantity` desde meta.qty (qty > 1, ej. mano de obra desglosada por horas)", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 227.28, {
+        costLineId: "cl-h1", qty: "3", unitValue: "75.76", lineLabel: "Mano de obra",
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0].quantity).toBe(3);
+    expect(items[0].unitValue).toBe(75.76);
+    expect(items[0].lineCost).toBe(227.28);
+  });
+
+  it("propaga `quantityUnit` desde meta.quantityUnit (selección del operador)", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 200, {
+        costLineId: "cl-h1", qty: "3", unitValue: "75.76",
+        quantityUnit: "hr",       // ← operador eligió "horas"
+        lineLabel: "Mano de obra",
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0].quantityUnit).toBe("hr");
+  });
+
+  it("backward compat: snapshot sin meta.quantityUnit → quantityUnit omitido", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 200, {
+        costLineId: "cl-h1", qty: "1", unitValue: "200", lineLabel: "Mano de obra",
+        // sin quantityUnit en meta
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0]).not.toHaveProperty("quantityUnit");
+  });
+
+  it("propaga `unitValueBase = unitValue × rate` cuando hay conversión", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 101_323.20, {
+        costLineId: "cl-h1", qty: "3", unitValue: "75.76",
+        fromCurrencyId: "cur-usd",
+        currencyCode:   "USD",
+        currencySymbol: "US$",
+        rate:           "446.00",   // unitValue × rate = 75.76 × 446 = 33_788.96
+        lineLabel: "Mano de obra",
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    // unitValueBase debe ser unitValue (75.76) × rate (446) = 33788.96.
+    expect(items[0].unitValueBase).toBeCloseTo(75.76 * 446, 2);
+    // `unitValue` se mantiene en moneda original (sin convertir).
+    expect(items[0].unitValue).toBe(75.76);
+  });
+
+  it("propaga `unitValueBase` cuando NO hay conversión (rate=1 → coincide con unitValue)", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 200, {
+        costLineId: "cl-base", qty: "1", unitValue: "200", lineLabel: "Mano de obra",
+        // sin conversionMeta — el cost line está en moneda base.
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0].unitValueBase).toBe(200);
+  });
+
+  it("propaga `currencyCode/Symbol` + `currencyId` cuando el motor registró conversión (meta.fromCurrencyId)", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 227.28, {
+        costLineId: "cl-h1", qty: "3", unitValue: "75.76",
+        // El motor inyecta esto vía spread de conversionMeta cuando el cost
+        // line está en moneda != base.
+        fromCurrencyId: "cur-usd",
+        currencyCode:   "USD",
+        currencySymbol: "US$",
+        rate:           "1332.5",
+        lineLabel: "Mano de obra",
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0].currencyId).toBe("cur-usd");
+    expect(items[0].currencyCode).toBe("USD");
+    expect(items[0].currencySymbol).toBe("US$");
+  });
+
+  it("snapshot sin conversión (cost line en moneda base) → currency* no se emiten", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 200, {
+        costLineId: "cl-base", qty: "1", unitValue: "200", lineLabel: "Mano de obra",
+        // sin conversionMeta — el cost line está en moneda base.
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0]).not.toHaveProperty("currencyCode");
+    expect(items[0]).not.toHaveProperty("currencySymbol");
+    expect(items[0]).not.toHaveProperty("currencyId");
+  });
+
+  it("backward compat: snapshot legacy sin meta.qty → quantity omitido (no se emite)", () => {
+    const steps = [
+      makeStep("COST_LINES_HECHURA", 200, {
+        costLineId: "cl-legacy", unitValue: "200", lineLabel: "Mano de obra",
+        // sin `qty` en meta
+      }, "Mano de obra"),
+    ];
+    const items = extractCompositionHechuras(steps);
+    expect(items[0]).not.toHaveProperty("quantity");
+    expect(items[0].lineCost).toBe(200);
   });
 });
 

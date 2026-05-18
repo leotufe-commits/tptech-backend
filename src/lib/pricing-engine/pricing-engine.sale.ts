@@ -202,6 +202,7 @@ function noPrice(): Omit<SalePriceResult, "alerts" | "policy"> {
     unitCost: null,
     unitMargin: null,
     marginPercent: null,
+    markupPercent: null,
     costPartial: true,
     costMode: "NONE",
     partial: true,
@@ -491,7 +492,7 @@ type TaxOverrideInput = {
 export type LineTaxManualOverride = {
   mode: "PERCENT" | "AMOUNT";
   value: number;
-  appliesTo?: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL";
+  appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
 };
 
 export async function computeLineTaxes(
@@ -504,6 +505,14 @@ export async function computeLineTaxes(
   entityApplyOnOverride?: string | null,
   entityTaxOverrides?: TaxOverrideInput[] | null,
   manualOverride?: LineTaxManualOverride | null,
+  /**
+   * Override de SOLO la base ("Aplica a") por LÍNEA, independiente del
+   * valor. Cuando viene (y NO hay `manualOverride` de valor), fuerza la
+   * base de TODOS los impuestos heredados a este scope, por encima del
+   * applyOn config del Tax y de los overrides de entidad. El operador lo
+   * elige desde la línea; el motor recalcula con esa base.
+   */
+  lineApplyOnOverride?: string | null,
 ): Promise<{ taxBreakdown: TaxBreakdownItem[]; taxAmount: Prisma.Decimal }> {
   const D = Prisma.Decimal;
 
@@ -635,7 +644,13 @@ export async function computeLineTaxes(
     let effectiveApplyOn: string;
     let entityOverrideSource: "INDIVIDUAL" | "GLOBAL" | undefined;
 
-    if (individualOverride && individualOverride.applyOn != null) {
+    if (lineApplyOnOverride != null) {
+      // MÁXIMA prioridad — el operador eligió explícitamente la base desde
+      // la línea (independiente del valor). Gana sobre config del Tax y
+      // sobre overrides de entidad (individual/global).
+      effectiveApplyOn = lineApplyOnOverride;
+      entityOverrideSource = "INDIVIDUAL";
+    } else if (individualOverride && individualOverride.applyOn != null) {
       // Override puntual con applyOn propio
       effectiveApplyOn = individualOverride.applyOn;
       entityOverrideSource = "INDIVIDUAL";
@@ -873,6 +888,7 @@ export async function resolveFinalSalePrice(
           type: true,
           label: true,
           quantity: true,
+          quantityUnit: true,
           unitValue: true,
           currencyId: true,
           mermaPercent: true,
@@ -1126,6 +1142,27 @@ export async function resolveFinalSalePrice(
     },
     opts.costLineOverrides,
   );
+  // FASE F2 — cargar EntityMermaOverride del cliente para esta factura.
+  // Se pasa como `entityMermaMap` al motor de costo y queda como nivel 2 de
+  // la prioridad (manual > cliente > catálogo > 0). El motor sale.ts ya NO
+  // re-aplica la merma del cliente después: la única fuente de verdad es
+  // calculateCostFromLines. Sin clientId, el map queda vacío y se ignora.
+  const entityMermaMap = new Map<string, number>();
+  if (opts.clientId) {
+    const overrides = await prisma.entityMermaOverride.findMany({
+      where: {
+        entityId: opts.clientId,
+        role: "CLIENT",
+        isActive: true,
+        deletedAt: null,
+      },
+      select: { variantId: true, mermaPercent: true },
+    });
+    for (const ov of overrides) {
+      entityMermaMap.set(ov.variantId, Number(ov.mermaPercent));
+    }
+  }
+
   const costResult = await calculateCostFromLines(
     jewelryId,
     composedLines,
@@ -1136,6 +1173,7 @@ export async function resolveFinalSalePrice(
     },
     undefined,  // ctx
     unifiedCostLineOverrides,
+    entityMermaMap,
   );
 
   // Resolver totalGrams: variant.weightOverride tiene prioridad
@@ -1314,96 +1352,14 @@ export async function resolveFinalSalePrice(
     meta: { mode: costResult.mode, partial: costResult.partial },
   });
 
-  // ── Entity merma override — solo afecta VENTA, no el costo ────────────
-  // Se re-calcula la parte de metal del costo usando la merma del cliente,
-  // y ese valor ajustado se pasa a applyPriceList en lugar del costo puro.
-  // El costResult (puro) sigue sin modificarse — es lo que se muestra en Costo.
-  let saleCostInput: typeof costResult = costResult;
-
-  if (opts.clientId && costResult.metalCost != null && costResult.metalCost.gt(new Prisma.Decimal(0))) {
-    const entityOverrides = await prisma.entityMermaOverride.findMany({
-      where: { entityId: opts.clientId, isActive: true, deletedAt: null },
-      select: { variantId: true, mermaPercent: true },
-    });
-
-    if (entityOverrides.length > 0) {
-      const D = Prisma.Decimal;
-      const overrideMap = new Map<string, number>();
-      for (const o of entityOverrides) {
-        overrideMap.set(o.variantId, Number(o.mermaPercent));
-      }
-
-      // Re-computar metalCost usando merma del cliente (a partir de los steps del costo puro)
-      const metalSteps = costResult.steps.filter(
-        (s: PricingStep) =>
-          (s.key === "METAL_QUOTE" || s.key === "COST_LINES_METAL") && s.status === "ok"
-      );
-
-      let newMetalCost = new D(0);
-      let newMetalGramsWithMerma = new D(0);
-
-      for (const step of metalSteps) {
-        const m = (step.meta ?? {}) as Record<string, unknown>;
-        const variantId  = String(m.variantId ?? "");
-        const entityMerma = overrideMap.get(variantId);
-        const grams = new D(String(m.grams ?? m.qty ?? "0"));
-        const price = new D(String(m.price ?? m.quotePrice ?? "0"));
-
-        if (entityMerma != null) {
-          // Re-computar con la merma del cliente
-          const mermaFactor = new D(1).add(new D(entityMerma.toString()).div(100));
-          const gramsWithMerma = grams.mul(mermaFactor);
-          newMetalCost = newMetalCost.add(gramsWithMerma.mul(price));
-          newMetalGramsWithMerma = newMetalGramsWithMerma.add(gramsWithMerma);
-        } else {
-          // Sin override para esta variante: usar el valor original del step
-          newMetalCost = newMetalCost.add(new D(String(step.value ?? "0")));
-          // Recuperar gramos con merma originales del metadata del step
-          const origGramsWithMerma = m.gramsConMerma != null
-            ? new D(String(m.gramsConMerma))
-            : m.merma != null
-              ? grams.mul(new D(1).add(new D(String(m.merma)).div(100)))
-              : grams;
-          newMetalGramsWithMerma = newMetalGramsWithMerma.add(origGramsWithMerma);
-        }
-      }
-
-      // Si COST_LINES tuvo un ajuste global, propagar ese factor al nuevo metalCost
-      // (los gramos no llevan ajuste monetario)
-      const stepsMetalSum = metalSteps.reduce(
-        (acc: Prisma.Decimal, s: PricingStep) => acc.add(new D(String(s.value ?? "0"))),
-        new D(0)
-      );
-      if (stepsMetalSum.gt(new D("0.0001"))) {
-        const adjFactor = costResult.metalCost.div(stepsMetalSum);
-        newMetalCost = newMetalCost.mul(adjFactor);
-      }
-
-      if (!newMetalCost.eq(costResult.metalCost)) {
-        const delta = newMetalCost.sub(costResult.metalCost);
-        saleCostInput = {
-          ...costResult,
-          metalCost: newMetalCost,
-          value: costResult.value != null ? costResult.value.add(delta) : costResult.value,
-          metalGramsWithMerma: newMetalGramsWithMerma,
-        };
-
-        steps.push({
-          key: "ENTITY_MERMA_SALE_ADJ",
-          label: "Ajuste de merma por cliente (venta)",
-          status: "ok",
-          value: delta,
-          meta: {
-            clientId: opts.clientId,
-            variants: entityOverrides.map(o => ({
-              variantId: o.variantId,
-              mermaPercent: Number(o.mermaPercent),
-            })),
-          },
-        });
-      }
-    }
-  }
+  // FASE F2 — el bloque ENTITY_MERMA_SALE_ADJ se eliminó. La merma del
+  // cliente ahora se aplica una sola vez en `calculateCostFromLines` con
+  // prioridad uniforme (manual > cliente > catálogo > 0). El `costResult`
+  // ya viene con la merma efectiva integrada → `saleCostInput === costResult`.
+  // Para auditoría, cada step METAL emitido por el motor lleva
+  // `meta.mermaSource` con los valores: "costLineOverride" | "entity" |
+  // "line" | "default".
+  const saleCostInput: typeof costResult = costResult;
 
   // ── Cost breakdown unificado para resolveDiscountBase y tracker ─────────
   // `resolveDiscountBase` con applyOn=METAL|HECHURA lee el desglose de costo
@@ -2124,7 +2080,11 @@ export async function resolveFinalSalePrice(
     const rawValue      = clientEnt?.commercialValue != null
       ? parseFloat(clientEnt.commercialValue.toString())
       : null;
-    const effectiveApplyOn = clientEnt?.commercialApplyOn ?? "TOTAL";
+    // Override de SOLO la base ("Aplica a") del descuento del cliente,
+    // independiente del valor. El operador puede cambiar la base sin tocar
+    // el %/monto configurado del cliente; el motor recalcula sobre esa base.
+    const effectiveApplyOn =
+      opts.discountAppliesToOverride ?? clientEnt?.commercialApplyOn ?? "TOTAL";
 
     const canApply = ruleType != null && valueType != null && rawValue != null && rawValue > 0;
 
@@ -2220,36 +2180,47 @@ export async function resolveFinalSalePrice(
   //     este encadenamiento el operador no podía componer overrides
   //     comerciales — el manual price desactivaba el descuento manual.
   //
-  // `appliesTo` define la base sobre la que se calcula el descuento:
+  // `appliesTo` define la base sobre la que se calcula el descuento
+  // (vía `resolveDiscountBase`, misma lógica que qty/promo/cliente):
   //   · TOTAL   (default): sobre la base elegida arriba (basePrice o finalPrice).
-  //   · METAL   / HECHURA: sobre la porción metal/hechura del costo
-  //                        (proporción de la base). Si no hay
-  //                        decomposición disponible, cae a TOTAL.
-  //   · PRODUCT / SERVICE: idem (estimación por costo, fallback TOTAL).
+  //   · METAL   / HECHURA: sobre el VALOR DE VENTA del componente
+  //                        (`metalHechuraBreakdown.metalSale/hechuraSale`);
+  //                        si no hay desglose, estima por proporción de
+  //                        costo; si tampoco, cae a TOTAL.
   if (
     opts.manualDiscountOverride &&
     Number.isFinite(opts.manualDiscountOverride.value) &&
     opts.manualDiscountOverride.value >= 0
   ) {
     const od = opts.manualDiscountOverride;
-    const applyOn = od.appliesTo ?? "TOTAL";
+    // Precedencia de base (independiente de si hay cliente o no):
+    //   1. `manualDiscountOverride.appliesTo` (base embebida en el override
+    //      de valor que fijó el operador en la línea).
+    //   2. `discountAppliesToOverride` (override de SOLO la base, si el
+    //      operador cambió "Aplica a" sin re-tocar el valor).
+    //   3. "TOTAL" (default — NO se requiere cliente/regla comercial).
+    // La regla comercial del cliente (`commercialApplyOn`) NO interviene
+    // acá: gobierna solo su propia capa (más arriba). La bonificación
+    // MANUAL por línea manda y funciona con o sin cliente.
+    const applyOn = od.appliesTo ?? opts.discountAppliesToOverride ?? "TOTAL";
     // Base de cálculo según haya o no manualPrice. Mantener back-compat
     // del comportamiento legacy cuando NO hay manualPrice (descuento sobre
     // lista, reemplaza qty/promo).
     const discountStartingBase: Prisma.Decimal = manualPriceApplied ? finalPrice : basePrice;
-    const costMetal   = effectiveCostBreakdown?.totals.metal   ?? null;
-    const costHechura = effectiveCostBreakdown?.totals.hechura ?? null;
-    const costTotal   = effectiveCostBreakdown?.totals.unified ?? null;
-    let discBase: Prisma.Decimal = discountStartingBase;
-    if ((applyOn === "METAL" || applyOn === "HECHURA") && costTotal && costTotal > 0) {
-      const portion =
-        applyOn === "METAL"   ? (costMetal   ?? 0) / costTotal :
-        applyOn === "HECHURA" ? (costHechura ?? 0) / costTotal :
-        1;
-      if (portion > 0 && portion <= 1) {
-        discBase = discountStartingBase.mul(portion);
-      }
-    }
+    // FIX bonificación por base: METAL/HECHURA debe descontar sobre el
+    // VALOR DE VENTA del componente (`metalHechuraBreakdown.metalSale /
+    // hechuraSale`), igual que qty/promo/regla-cliente — vía el helper
+    // canónico `resolveDiscountBase`. Antes este bloque estimaba por
+    // PROPORCIÓN DE COSTO y solo si había `effectiveCostBreakdown`: sin
+    // breakdown de costo (costMode NONE) METAL/HECHURA colapsaban a TOTAL
+    // y "Aplica a" no cambiaba el descuento. Para TOTAL el helper
+    // devuelve `base = discountStartingBase` (comportamiento idéntico).
+    const { base: discBase } = resolveDiscountBase(
+      applyOn,
+      discountStartingBase,
+      metalHechuraBreakdown ?? null,
+      effectiveCostBreakdown,
+    );
     const discAmount = od.mode === "PERCENT"
       ? discBase.mul(od.value).div(100)
       : new D(od.value);
@@ -2320,6 +2291,7 @@ export async function resolveFinalSalePrice(
   let unitCost: Prisma.Decimal | null = null;
   let unitMargin: Prisma.Decimal | null = null;
   let marginPercent: Prisma.Decimal | null = null;
+  let markupPercent: Prisma.Decimal | null = null;
 
   if (costResult.value != null) {
     unitCost = costResult.value;
@@ -2327,6 +2299,9 @@ export async function resolveFinalSalePrice(
     marginPercent = finalPrice.gt(0)
       ? unitMargin.div(finalPrice).mul(100)
       : new D(0);
+    markupPercent = unitCost.gt(0)
+      ? unitMargin.div(unitCost).mul(100)
+      : null;
 
     steps.push({
       key: "MARGIN",
@@ -2368,6 +2343,9 @@ export async function resolveFinalSalePrice(
     // Override manual de la línea — si vino, reemplaza el cálculo entero
     // (excepto cuando el cliente está exento, que prevalece).
     entityTaxExempt ? null : (opts.taxOverride ?? null),
+    // Override de SOLO la base ("Aplica a") — independiente del valor.
+    // Solo aplica al impuesto HEREDADO (cuando NO hay taxOverride de valor).
+    entityTaxExempt ? null : (opts.taxAppliesToOverride ?? null),
   );
   let totalWithTax = finalPrice.add(taxAmount);
 
@@ -2518,6 +2496,28 @@ export async function resolveFinalSalePrice(
       : null,
   }) as typeof metalHechuraBreakdown;
 
+  // FASE F3 — metalCostBase = Σ appliedGrams × quotePrice de los steps METAL.
+  // Aditivo: si algún step no tiene `meta.quotePrice` (snapshot legacy), el
+  // total queda null. Sin recalcular nada — passthrough puro.
+  if (metalHechuraBreakdown) {
+    const metalStepsForBase = (costResult.steps as any[]).filter(
+      (s) => s?.key === "COST_LINES_METAL" && s?.status === "ok",
+    );
+    let baseSum = 0;
+    let allHaveBase = metalStepsForBase.length > 0;
+    for (const s of metalStepsForBase) {
+      const qty = Number(s?.meta?.qty);
+      const qp  = Number(s?.meta?.quotePrice);
+      if (!Number.isFinite(qty) || !Number.isFinite(qp)) {
+        allHaveBase = false;
+        break;
+      }
+      baseSum += qty * qp;
+    }
+    (metalHechuraBreakdown as any).metalCostBase =
+      allHaveBase ? parseFloat(baseSum.toFixed(6)) : null;
+  }
+
   const base: Omit<SalePriceResult, "alerts" | "policy"> = {
     unitPrice: finalPrice,
     basePrice,
@@ -2532,6 +2532,7 @@ export async function resolveFinalSalePrice(
     unitCost,
     unitMargin,
     marginPercent,
+    markupPercent,
     costPartial: costResult.partial,
     costMode: costResult.mode,
     partial,
@@ -2874,7 +2875,7 @@ export async function evaluatePricingPolicy(
             // Aditivo y barato; mantiene paridad cross-paths del motor.
             id: true,
             type: true, label: true,
-            quantity: true, unitValue: true, currencyId: true, mermaPercent: true, metalVariantId: true,
+            quantity: true, quantityUnit: true, unitValue: true, currencyId: true, mermaPercent: true, metalVariantId: true,
             lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
             catalogItem: { select: { code: true, sku: true } },
           },
@@ -2959,6 +2960,11 @@ export interface BuildPricingSnapshotOptions {
   /** Composición visual (metal/hechura/products/services/taxes). Se persiste
    *  tal cual la pasó el caller — paridad byte-a-byte con el preview. */
   composition?: SnapshotComposition | null;
+  /** F17 — resultado de `computePurchaseTaxes` ya resuelto para esta línea.
+   *  Se persiste TAL CUAL en el snapshot (POLICY: inmutable). Si no se
+   *  pasa, el snapshot v7 queda con los campos en `undefined` y la UI los
+   *  trata como `null` (sin "Costo con impuestos"). */
+  purchaseTaxes?: PurchaseTaxResult | null;
 }
 
 export function buildPricingSnapshot(
@@ -3011,6 +3017,8 @@ export function buildPricingSnapshot(
           // pureGramsSale = pureGramsBase × (1 + metalMarginPct/100).
           pureGramsBase:  mhb.pureGramsBase  ?? null,
           pureGramsSale:  mhb.pureGramsSale  ?? null,
+          // FASE F3 — costo del metal sin merma comercial (passthrough).
+          metalCostBase:  (mhb as any).metalCostBase ?? null,
           source:         mhb.source,
         }
       : null,
@@ -3028,6 +3036,18 @@ export function buildPricingSnapshot(
     // pasa el componentSaleBreakdown que él mismo computó.
     composition:            options?.composition ?? null,
     componentSaleBreakdown: result.componentSaleBreakdown ?? null,
+
+    // F17 (snapshot v7) — impuestos de costo persistidos (aditivo,
+    // opcional). Si el caller no pasa `purchaseTaxes`, los campos quedan
+    // `undefined` y un reader v6 los trata igual que `null`.
+    ...(options?.purchaseTaxes
+      ? {
+          costBase:         options.purchaseTaxes.costBase,
+          costTaxAmount:    options.purchaseTaxes.costTaxAmount,
+          costWithTax:      options.purchaseTaxes.costWithTax,
+          costTaxBreakdown: options.purchaseTaxes.costTaxBreakdown,
+        }
+      : {}),
 
     resolvedAt: new Date().toISOString(),
   };

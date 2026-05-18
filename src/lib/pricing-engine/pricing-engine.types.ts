@@ -318,6 +318,11 @@ export interface SalePriceResult {
   unitMargin: Prisma.Decimal | null;
   /** Margen % sobre precio final. Null si sin costo. */
   marginPercent: Prisma.Decimal | null;
+  /** Markup % sobre costo = unitMargin / unitCost × 100. Null si sin costo o costo ≤ 0.
+   *  Derivable de unitCost/unitMargin pero se expone en el response del motor para
+   *  evitar recálculo en frontend (POLICY R6 — frontend lector puro). NO se persiste
+   *  en el snapshot porque es información redundante con marginPercent. */
+  markupPercent: Prisma.Decimal | null;
   /** true cuando el costo no pudo resolverse completamente */
   costPartial: boolean;
   /** Modo de cálculo de costo: COST_LINES | NONE */
@@ -383,6 +388,13 @@ export interface SalePriceResult {
     /** Gramos puros de venta = pureGramsBase × (1 + metalMarginPct/100).
      *  null si pureGramsBase null. POLICY.md §8 — campo persistible. */
     pureGramsSale?:     number | null;
+    /**
+     * FASE F3 — costo del metal **sin merma comercial**.
+     * Σ `lineCostBase` de todas las cost lines METAL.
+     * Aditivo y opcional. `null` si algún `lineCostBase` falta (snapshot
+     * legacy pre-Fase 2.3 sin `quotePrice` en algún metal).
+     */
+    metalCostBase?:     number | null;
     /** FASE 1 — `true` cuando `metalSale` se derivó por proporción de costo
      *  (no surge directo del paso PRICE_LIST METAL_HECHURA). */
     metalSaleEstimated?:   boolean;
@@ -633,6 +645,10 @@ export interface CostLineInput {
   /** Código del artículo referenciado (catalogItem.code), solo para PRODUCT/SERVICE */
   lineCode?: string | null;
   quantity: any;
+  /** Unidad seleccionada por el operador en el modal del artículo (ej. "u",
+   *  "g", "hr", "min"). Display-only — el motor la propaga sin participar
+   *  en ningún cálculo. Default `""` → frontend cae a fallback. */
+  quantityUnit?: string | null;
   unitValue: any;
   /** Moneda del valor unitario; null = moneda base del tenant */
   currencyId?: string | null;
@@ -791,7 +807,7 @@ export interface SalePriceOpts {
   taxOverride?: {
     mode: "PERCENT" | "AMOUNT";
     value: number;
-    appliesTo?: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL";
+    appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
   } | null;
   /**
    * Override manual del precio neto unitario (sin impuestos). Pisa el
@@ -820,8 +836,28 @@ export interface SalePriceOpts {
      * "TOTAL" (descuento sobre el precio completo). METAL / HECHURA /
      * PRODUCT / SERVICE descuentan solo de la porción correspondiente.
      */
-    appliesTo?: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL";
+    appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
   } | null;
+  /**
+   * Override de SOLO la BASE ("Aplica a") del descuento HEREDADO de la regla
+   * comercial del cliente, INDEPENDIENTE del valor. Permite que el operador
+   * cambie la base sin tocar el %/monto (que sigue siendo el del cliente).
+   * Precedencia: si hay `manualDiscountOverride` (override de valor), su
+   * `appliesTo` gana y este campo se ignora. Si no, reemplaza
+   * `commercialApplyOn` del cliente. El frontend NO deriva el % heredado:
+   * solo manda el scope; el motor recalcula la regla del cliente sobre la
+   * nueva base.
+   */
+  discountAppliesToOverride?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
+  /**
+   * Override de SOLO la BASE ("Aplica a") de los impuestos HEREDADOS del
+   * artículo, INDEPENDIENTE del valor/tasa (que sigue siendo la configurada).
+   * Precedencia: si hay `taxOverride` (override de valor), su `appliesTo`
+   * gana y este campo se ignora. Si no, fuerza la base de TODOS los
+   * impuestos heredados de la línea (por encima del applyOn config / entity).
+   * El frontend solo manda el scope; el motor recalcula con esa base.
+   */
+  taxAppliesToOverride?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
 
   // ─────────────────────────────────────────────────────────────────────
   // Overrides de COMPOSICIÓN DE COSTO a nivel línea (Fase 2).
@@ -974,6 +1010,10 @@ export interface PricingLineSnapshot {
   discountAmount: number;
   taxAmount:      number;
   totalWithTax:   number | null;
+  /** Base ("Aplica a") del impuesto elegida por el operador en la línea,
+   *  congelada en DRAFT. confirmSale la reusa para recomputar el impuesto
+   *  sobre la MISMA base (paridad preview↔confirm). null = sin override. */
+  manualTaxAppliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
 
   // ── Fuente del precio ─────────────────────────────────────────────────────
   priceSource: string;
@@ -1012,6 +1052,8 @@ export interface PricingLineSnapshot {
     /** Sprint 1: null hasta que el motor propague purity. */
     pureGramsBase?:  number | null;
     pureGramsSale?:  number | null;
+    /** FASE F3 — costo del metal sin merma comercial. Aditivo y opcional. */
+    metalCostBase?:  number | null;
     source?:         string;
   } | null;
 
@@ -1053,6 +1095,37 @@ export interface PricingLineSnapshot {
    *  `final` y `salePreManualDiscount`. Es el mismo shape que
    *  `SalePriceResult.componentSaleBreakdown` pero serializado plano. */
   componentSaleBreakdown?: ComponentSaleDetail | null;
+
+  // ── F17 (snapshot v7) — impuestos de costo persistidos ────────────────────
+  // Espejo del bloque que `computePurchaseTaxes()` devuelve. Se persiste
+  // tal cual al confirmar para que un reader histórico pueda mostrar
+  // "Costo con impuestos" sin recomputar (POLICY: snapshots inmutables).
+  // Aditivo y opcional: snapshots v6 sin estos campos los leen como
+  // `undefined` y la UI los trata como `null` (no muestra "Costo con
+  // impuestos").
+  //
+  // Reglas semánticas (definidas por `computePurchaseTaxes`):
+  //   · costBase = unitCost POST-ajuste-global del artículo (sin impuestos).
+  //   · costTaxAmount = suma de impuestos donde `appliesOnPurchase=true`
+  //     y `isRecoverable=false`. Impuestos recuperables NO suman.
+  //   · costWithTax = costBase + costTaxAmount.
+  //   · costTaxBreakdown = array con desglose por impuesto resuelto al
+  //     momento del snapshot (no se recomputa en confirm).
+  /** Costo base (post-ajuste global) en string Decimal con 4 decimales. */
+  costBase?: string | null;
+  /** Suma de impuestos de costo en string Decimal con 4 decimales. */
+  costTaxAmount?: string | null;
+  /** costBase + costTaxAmount en string Decimal con 4 decimales. */
+  costWithTax?: string | null;
+  /** Desglose por impuesto (resuelto al snapshot). */
+  costTaxBreakdown?: Array<{
+    taxId:           string;
+    name:            string;
+    calculationType: string;
+    rate:            number | null;
+    fixedAmount:     number | null;
+    taxAmount:       number;
+  }>;
 
   // ── Timestamp ISO-8601 del momento en que se congeló el precio ────────────
   resolvedAt: string;
@@ -1146,6 +1219,24 @@ export interface SnapshotCompositionMetalItem {
    * Garantiza Σ metals[i].lineSale === metalHechuraBreakdown.metalSale.
    */
   lineSale?:         number | null;
+  /**
+   * FASE F2 — origen de la merma efectiva aplicada por el motor.
+   *   · "costLineOverride" → override manual del operador en la factura.
+   *   · "entity"           → `EntityMermaOverride` del cliente para esa variante.
+   *   · "line"             → merma del catálogo (`ArticleCostLine.mermaPercent`).
+   *   · "default"          → no había merma (efectiva = 0).
+   * Aditivo y opcional. Snapshots viejos sin este campo lo leen como
+   * undefined → el frontend cae a no mostrar badge.
+   */
+  mermaSource?:      "costLineOverride" | "entity" | "line" | "default" | null;
+  /**
+   * FASE F3 — costo de la línea **antes de aplicar merma comercial**.
+   * Fórmula: `appliedGrams × quotePrice`. Aditivo y opcional. Útil para
+   * mostrar el "metal puro" en headers/tooltips sin que el frontend
+   * recalcule. `null` cuando falta alguno de los dos componentes (snapshots
+   * legacy pre-Fase 2.3 sin `quotePrice`).
+   */
+  lineCostBase?:     number | null;
 }
 
 /**
@@ -1240,5 +1331,12 @@ export interface SnapshotComposition {
  *                  post-validación + post-merge con legacy). La
  *                  `composition` ya refleja el resultado post-override
  *                  (no requiere campo nuevo). Aditivo: snapshots v5 sin
- *                  el array se leen con `costLineOverridesApplied=undefined`. */
-export const PRICING_LINE_SNAPSHOT_VERSION = 6;
+ *                  el array se leen con `costLineOverridesApplied=undefined`.
+ *  v7 (F17) — agrega `costBase`, `costTaxAmount`, `costWithTax`,
+ *                  `costTaxBreakdown[]` para que el snapshot persista los
+ *                  impuestos de costo resueltos al momento del confirm.
+ *                  Los emite `computePurchaseTaxes` (sale.ts). Snapshots
+ *                  v6 sin estos campos los leen como `undefined` → UI
+ *                  los trata como `null` (no muestra "Costo con
+ *                  impuestos"). Aditivo, sin cambio en totales/precio. */
+export const PRICING_LINE_SNAPSHOT_VERSION = 7;

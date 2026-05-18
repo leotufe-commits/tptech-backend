@@ -183,7 +183,7 @@ describe("extractCompositionItems — catalog map opcional", () => {
 
   it("baseline correct: con catalog map, prefiere catalog code/name sobre meta", () => {
     const catalog = new Map([
-      ["art-1", { code: "CATALOG-CODE", name: "Catalog Name Resolved", sku: "CAT-SKU" }],
+      ["art-1", { code: "CATALOG-CODE", name: "Catalog Name Resolved", sku: "CAT-SKU", unitOfMeasure: "" }],
     ]);
     const steps = [makeStep({
       value: new D(100),
@@ -201,9 +201,98 @@ describe("extractCompositionItems — catalog map opcional", () => {
     expect(item.catalogItemName).toBe("Catalog Name Resolved");
   });
 
+  it("propaga `quantityUnit` (selección del operador) para PRODUCT/SERVICE", () => {
+    const steps = [makeStep({
+      value: new D(150),
+      meta: { qty: "2", unitValue: "75", quantityUnit: "kg" },
+    })];
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT");
+    expect(item.quantityUnit).toBe("kg");
+  });
+
+  it("`quantityUnit` (cost line) y `quantityUnitName` (Article maestro) son campos independientes", () => {
+    const catalog = new Map([
+      ["art-1", { code: "P-01", name: "Componente", sku: "", unitOfMeasure: "par" }],
+    ]);
+    const steps = [makeStep({
+      value: new D(200),
+      meta: {
+        qty: "1", unitValue: "200",
+        catalogItemId: "art-1",
+        quantityUnit:  "u",      // ← selección del operador (gana en UI)
+      },
+    })];
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT", catalog);
+    // Ambos campos llegan al composition — la UI decide cuál usar.
+    expect(item.quantityUnit).toBe("u");
+    expect(item.quantityUnitName).toBe("par");
+  });
+
+  it("propaga `unitValueBase = unitValue × rate` para PRODUCT/SERVICE", () => {
+    const steps = [makeStep({
+      value: new D(33_801),
+      meta: {
+        qty:       "1",
+        unitValue: "75.76",
+        rate:      "446",
+        currencyCode:   "USD",
+        currencySymbol: "US$",
+      },
+    })];
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT");
+    expect(item.unitValueBase).toBeCloseTo(75.76 * 446, 2);
+    expect(item.unitValue).toBe(75.76);
+  });
+
+  it("propaga `currencyCode/Symbol` cuando el step trae conversionMeta", () => {
+    const steps = [makeStep({
+      value: new D(100),
+      meta:  {
+        qty:           "1",
+        unitValue:     "75.76",
+        catalogItemId: "art-1",
+        currencyId:    "cur-usd",
+        // Inyectado por el motor vía spread de conversionMeta.
+        currencyCode:   "USD",
+        currencySymbol: "US$",
+        rate:           "1332.5",
+        fromCurrencyId: "cur-usd",
+      },
+    })];
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT");
+    expect(item.currencyCode).toBe("USD");
+    expect(item.currencySymbol).toBe("US$");
+  });
+
+  it("propaga `quantityUnitName` desde catalogItem.unitOfMeasure", () => {
+    const catalog = new Map([
+      ["art-1", { code: "P-01", name: "Cadena 60cm", sku: "P-01", unitOfMeasure: "par" }],
+    ]);
+    const steps = [makeStep({
+      value: new D(150),
+      meta:  { qty: "1", unitValue: "150", catalogItemId: "art-1" },
+    })];
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT", catalog);
+    expect(item.quantityUnitName).toBe("par");
+  });
+
+  it("backward compat: sin conversionMeta y sin unitOfMeasure → campos opcionales omitidos", () => {
+    const catalog = new Map([
+      ["art-1", { code: "P-01", name: "X", sku: "", unitOfMeasure: "" }],
+    ]);
+    const steps = [makeStep({
+      value: new D(100),
+      meta:  { qty: "1", unitValue: "100", catalogItemId: "art-1" },
+    })];
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT", catalog);
+    expect(item).not.toHaveProperty("currencyCode");
+    expect(item).not.toHaveProperty("currencySymbol");
+    expect(item).not.toHaveProperty("quantityUnitName");
+  });
+
   it("baseline correct: catalog map sin entrada para el id, cae a meta", () => {
     const catalog = new Map([
-      ["other-id", { code: "X", name: "Y", sku: "" }],
+      ["other-id", { code: "X", name: "Y", sku: "", unitOfMeasure: "" }],
     ]);
     const steps = [makeStep({
       value: new D(100),

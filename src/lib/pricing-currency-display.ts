@@ -255,6 +255,15 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
   if (Array.isArray(comp.metals)) {
     for (const m of comp.metals) {
       convertFieldNumber(m, "lineCost", rate);
+      // F1.5 #A++ FIX — `lineSale` (sale-side per cost-line, passthrough del
+      // motor, BASE) es monetario y DEBE convertirse igual que `lineCost`.
+      // Sin esto, en multimoneda `lineCost` queda en moneda display y
+      // `lineSale` en BASE → el margen por fila se calcula mezclando
+      // monedas (`(saleBASE − costDISPLAY)/costDISPLAY`) y explota a
+      // valores absurdos (+295.900%). Además rompe la invariante
+      // documentada `Σ metals[i].lineSale === metalHechuraBreakdown.metalSale`
+      // (metalSale SÍ se convierte, ver convertMetalHechuraBreakdownInPlace).
+      convertFieldNumber(m, "lineSale", rate);
       // Fase 2.3 — `quotePrice` (precio por gramo BASE pre-merma) es
       // monetario y necesita conversión. Sin esto, VAL. UNIT. METAL
       // queda en moneda base mientras el resto del response viene en la
@@ -267,6 +276,9 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
     for (const h of comp.hechuras) {
       convertFieldNumber(h, "appliedAmount", rate);
       convertFieldNumber(h, "lineCost",      rate);
+      // F1.5 #A+ FIX — `lineSale` monetario (mismo motivo que metals[]):
+      // sin convertir, el margen por fila mezcla USD/ARS.
+      convertFieldNumber(h, "lineSale",      rate);
       // Fase 2.3.1 — `unitValue` BASE pre-ajuste es monetario.
       convertFieldNumber(h, "unitValue",     rate);
       // Fase 2.2 — monto absoluto del ajuste de HECHURA. Mismo tratamiento
@@ -292,6 +304,10 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
     for (const it of items) {
       convertFieldNumber(it, "unitValue",     rate);
       convertFieldNumber(it, "totalValue",    rate);
+      // F1.5 #A+ FIX — `lineSale` monetario (passthrough motor, BASE). Sin
+      // convertir, PRODUCT/SERVICE muestran margen con monedas mezcladas y
+      // rompen `Σ lineSale === hechuraSale` en multimoneda.
+      convertFieldNumber(it, "lineSale",      rate);
       convertFieldNumber(it, "lineAdjAmount", rate);
       // lineAdjValue: convertir SOLO si es FIXED_AMOUNT (es monto, no %).
       if (it?.lineAdjType === "FIXED_AMOUNT") {

@@ -123,6 +123,23 @@ export type CompositionMetalItem = {
    * lineCost === appliedGrams × quotePrice × (1 + appliedMermaPct/100).
    */
   quotePrice:        number | null;
+  /**
+   * FASE F2 — origen de la merma efectiva aplicada por el motor.
+   * Passthrough de `step.meta.mermaSource`:
+   *   · "costLineOverride" → override manual del operador.
+   *   · "entity"           → `EntityMermaOverride` del cliente.
+   *   · "line"             → catálogo (`ArticleCostLine.mermaPercent`).
+   *   · "default"          → sin merma (0).
+   * Aditivo y opcional para mantener compat con steps viejos.
+   */
+  mermaSource?:      "costLineOverride" | "entity" | "line" | "default" | null;
+  /**
+   * FASE F3 — costo de la línea **sin merma comercial**.
+   * = `appliedGrams × quotePrice` cuando ambos están disponibles, si no `null`.
+   * Aditivo y opcional. Permite al frontend mostrar "Metal puro" en el
+   * header del grupo METALES sin recalcular nada.
+   */
+  lineCostBase?:     number | null;
 };
 
 /**
@@ -149,6 +166,19 @@ export type CompositionHechuraItem = {
    * lineCost (post-ajuste) === unitValue × qty + lineAdjAmount (signed).
    */
   unitValue:         number | null;
+  /**
+   * `unitValue × rate` — costo unitario en moneda BASE, **post-conversión**
+   * pero **pre-ajuste**. Display-only — el motor ya tiene ambos factores
+   * separados (`meta.unitValue` + `meta.rate`); este campo es la
+   * multiplicación trivial. Permite que la UI muestre "USD 75,76 ≈ ARS X"
+   * como conversión directa sin incluir el ajuste de la columna Merma/Ajuste,
+   * evitando la percepción de doble descuento.
+   *
+   * Cuando no hubo conversión (cost line en moneda base) `unitValueBase`
+   * coincide con `unitValue`. Cuando `unitValue` no está disponible →
+   * undefined (frontend cae al fallback anterior).
+   */
+  unitValueBase?:    number;
   /** Costo individual de esta línea = step.value del motor (en BASE).
    *  La suma de `lineCost` de todos los items === hechuraCost agregado. */
   lineCost:          number | null;
@@ -169,6 +199,36 @@ export type CompositionHechuraItem = {
   lineSale:          number | null;
   /** Etiqueta legible (label de la cost line, ej. "Mano de obra"). */
   lineLabel:         string | null;
+  /** Unidad seleccionada por el operador en el modal del artículo (`u`, `g`,
+   *  `hr`, etc., persistida en `ArticleCostLine.quantityUnit`). Display-only —
+   *  passthrough desde `step.meta.quantityUnit` que el motor emite sin
+   *  participar en cálculos. Frontend cae a fallback "Unidades" cuando es
+   *  vacío o undefined (snapshots viejos o legacy). */
+  quantityUnit?:     string;
+  /**
+   * Cantidad del cost line por unidad de artículo (= `ArticleCostLine.quantity`,
+   * con `quantityOverride` aplicado si lo hubiera). Viene de `step.meta.qty`
+   * que el motor cost ya emite — passthrough display, cero recálculo.
+   *
+   * Paridad con PRODUCT/SERVICE (que exponen `quantity` desde la primera
+   * versión). Antes el extractor descartaba este campo para HECHURA y el
+   * frontend caía a `1` hardcoded → pérdida de trazabilidad cuando un
+   * cost line tenía `qty > 1` (ej. mano de obra desglosada por horas).
+   *
+   * Opcional para compatibilidad con snapshots viejos: el frontend cae a
+   * `1` cuando este campo no está. */
+  quantity?:         number;
+  /** Id de la moneda original del cost line (= `ArticleCostLine.currencyId`).
+   *  Sólo se emite cuando el motor registra `fromCurrencyId` en `conversionMeta`
+   *  (es decir, hubo conversión efectiva a moneda base). Snapshots sin
+   *  conversión efectiva o sin el campo → frontend cae a moneda del documento. */
+  currencyId?:       string | null;
+  /** Code ISO de la moneda original (ej. "USD"). Passthrough display desde
+   *  `step.meta.currencyCode` cuando hubo conversión. */
+  currencyCode?:     string | null;
+  /** Símbolo de la moneda original (ej. "US$"). Passthrough display desde
+   *  `step.meta.currencySymbol`. */
+  currencySymbol?:   string | null;
   // Fase 2.2 — paridad con PRODUCT/SERVICE: el motor cost SÍ emite
   // `meta.lineAdjKind/Type/Value/Amount` para HECHURA cuando la cost line
   // del artículo trae ajuste configurado. Antes el extractor los descartaba
@@ -266,10 +326,29 @@ export type CompositionItemBlock = {
   quantity:         number;
   /** Valor unitario en moneda del componente. */
   unitValue:        number;
+  /** Unidad seleccionada por el operador en el modal del artículo
+   *  (`u`, `g`, `hr`, etc.). Passthrough display desde `step.meta.quantityUnit`. */
+  quantityUnit?:    string;
+  /**
+   * `unitValue × rate` — display-only, costo unitario en moneda BASE
+   * post-conversión, pre-ajuste. Ver `CompositionHechuraItem.unitValueBase`. */
+  unitValueBase?:   number;
   /** Total del item = quantity × unitValue (lo computa el motor en step.value). */
   totalValue:       number;
   /** Moneda original del componente (null = moneda base del tenant). */
   currencyId:       string | null;
+  /** Code ISO de la moneda original (ej. "USD"). Passthrough display desde
+   *  `step.meta.currencyCode` cuando el motor registró conversión. Opcional —
+   *  cuando es null el frontend asume moneda base del documento. */
+  currencyCode?:    string | null;
+  /** Símbolo de la moneda original (ej. "US$"). Passthrough display desde
+   *  `step.meta.currencySymbol`. Opcional. */
+  currencySymbol?:  string | null;
+  /** Unidad de medida del Article referenciado (`Article.unitOfMeasure`, ej.
+   *  "unidad", "par", "set"). Resuelto desde el catalog map para que la UI
+   *  no dependa del catálogo del tenant. null cuando el catalog map no lo
+   *  resolvió o el Article maestro no la tenía definida. */
+  quantityUnitName?: string | null;
   /** Tipo de ajuste per-línea ("BONUS" o "SURCHARGE"), si lo hay. */
   lineAdjKind:      "BONUS" | "SURCHARGE" | null;
   /** Tipo del valor del ajuste ("PERCENTAGE" o "FIXED_AMOUNT"). */
@@ -486,22 +565,27 @@ export async function fetchMetalVariantInfoMap(
 async function loadCatalogItemsByIds(
   jewelryId: string,
   ids: Set<string>,
-): Promise<Map<string, { code: string; name: string; sku: string }>> {
-  const empty = new Map<string, { code: string; name: string; sku: string }>();
+): Promise<Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>> {
+  const empty = new Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>();
   if (!jewelryId || ids.size === 0) return empty;
 
   try {
     const items = await prisma.article.findMany({
       where:  { jewelryId, id: { in: [...ids] }, deletedAt: null },
-      select: { id: true, code: true, name: true, sku: true },
+      select: { id: true, code: true, name: true, sku: true, unitOfMeasure: true },
     });
-    const map = new Map<string, { code: string; name: string; sku: string }>();
+    const map = new Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>();
     for (const a of items) {
       map.set(a.id, {
         code: a.code ?? "",
         name: a.name ?? "",
         // Fase 2.4 — `Article.sku` (nullable en schema, queda "" como fallback).
         sku:  a.sku  ?? "",
+        // Unidad de medida del Article referenciado — sólo aplica a PRODUCT/SERVICE
+        // (cost lines que referencian otro Article del catálogo). HECHURA / METAL
+        // no usan este campo (METAL es siempre gramos, HECHURA no tiene unidad).
+        // Fallback "" cuando el Article maestro no la definió.
+        unitOfMeasure: (a as { unitOfMeasure?: string }).unitOfMeasure ?? "",
       });
     }
     return map;
@@ -532,9 +616,9 @@ async function loadCatalogItemsByIds(
 export async function buildCatalogItemsMapForSteps(
   jewelryId: string,
   steps: PricingStep[] | null | undefined,
-): Promise<Map<string, { code: string; name: string; sku: string }>> {
+): Promise<Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>> {
   if (!Array.isArray(steps) || steps.length === 0) {
-    return new Map<string, { code: string; name: string; sku: string }>();
+    return new Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>();
   }
   const ids = new Set<string>();
   for (const s of steps) {
@@ -571,9 +655,9 @@ export async function buildCatalogItemsMapForSteps(
 export async function buildCatalogItemsMapForCostLines(
   jewelryId: string,
   costLinesByArticle: Array<Array<{ catalogItemId?: string | null }>> | null | undefined,
-): Promise<Map<string, { code: string; name: string; sku: string }>> {
+): Promise<Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>> {
   if (!Array.isArray(costLinesByArticle) || costLinesByArticle.length === 0) {
-    return new Map<string, { code: string; name: string; sku: string }>();
+    return new Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>();
   }
   const ids = new Set<string>();
   for (const lines of costLinesByArticle) {
@@ -624,6 +708,22 @@ export function extractCompositionMetals(
         lineCostFinite != null && metalSaleFactor != null && Number.isFinite(metalSaleFactor)
           ? lineCostFinite * metalSaleFactor
           : null;
+      // FASE F2 — propagar el origen de la merma desde el step. Valores
+      // válidos: "costLineOverride" | "entity" | "line" | "default".
+      // Steps viejos sin este campo caen a null → el frontend no muestra badge.
+      const mermaSourceRaw = typeof meta.mermaSource === "string" ? meta.mermaSource : null;
+      const mermaSource =
+        mermaSourceRaw === "costLineOverride" || mermaSourceRaw === "entity"
+          || mermaSourceRaw === "line" || mermaSourceRaw === "default"
+          ? mermaSourceRaw
+          : null;
+      // FASE F3 — costo de la línea sin merma comercial (passthrough).
+      // = appliedGrams × quotePrice cuando ambos finite; si no, null.
+      const lineCostBase =
+        qtyNum != null && Number.isFinite(qtyNum)
+          && quotePriceNum != null && Number.isFinite(quotePriceNum)
+          ? qtyNum * quotePriceNum
+          : null;
       return {
         costLineId:      typeof meta.costLineId === "string" ? meta.costLineId : null,
         metalVariantId:  variantId,
@@ -637,6 +737,8 @@ export function extractCompositionMetals(
         lineCost:        lineCostFinite,
         lineSale,
         quotePrice:      quotePriceNum != null && Number.isFinite(quotePriceNum) ? quotePriceNum : null,
+        mermaSource,
+        lineCostBase,
       };
     });
 }
@@ -683,13 +785,52 @@ export function extractCompositionHechuras(
         lineCostFinite != null && hechuraSaleFactor != null && Number.isFinite(hechuraSaleFactor)
           ? lineCostFinite * hechuraSaleFactor
           : null;
+      // Paridad con PRODUCT/SERVICE: propagamos `meta.qty` para que la UI
+      // pueda rehidratar la cantidad real del cost line (HECHURA con qty > 1).
+      // El motor ya emite `meta.qty` en cada step COST_LINES_*; este extractor
+      // solo lo pega al item. NO toca el cálculo (lineCost / lineSale / etc.).
+      const qtyRaw = meta.qty != null ? Number(meta.qty) : null;
+      const quantity = qtyRaw != null && Number.isFinite(qtyRaw) ? qtyRaw : undefined;
+      // Unidad seleccionada por el operador en el modal — passthrough display.
+      const quantityUnit = typeof meta.quantityUnit === "string" && meta.quantityUnit.length > 0
+        ? meta.quantityUnit
+        : undefined;
+      // Moneda original — el motor inyecta `fromCurrencyId`, `currencyCode` y
+      // `currencySymbol` en `step.meta` SOLO cuando hubo conversión efectiva
+      // (cost line en moneda != base). Snapshots sin conversión los omiten.
+      const currencyId     = typeof meta.fromCurrencyId === "string" && meta.fromCurrencyId.length > 0
+        ? meta.fromCurrencyId
+        : (typeof (meta as any).currencyId === "string" && (meta as any).currencyId.length > 0
+            ? (meta as any).currencyId
+            : null);
+      const currencyCode   = typeof meta.currencyCode   === "string" && meta.currencyCode.length   > 0
+        ? meta.currencyCode   : null;
+      const currencySymbol = typeof meta.currencySymbol === "string" && meta.currencySymbol.length > 0
+        ? meta.currencySymbol : null;
+      // Display-only — `unitValue × rate`, costo unitario en moneda BASE
+      // post-conversión y PRE-ajuste. Si no hubo conversión, rate=1 → coincide
+      // con `unitValue`. Multiplicación trivial sobre dos passthrough del motor;
+      // NO recalcula precios comerciales.
+      const rateRaw = (meta as { rate?: unknown }).rate;
+      const rate    = rateRaw != null && Number.isFinite(Number(rateRaw))
+        ? Number(rateRaw)
+        : 1;
+      const unitValueBase = unitValueRaw != null && Number.isFinite(unitValueRaw)
+        ? unitValueRaw * rate
+        : undefined;
       return {
         costLineId:    typeof meta.costLineId === "string" ? meta.costLineId : null,
         appliedAmount: lineCostFinite,
         unitValue:     unitValueRaw != null && Number.isFinite(unitValueRaw) ? unitValueRaw : null,
+        ...(unitValueBase != null && Number.isFinite(unitValueBase) ? { unitValueBase } : {}),
         lineCost:      lineCostFinite,
         lineSale,
         lineLabel,
+        ...(quantity != null ? { quantity } : {}),
+        ...(quantityUnit != null ? { quantityUnit } : {}),
+        ...(currencyId     != null ? { currencyId }     : {}),
+        ...(currencyCode   != null ? { currencyCode }   : {}),
+        ...(currencySymbol != null ? { currencySymbol } : {}),
         lineAdjKind:   adjKind,
         lineAdjType:   adjType,
         lineAdjValue:  meta.lineAdjValue  != null ? Number(meta.lineAdjValue)  : null,
@@ -723,7 +864,7 @@ export function extractCompositionHechuras(
 export function extractCompositionItems(
   steps: PricingStep[] | null | undefined,
   targetKey: "COST_LINES_PRODUCT" | "COST_LINES_SERVICE",
-  catalogItems?: Map<string, { code: string; name: string; sku: string }>,
+  catalogItems?: Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>,
   hechuraSaleFactor: number | null = null,
 ): CompositionItemBlock[] {
   if (!Array.isArray(steps) || steps.length === 0) return [];
@@ -767,6 +908,30 @@ export function extractCompositionItems(
           ? totalValueFinite * hechuraSaleFactor
           : null;
 
+      // Moneda original — passthrough display desde `step.meta.currencyCode`
+      // y `currencySymbol` que el motor cost inyecta (vía spread de
+      // `conversionMeta`) cuando el cost line está en moneda != base.
+      const currencyCode   = typeof meta.currencyCode   === "string" && meta.currencyCode.length   > 0
+        ? meta.currencyCode   : null;
+      const currencySymbol = typeof meta.currencySymbol === "string" && meta.currencySymbol.length > 0
+        ? meta.currencySymbol : null;
+      // Display-only — `unitValue × rate`, costo unitario en moneda BASE
+      // post-conversión y PRE-ajuste. Ver `CompositionHechuraItem.unitValueBase`.
+      const rateRawP = (meta as { rate?: unknown }).rate;
+      const rateP    = rateRawP != null && Number.isFinite(Number(rateRawP))
+        ? Number(rateRawP)
+        : 1;
+      const unitValueBase = Number.isFinite(unitValue) ? unitValue * rateP : undefined;
+      // Unidad — se resuelve desde el catalog map (`Article.unitOfMeasure`
+      // del componente referenciado). Sólo aplica a PRODUCT/SERVICE.
+      const quantityUnitName = catalogInfo?.unitOfMeasure && catalogInfo.unitOfMeasure.length > 0
+        ? catalogInfo.unitOfMeasure
+        : null;
+      // Unidad seleccionada por el operador en la línea de costo (gana sobre
+      // la unidad del Article maestro). Passthrough display.
+      const quantityUnit = typeof meta.quantityUnit === "string" && meta.quantityUnit.length > 0
+        ? meta.quantityUnit
+        : undefined;
       return {
         costLineId:       (meta.costLineId ?? null) as string | null,
         catalogItemId:    catalogId,
@@ -779,9 +944,14 @@ export function extractCompositionItems(
                           : null,
         catalogItemName:  catalogInfo?.name ?? lineLabelFromMeta ?? fallbackLabel,
         quantity:         Number.isFinite(qty)       ? qty       : 0,
+        ...(quantityUnit != null ? { quantityUnit } : {}),
         unitValue:        Number.isFinite(unitValue) ? unitValue : 0,
+        ...(unitValueBase != null && Number.isFinite(unitValueBase) ? { unitValueBase } : {}),
         totalValue:       Number.isFinite(totalValue) ? totalValue : 0,
         currencyId:       (meta.currencyId ?? null) as string | null,
+        ...(currencyCode     != null ? { currencyCode }     : {}),
+        ...(currencySymbol   != null ? { currencySymbol }   : {}),
+        ...(quantityUnitName != null ? { quantityUnitName } : {}),
         lineAdjKind:      adjKind,
         lineAdjType:      adjType,
         lineAdjValue:     meta.lineAdjValue != null ? Number(meta.lineAdjValue) : null,
@@ -937,7 +1107,7 @@ export function computeHechuraSaleFactor(
 export function buildComposition(
   result: SalePriceResult,
   mvi: MetalVariantInfo,
-  catalogItems?: Map<string, { code: string; name: string; sku: string }>,
+  catalogItems?: Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>,
   metalVariantInfoMap?: Map<string, MetalVariantInfo>,
 ): Composition {
   const ctx = result.costOverrideContext;

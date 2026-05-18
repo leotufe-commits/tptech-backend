@@ -54,6 +54,12 @@ vi.mock("../../../lib/pricing-engine/pricing-engine.js", () => ({
   // sin metalHechuraBreakdown como agregados=0; no afecta los assertions
   // existentes de este archivo de tests).
   deriveMetalHechuraBreakdown:    () => null,
+  // F17 — sales.service ahora llama computePurchaseTaxes en
+  // getLinePricingSnapshotForConfirm (legacy recompute path) para que el
+  // snapshot v7 persistido incluya el bloque de impuestos de costo.
+  computePurchaseTaxes: vi.fn().mockResolvedValue({
+    costBase: null, costTaxAmount: null, costWithTax: null, costTaxBreakdown: [],
+  }),
 }));
 
 vi.mock("../../../lib/pricing-engine/pricing-engine.currency.js", () => ({

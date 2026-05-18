@@ -761,7 +761,7 @@ export async function confirmSale(
           // costLineId y el match `unifyCostLineOverrides` falla → overrides
           // ignorados al recomputar costo → margen inconsistente.
           id: true,
-          type: true, label: true, quantity: true, unitValue: true, currencyId: true,
+          type: true, label: true, quantity: true, quantityUnit: true, unitValue: true, currencyId: true,
           mermaPercent: true, metalVariantId: true, lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
           catalogItemId: true, catalogVariantId: true, affectsStock: true,
         },
@@ -890,6 +890,13 @@ export async function confirmSale(
         costResult.breakdown ?? null,
         clientTaxApplyOnOverride,
         clientTaxOverrides,
+        // 9º — confirm no recibe override de valor por línea (limitación
+        // preexistente; el precio/descuento ya está frozen en el snapshot).
+        null,
+        // 10º — base ("Aplica a") congelada en el snapshot del DRAFT, para
+        // que el impuesto se recompute sobre la MISMA base que el preview
+        // (paridad preview↔confirm del override de base).
+        (snap as any).manualTaxAppliesTo ?? null,
       );
 
       const lineTaxAmt = parseFloat(taxAmount.toString());
@@ -944,6 +951,11 @@ export async function confirmSale(
             : (frozenCostLineOverrides && frozenCostLineOverrides.length > 0
                 ? { costLineOverridesApplied: frozenCostLineOverrides }
                 : {})),
+        // Preservar la base ("Aplica a") congelada del DRAFT en el snapshot
+        // CONFIRMED — así un re-confirm / recompute reproduce idéntico.
+        ...((snap as any).manualTaxAppliesTo != null
+          ? { manualTaxAppliesTo: (snap as any).manualTaxAppliesTo }
+          : {}),
         resolvedAt,
       };
 
@@ -1761,6 +1773,13 @@ export type DraftSaleLineInput = {
   metalVariantIdOverride?: string | null;
   hechuraOverrideAmount?:  number | null;
   costLineOverrides?:      CostLineOverride[];
+  /** Override de SOLO la base ("Aplica a") del descuento del cliente,
+   *  independiente del valor. Persiste vía snapshot para paridad confirm. */
+  manualDiscountAppliesToOverride?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
+  /** Override de SOLO la base ("Aplica a") del impuesto heredado,
+   *  independiente del valor. Persiste en el snapshot para que confirmSale
+   *  recompute el impuesto sobre la misma base (paridad preview↔confirm). */
+  manualTaxAppliesToOverride?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
 };
 
 export type DraftSaleLineOpts = {
@@ -1880,6 +1899,10 @@ export async function resolveDraftSaleLinesPricing(
         metalVariantIdOverride: line.metalVariantIdOverride ?? null,
         hechuraOverrideAmount:  line.hechuraOverrideAmount  ?? null,
         costLineOverrides:      line.costLineOverrides,
+        // Override de SOLO la base del descuento del cliente — afecta el
+        // unitPrice congelado en DRAFT (paridad con preview).
+        discountAppliesToOverride: line.manualDiscountAppliesToOverride ?? null,
+        taxAppliesToOverride:      line.manualTaxAppliesToOverride      ?? null,
         suppressListDeferredRounding,
       });
 
@@ -1954,7 +1977,26 @@ export async function resolveDraftSaleLinesPricing(
           err,
         );
       }
-      const pricingSnapshot = buildPricingSnapshot(result, { composition });
+
+      // F17 — paridad preview/confirm. computePurchaseTaxes corre acá también
+      // para que el snapshot v7 persistido en DRAFT incluya costBase/
+      // costTaxAmount/costWithTax/costTaxBreakdown idénticos a los del
+      // preview. La base es `result.unitCost` (post-ajuste global).
+      const draftCostTaxResult = await computePurchaseTaxes(
+        jewelryId,
+        line.articleId,
+        result.unitCost ?? null,
+      );
+      const pricingSnapshot = buildPricingSnapshot(result, {
+        composition,
+        purchaseTaxes: draftCostTaxResult,
+      });
+      // Persistir la base ("Aplica a") del impuesto elegida por el operador,
+      // para que confirmSale recompute el impuesto sobre la MISMA base
+      // (paridad preview↔confirm). El descuento ya quedó congelado en
+      // unitPrice (resuelto arriba con discountAppliesToOverride).
+      (pricingSnapshot as any).manualTaxAppliesTo =
+        line.manualTaxAppliesToOverride ?? null;
 
       return {
         articleId:           line.articleId,
@@ -2102,7 +2144,18 @@ export async function getLinePricingSnapshotForConfirm(
     };
   }
 
-  return { snapshot: buildPricingSnapshot(result), recomputed: true };
+  // F17 — para snapshots recomputados en confirm (legacy fallback), también
+  // resolvemos costBase/costTaxAmount/costWithTax/costTaxBreakdown para que
+  // el snapshot v7 quede consistente.
+  const recomputeCostTax = await computePurchaseTaxes(
+    jewelryId,
+    line.articleId,
+    result.unitCost ?? null,
+  );
+  return {
+    snapshot: buildPricingSnapshot(result, { purchaseTaxes: recomputeCostTax }),
+    recomputed: true,
+  };
 }
 
 // ─── Sale Preview ─────────────────────────────────────────────────────────────
@@ -2133,14 +2186,20 @@ export type SalePreviewLineInput = {
   manualDiscountOverride?: {
     mode:      "PERCENT" | "AMOUNT";
     value:     number;
-    appliesTo?: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL";
+    appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
   } | null;
   /** Override manual de impuesto por línea. Reemplaza el tax automático. */
   taxOverride?: {
     mode:      "PERCENT" | "AMOUNT";
     value:     number;
-    appliesTo?: "METAL" | "HECHURA" | "PRODUCT" | "SERVICE" | "TOTAL";
+    appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
   } | null;
+  /** Override de SOLO la base ("Aplica a") del descuento heredado del
+   *  cliente, independiente del valor. Ver `SalePriceOpts.discountAppliesToOverride`. */
+  manualDiscountAppliesToOverride?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
+  /** Override de SOLO la base ("Aplica a") del impuesto heredado,
+   *  independiente del valor. Ver `SalePriceOpts.taxAppliesToOverride`. */
+  manualTaxAppliesToOverride?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
   /** Fase 2A.7 — override de lista de precios a nivel línea. Tiene
    *  precedencia sobre el `priceListId` doc-level. Si ambos vienen vacíos,
    *  el motor resuelve por jerarquía cliente → categoría → favorita. */
@@ -2281,6 +2340,10 @@ export type SalePreviewLine = {
   unitCost:             number | null;
   unitMargin:           number | null;
   marginPercent:        number | null;
+  /** Markup % sobre costo. Provisto por el motor para que el frontend no
+   *  recalcule (POLICY R6 — frontend lector puro). Derivable de unitCost/
+   *  unitMargin pero no se persiste en pricingSnapshot. Null si sin costo. */
+  markupPercent:        number | null;
   costPartial:          boolean;
   costMode:             string;
 
@@ -2439,7 +2502,7 @@ export async function previewSale(
               // F1.3 G4.1.2 — `id` necesario para que step.meta.costLineId
               // se propague (trazabilidad estable, snapshot-safe).
               id: true,
-              type: true, label: true, quantity: true, unitValue: true, currencyId: true,
+              type: true, label: true, quantity: true, quantityUnit: true, unitValue: true, currencyId: true,
               mermaPercent: true, metalVariantId: true, lineAdjKind: true, lineAdjType: true, lineAdjValue: true,
               catalogItemId: true, affectsStock: true,
             },
@@ -2565,6 +2628,7 @@ export async function previewSale(
           unitCost:             null,
           unitMargin:           null,
           marginPercent:        null,
+          markupPercent:        null,
           costPartial:          true,
           costMode:             "NONE",
           partial:              false,
@@ -2603,6 +2667,7 @@ export async function previewSale(
           unitCost:             null,
           unitMargin:           null,
           marginPercent:        null,
+          markupPercent:        null,
           costPartial:          true,
           costMode:             "NONE",
           policy:               { canConfirm: true, blockingAlerts: [] },
@@ -2641,6 +2706,9 @@ export async function previewSale(
         manualPriceOverride:    line.manualPriceOverride    ?? null,
         manualDiscountOverride: line.manualDiscountOverride ?? null,
         taxOverride:            line.taxOverride            ?? null,
+        // Override de SOLO la base ("Aplica a"), independiente del valor.
+        discountAppliesToOverride: line.manualDiscountAppliesToOverride ?? null,
+        taxAppliesToOverride:      line.manualTaxAppliesToOverride      ?? null,
         // Fase 2A.7 — override de lista por línea (toma precedencia).
         priceListIdOverride:    effectivePriceListOverride,
         // Fase 3B — overrides de composición de costo por línea. El motor
@@ -2696,7 +2764,20 @@ export async function previewSale(
       let taxBreakdownArr: any[] = [];
       if (unitPrice != null && art && !clientTaxExempt) {
         const taxIds: string[] = ((art as any).manualTaxIds ?? []) as string[];
-        if (taxIds.length > 0) {
+        // Override manual de impuesto por línea (Factura). Tiene PRIORIDAD
+        // absoluta sobre el impuesto heredado del artículo (`manualTaxIds`):
+        // `computeLineTaxes` lo resuelve antes de tocar `taxIds`. Por eso el
+        // bloque debe ejecutarse también cuando NO hay taxIds heredados pero
+        // sí hay override (ej. artículo sin IVA y el operador fija 10%), y
+        // cuando hay override 0 explícito (limpiar impuesto). Antes este
+        // recompute OMITÍA el 9º argumento → el motor caía al IVA heredado y
+        // el override del operador se perdía (bug confirmado por logs).
+        const lineTaxOverride   = line.taxOverride ?? null;
+        // Override de SOLO la base ("Aplica a") del impuesto heredado.
+        // El recompute debe correr también cuando solo cambió la base
+        // (sin override de valor) para que el preview recalcule al toque.
+        const lineTaxAppliesTo  = line.manualTaxAppliesToOverride ?? null;
+        if (taxIds.length > 0 || lineTaxOverride != null || lineTaxAppliesTo != null) {
           const unitPriceDec = new Prisma.Decimal(unitPrice);
           const basePriceDec = new Prisma.Decimal(basePrice ?? unitPrice);
           const mhForTax = pricing.metalHechuraBreakdown
@@ -2714,6 +2795,12 @@ export async function previewSale(
             costBreakdown,
             clientTaxApplyOnOverride,
             clientTaxOverrides,
+            // 9º arg — override manual de la línea. Sin esto el motor
+            // ignoraba el override y devolvía el IVA heredado 21%.
+            lineTaxOverride,
+            // 10º arg — override de SOLO la base ("Aplica a"). Recalcula
+            // el impuesto heredado sobre esa base sin tocar la tasa.
+            lineTaxAppliesTo,
           );
           unitTaxAmount   = parseFloat(taxAmount.toString());
           // Escalar `base` y `taxAmount` de cada item por la cantidad de la
@@ -2800,24 +2887,33 @@ export async function previewSale(
         );
       }
 
+      // Fase 2A.7 — paridad con `articles/pricing-preview`.
+      // 1) Costo de compra por línea (mismo helper que articles).
+      // F17 — se calcula ANTES de armar el snapshot para que `buildPricingSnapshot`
+      // lo persista en `costBase/costTaxAmount/costWithTax/costTaxBreakdown`
+      // (snapshot v7). La base es `pricing.unitCost`, que ya es post-ajuste
+      // global del artículo (manualAdjustment* aplicado por el motor).
+      const costTaxResult = await computePurchaseTaxes(
+        jewelryId,
+        line.articleId,
+        pricing.unitCost ?? null,
+      );
+
       // Snapshot reusable — lo mismo que createSale persiste en DRAFT.
       // F1.3 G4.x #5b — pasamos `composition` para que viaje en el snapshot
       // (igual al de DRAFT). El motor ya provee componentSaleBreakdown.
-      const pricingSnapshotForLine = buildPricingSnapshot(pricing, { composition });
+      // F17 — pasamos `purchaseTaxes` para persistir costBase/costTaxAmount/
+      // costWithTax/costTaxBreakdown en el snapshot v7.
+      const pricingSnapshotForLine = buildPricingSnapshot(pricing, {
+        composition,
+        purchaseTaxes: costTaxResult,
+      });
       // El snapshot del motor ya trae `totalWithTax` UNITARIO REDONDEADO
       // (preservando applyRounding cuando la lista aplica `applyOn=TOTAL`).
       // NO pisarlo: antes lo reescribíamos como `unitPrice + unitTaxAmount`
       // y perdíamos el redondeo. Solo sincronizamos `taxAmount` con el
       // cálculo local de previewSale (ya consistente con el motor).
       pricingSnapshotForLine.taxAmount = unitTaxAmount;
-
-      // Fase 2A.7 — paridad con `articles/pricing-preview`.
-      // 1) Costo de compra por línea (mismo helper que articles).
-      const costTaxResult = await computePurchaseTaxes(
-        jewelryId,
-        line.articleId,
-        pricing.unitCost ?? null,
-      );
       const appliedMermaPercent   = getAppliedMermaPercent(pricing);
 
       // FASE 1.1 G7 — flags explícitos de qué overrides aplicó el operador a
@@ -2871,6 +2967,7 @@ export async function previewSale(
         unitCost:             n2(pricing.unitCost),
         unitMargin:           n2(pricing.unitMargin),
         marginPercent:        n2(pricing.marginPercent),
+        markupPercent:        n2(pricing.markupPercent),
         costPartial:          pricing.costPartial,
         costMode:             pricing.costMode,
         policy:               pricing.policy,
@@ -3028,6 +3125,7 @@ export async function previewSale(
   }
 
   // ── Totales del documento — fuente única (Fase 4) ────────────────────────
+
   // Mismo motor que `confirmSale` usa.
   // FASE 2 — propagamos el breakdown Metal/Hechura por línea (per-unit ×
   // qty) para que el motor agregue `metalCostSubtotal` / `metalSaleSubtotal`
