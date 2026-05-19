@@ -2370,6 +2370,19 @@ export async function resolveFinalSalePrice(
   // ── PASO 5: Impuestos ──────────────────────────────────────────────────────
   // entityTaxExempt y entityTaxApplyOnOverride ya se cargaron en PASO 4b
 
+  // La exención del cliente es un DEFAULT (hidratación), NO un candado. Un
+  // override MANUAL de impuesto a nivel línea es una decisión explícita del
+  // operador y SUPERA la exención heredada. Sin esto, cargar impuesto manual
+  // sobre un cliente exento se descartaba silenciosamente.
+  const hasManualTaxOverride =
+    !!opts.taxOverride &&
+    Number.isFinite(opts.taxOverride.value) &&
+    opts.taxOverride.value >= 0;
+  // Exención EFECTIVA para display/propagación: el cliente sigue exento de
+  // los impuestos HEREDADOS, pero si hay override manual la línea NO es
+  // "exenta" a efectos de UI (debe mostrar el impuesto manual aplicado).
+  const effectiveTaxExempt = entityTaxExempt && !hasManualTaxOverride;
+
   const taxIds: string[] = entityTaxExempt ? [] : ((article as any).manualTaxIds ?? []);
 
   // ── FIX base imponible NETA por componente ──────────────────────────────
@@ -2417,11 +2430,15 @@ export async function resolveFinalSalePrice(
     effectiveCostBreakdown,
     entityTaxApplyOnOverride,
     entityTaxOverrides,
-    // Override manual de la línea — si vino, reemplaza el cálculo entero
-    // (excepto cuando el cliente está exento, que prevalece).
-    entityTaxExempt ? null : (opts.taxOverride ?? null),
+    // Override manual de la línea — decisión explícita del operador: se
+    // aplica SIEMPRE, incluso con cliente exento (la exención es default,
+    // no candado). `computeLineTaxes` resuelve el override antes del guard
+    // de `taxIds` vacíos, así que funciona aunque no haya impuestos
+    // heredados.
+    opts.taxOverride ?? null,
     // Override de SOLO la base ("Aplica a") — independiente del valor.
-    // Solo aplica al impuesto HEREDADO (cuando NO hay taxOverride de valor).
+    // Solo aplica al impuesto HEREDADO (cuando NO hay taxOverride de valor);
+    // con cliente exento el heredado se suprime, así que queda en null.
     entityTaxExempt ? null : (opts.taxAppliesToOverride ?? null),
   );
   let totalWithTax = finalPrice.add(taxAmount);
@@ -2429,13 +2446,13 @@ export async function resolveFinalSalePrice(
   steps.push({
     key: "TAX",
     label: "Impuestos",
-    status: entityTaxExempt ? "skipped" : taxBreakdown.length > 0 ? "ok" : "skipped",
+    status: effectiveTaxExempt ? "skipped" : taxBreakdown.length > 0 ? "ok" : "skipped",
     value: taxBreakdown.length > 0 ? taxAmount : null,
-    message: entityTaxExempt ? "Entidad exenta de impuestos" : undefined,
+    message: effectiveTaxExempt ? "Entidad exenta de impuestos" : undefined,
     meta: {
       items: taxBreakdown,
       totalWithTax: totalWithTax.toString(),
-      exemptByEntity: entityTaxExempt,
+      exemptByEntity: effectiveTaxExempt,
     },
   });
 
@@ -2626,7 +2643,7 @@ export async function resolveFinalSalePrice(
     taxAmount,
     taxBreakdown,
     totalWithTax,
-    taxExemptByEntity: entityTaxExempt,
+    taxExemptByEntity: effectiveTaxExempt,
     appliedRounding,
     costOverrideContext: Object.keys(overrideContext).length > 0 ? overrideContext : undefined,
     // F1.4 G5 #11-B — `costLineOverridesApplied` debe persistir el RESULTADO
