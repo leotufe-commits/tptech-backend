@@ -495,6 +495,46 @@ export type LineTaxManualOverride = {
   appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
 };
 
+/**
+ * Base imponible NETA por componente (metal/hechura) para `computeLineTaxes`.
+ *
+ * El breakdown de venta (`metalSale`/`hechuraSale`) es BRUTO: la bonificación
+ * /descuento solo redujo el escalar `finalPrice`, nunca el breakdown. Si el
+ * impuesto aplica a METAL/HECHURA, debe calcularse sobre la base NETA del
+ * componente luego del descuento que afectó esa misma base.
+ *
+ * Reglas (matriz):
+ *  - Descuento METAL  → resta de metal; hechura intacta.
+ *  - Descuento HECHURA→ resta de hechura; metal intacto.
+ *  - Descuento TOTAL  → no se trackea por componente; su porción remanente
+ *    (`grossSum − finalPrice − Σ ajustes de componente`) se PRORRATEA por la
+ *    participación bruta de cada componente.
+ *  - Descuento sobre el OTRO componente → este componente queda BRUTO.
+ *
+ * Pura y determinística → preview y confirm la usan con los mismos inputs
+ * (paridad). Clamp ≥ 0.
+ */
+export function resolveTaxComponentBase(
+  gross: { metalSale: number; hechuraSale: number } | null,
+  componentMetalAdjs: ReadonlyArray<{ amount: number }>,
+  componentHechuraAdjs: ReadonlyArray<{ amount: number }>,
+  finalPrice: number,
+): { metalSale: number; hechuraSale: number } | null {
+  if (!gross) return null;
+  const sum = (a: ReadonlyArray<{ amount: number }>) =>
+    a.reduce((s, x) => s + (Number.isFinite(x.amount) ? x.amount : 0), 0);
+  const mAdj = sum(componentMetalAdjs);
+  const hAdj = sum(componentHechuraAdjs);
+  const gM = gross.metalSale;
+  const gH = gross.hechuraSale;
+  const grossSum = gM + gH;
+  const fp = Number.isFinite(finalPrice) ? finalPrice : 0;
+  const totalScoped = Math.max(0, grossSum - fp - (mAdj + hAdj));
+  const mNet = Math.max(0, gM - mAdj - (grossSum > 0 ? (totalScoped * gM) / grossSum : 0));
+  const hNet = Math.max(0, gH - hAdj - (grossSum > 0 ? (totalScoped * gH) / grossSum : 0));
+  return { metalSale: mNet, hechuraSale: hNet };
+}
+
 export async function computeLineTaxes(
   jewelryId: string,
   taxIds: string[],
@@ -2331,12 +2371,49 @@ export async function resolveFinalSalePrice(
   // entityTaxExempt y entityTaxApplyOnOverride ya se cargaron en PASO 4b
 
   const taxIds: string[] = entityTaxExempt ? [] : ((article as any).manualTaxIds ?? []);
+
+  // ── FIX base imponible NETA por componente ──────────────────────────────
+  // `computeLineTaxes` resuelve METAL/HECHURA desde `metalHechuraBreakdown`.
+  // Ese breakdown es el VALOR DE VENTA BRUTO del componente; el descuento /
+  // bonificación solo había reducido el escalar `finalPrice`, nunca el
+  // breakdown. Resultado: con "Bonif. Solo metal + Impuesto Solo metal" el
+  // impuesto se calculaba sobre el metal BRUTO (bug reportado).
+  //
+  // El neto por componente ya lo conoce el motor en los acumuladores
+  // canónicos `componentMetalAdjs/componentHechuraAdjs` (incluyen la
+  // bonificación MANUAL_DISCOUNT con applyOn METAL/HECHURA). Los descuentos
+  // con applyOn=TOTAL no se trackean por componente: su porción remanente
+  // (grossSum − final − Σ ajustes de componente) se prorratea por la
+  // participación bruta de cada componente (matriz caso 6). TOTAL sigue
+  // usando `finalPrice` dentro de `computeLineTaxes` (ya es neto).
+  // Fuente BRUTA del split por componente. Con lista METAL_HECHURA viene
+  // exacta en `metalHechuraBreakdown`; con lista UNIFICADA / COST_LINES el
+  // motor igual derivó el split en `componentBaseMetal/Hechura` (proporción
+  // sobre el precio base). Antes, sin `metalHechuraBreakdown` el impuesto
+  // METAL/HECHURA caía al estimado `fp × costPart/costTotal` (≈ BRUTO) y la
+  // bonificación por componente no bajaba la base imponible (bug UNIFICADA).
+  const grossMetalSale   = metalHechuraBreakdown?.metalSale   ?? componentBaseMetal;
+  const grossHechuraSale = metalHechuraBreakdown?.hechuraSale ?? componentBaseHechura;
+  let taxComponentBase: { metalSale: number; hechuraSale: number } | null =
+    metalHechuraBreakdown ?? null;
+  if (
+    componentBaseMetal != null && componentBaseHechura != null &&
+    grossMetalSale != null && grossHechuraSale != null
+  ) {
+    taxComponentBase = resolveTaxComponentBase(
+      { metalSale: grossMetalSale, hechuraSale: grossHechuraSale },
+      componentMetalAdjs,
+      componentHechuraAdjs,
+      toNum(finalPrice) ?? 0,
+    );
+  }
+
   const { taxBreakdown, taxAmount } = await computeLineTaxes(
     jewelryId,
     taxIds,
     finalPrice,
     basePrice,
-    metalHechuraBreakdown ?? null,
+    taxComponentBase,
     effectiveCostBreakdown,
     entityTaxApplyOnOverride,
     entityTaxOverrides,
