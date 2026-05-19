@@ -185,7 +185,29 @@ const ATTACHMENT_SELECT = {
   createdAt: true,
 } as const;
 
+/**
+ * Falla con un error accionable (en vez de un `TypeError` opaco → 500 sin
+ * info) si el Prisma Client cargado no expone el modelo `ReceiptAttachment`.
+ * Caso típico: el dev server quedó vivo desde antes de `prisma:generate`
+ * (tsx watch NO recarga `node_modules/@prisma/client`), o falta correr la
+ * migración. No afecta `createDraft` ni otros flujos.
+ */
+function assertAttachmentModel() {
+  if (!(prisma as any).receiptAttachment) {
+    const err: any = new Error(
+      "Adjuntos no disponibles: el Prisma Client no tiene el modelo " +
+      "ReceiptAttachment. Corré `npm run prisma:generate` y reiniciá el " +
+      "backend (tsx watch no recarga @prisma/client).",
+    );
+    err.status = 500;
+    throw err;
+  }
+}
+
 async function assertReceiptOwnership(receiptId: string, jewelryId: string) {
+  // Chokepoint de todas las ops de adjuntos: validar el modelo acá garantiza
+  // un mensaje claro antes de tocar `prisma.receiptAttachment`.
+  assertAttachmentModel();
   const receipt = await prisma.receipt.findFirst({
     where: { id: receiptId, jewelryId },
     select: { id: true },
