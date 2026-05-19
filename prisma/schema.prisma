@@ -3337,6 +3337,7 @@ model Receipt {
   voidedAt           DateTime?
   voidReason         String           @default("")
   notes              String           @default("")
+  terms              String           @default("")
   issuedById         String?
   voidedById         String?
   createdAt          DateTime         @default(now())
@@ -3353,6 +3354,7 @@ model Receipt {
   voidedBy          User?                    @relation("ReceiptVoidedBy", fields: [voidedById], references: [id], onDelete: SetNull)
   lines             ReceiptLine[]
   accountMovements  CurrentAccountMovement[]
+  attachments       ReceiptAttachment[]
 
   @@unique([jewelryId, seriesId, code])
   @@index([jewelryId, type])
@@ -3362,6 +3364,26 @@ model Receipt {
   @@index([saleId])
   @@index([purchaseId])
   @@index([correctedReceiptId])
+}
+
+model ReceiptAttachment {
+  id         String    @id @default(cuid())
+  receiptId  String
+  jewelryId  String
+  filename   String
+  url        String
+  mimeType   String    @default("")
+  size       Int       @default(0)
+  label      String    @default("")
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  uploadedBy String    @default("")
+
+  receipt Receipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@index([receiptId])
+  @@index([jewelryId])
+  @@index([deletedAt])
 }
 
 model ReceiptLine {

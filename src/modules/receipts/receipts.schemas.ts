@@ -70,6 +70,7 @@ export const createReceiptDraftSchema = z.object({
 
   // Texto libre
   notes: z.string().default(""),
+  terms: z.string().default(""),
 
   // Snapshots (Json) — el frontend manda el shape que ya armó.
   pricingSnapshot:  z.unknown(),

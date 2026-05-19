@@ -109,6 +109,7 @@ export async function createReceiptDraft(
         issueDate,
         dueDate,
         notes:           body.notes || "",
+        terms:           body.terms || "",
 
         // status=DRAFT → issuedAt se setea al emitir, no acá.
         issuedById:      null,
@@ -155,4 +156,117 @@ export async function createReceiptDraft(
 
     return created;
   });
+}
+
+// ===========================================================================
+// Attachments — espejo del patrón de commercial-entities / sellers.
+// Tenant scoping por jewelryId, soft-delete (deletedAt), upload vía R2/local.
+// ===========================================================================
+
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+
+function assert(cond: any, msg: string): asserts cond {
+  if (!cond) {
+    const err: any = new Error(msg);
+    err.status = 400;
+    throw err;
+  }
+}
+
+const ATTACHMENT_SELECT = {
+  id: true,
+  filename: true,
+  url: true,
+  mimeType: true,
+  size: true,
+  label: true,
+  createdAt: true,
+} as const;
+
+async function assertReceiptOwnership(receiptId: string, jewelryId: string) {
+  const receipt = await prisma.receipt.findFirst({
+    where: { id: receiptId, jewelryId },
+    select: { id: true },
+  });
+  assert(receipt, "Comprobante no encontrado.");
+}
+
+export async function listAttachments(receiptId: string, jewelryId: string) {
+  assert(receiptId, "Id de comprobante inválido.");
+  assert(jewelryId, "Tenant inválido.");
+  await assertReceiptOwnership(receiptId, jewelryId);
+  return prisma.receiptAttachment.findMany({
+    where: { receiptId, deletedAt: null },
+    select: ATTACHMENT_SELECT,
+    orderBy: { createdAt: "desc" as const },
+  });
+}
+
+export async function addAttachment(
+  receiptId: string,
+  jewelryId: string,
+  data: { filename: string; url: string; mimeType: string; size: number; label?: string; uploadedBy?: string }
+) {
+  assert(receiptId, "Id de comprobante inválido.");
+  assert(jewelryId, "Tenant inválido.");
+  assert(data?.filename, "Nombre de archivo inválido.");
+  assert(data?.url, "URL inválida.");
+  await assertReceiptOwnership(receiptId, jewelryId);
+
+  return prisma.receiptAttachment.create({
+    data: {
+      receiptId,
+      jewelryId,
+      filename: data.filename,
+      url: data.url,
+      mimeType: data.mimeType || "",
+      size: data.size || 0,
+      label: s(data?.label),
+      uploadedBy: s(data?.uploadedBy),
+    },
+    select: ATTACHMENT_SELECT,
+  });
+}
+
+export async function updateAttachmentLabel(
+  receiptId: string,
+  attachmentId: string,
+  jewelryId: string,
+  label: string
+) {
+  assert(receiptId && attachmentId, "Ids inválidos.");
+  assert(jewelryId, "Tenant inválido.");
+  await assertReceiptOwnership(receiptId, jewelryId);
+
+  const att = await prisma.receiptAttachment.findFirst({
+    where: { id: attachmentId, receiptId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(att, "Adjunto no encontrado.");
+
+  return prisma.receiptAttachment.update({
+    where: { id: attachmentId },
+    data: { label: s(label) },
+    select: ATTACHMENT_SELECT,
+  });
+}
+
+export async function removeAttachment(receiptId: string, attachmentId: string, jewelryId: string) {
+  assert(receiptId && attachmentId, "Ids inválidos.");
+  assert(jewelryId, "Tenant inválido.");
+  await assertReceiptOwnership(receiptId, jewelryId);
+
+  const att = await prisma.receiptAttachment.findFirst({
+    where: { id: attachmentId, receiptId, deletedAt: null },
+    select: { id: true },
+  });
+  assert(att, "Adjunto no encontrado.");
+
+  await prisma.receiptAttachment.update({
+    where: { id: attachmentId },
+    data: { deletedAt: new Date() },
+  });
+  return { id: attachmentId };
 }
