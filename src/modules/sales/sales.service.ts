@@ -53,6 +53,7 @@ import {
   getCurrencyDisplayContext,
   buildResponseCurrencyMetadata,
   convertSalesPreviewResponseInPlace,
+  convertSalesPreviewInputInPlace,
 } from "../../lib/pricing-currency-display.js";
 import { getBaseCurrencyId } from "../../lib/pricing-engine/pricing-engine.currency.js";
 import type { EntitySnapshot, SellerSnapshot, IssuerSnapshot, CurrencySnapshot } from "../../lib/document-snapshot.types.js";
@@ -2447,6 +2448,13 @@ export type SalePreviewResult = {
   clientBalanceType?:    string | null;
   /** Reglas comerciales del cliente (descuentos/recargos automáticos). */
   clientCommercialRules?: SalePreviewClientCommercialRules | null;
+  /**
+   * true si el cliente está marcado exento de impuestos (`CommercialEntity
+   * .taxExempt`). Metadata READ-ONLY: lo expone para que el frontend pueda
+   * distinguir "sin impuesto" de "exento por cliente". NO recalcula nada
+   * (el motor ya aplicó la exención por `clientId`). null/false si no hay
+   * cliente o no es exento. */
+  clientTaxExempt?: boolean;
   /** Eco de `input.priceListId` (lo que el operador eligió a nivel doc). */
   requestedPriceListId?: string | null;
   /** Lista efectivamente aplicada consolidada a nivel documento. Si todas
@@ -2466,6 +2474,26 @@ export async function previewSale(
   input: SalePreviewInput,
 ): Promise<SalePreviewResult> {
   const { lines, clientId, paymentMethodId, installmentsQty = 0 } = input;
+
+  // ── Multimoneda (Fase MM) — contexto resuelto AL INICIO ─────────────────
+  // El motor trabaja 100% en moneda BASE. El operador tipea los montos
+  // (precio/bonif./impuesto/global/envío manuales) en la moneda del
+  // documento (display). Convertimos esos INPUTS display→base ACÁ, antes
+  // de que el motor los consuma, y al final convertimos el RESPONSE
+  // base→display (simetría). Sin esto, una bonif. AMOUNT de "20" (USD) se
+  // aplicaba como "20" base (ARS) y volvía como ~US$0,01.
+  // `confirmSale` NO pasa por acá (persiste en base) → sin doble conversión.
+  const currencyCtx = await getCurrencyDisplayContext(
+    jewelryId,
+    input.currencyId   ?? null,
+    input.currencyRate ?? null,
+  );
+  if (currencyCtx?.applied) {
+    // Mutación in-place de `input` ANTES de cualquier lectura del motor.
+    // `lines` (destructurado arriba) es la MISMA referencia → ve los
+    // valores ya convertidos. Solo AMOUNT/montos; PERCENT no se toca.
+    convertSalesPreviewInputInPlace(input, currencyCtx.rate);
+  }
 
   // ── Política de redondeo a nivel comprobante (UNIFIED) ──────────────────
   // Se carga una sola vez al inicio del preview y se reutiliza para todas
@@ -2780,12 +2808,37 @@ export async function previewSale(
         if (taxIds.length > 0 || lineTaxOverride != null || lineTaxAppliesTo != null) {
           const unitPriceDec = new Prisma.Decimal(unitPrice);
           const basePriceDec = new Prisma.Decimal(basePrice ?? unitPrice);
-          const mhForTax = pricing.metalHechuraBreakdown
-            ? {
-                metalSale:   parseFloat(String(pricing.metalHechuraBreakdown.metalSale)),
-                hechuraSale: parseFloat(String(pricing.metalHechuraBreakdown.hechuraSale)),
-              }
-            : null;
+          // Base imponible NETA por componente: usamos los `*SaleFinal`
+          // (= componentSaleBreakdown.{metal,hechura}.final) que el motor
+          // ya calculó post-bonificación/descuento por componente. Sin
+          // esto, "Bonif. Solo metal + Impuesto Solo metal" calculaba el
+          // impuesto sobre el metal BRUTO (bug reportado). Fallback al
+          // bruto solo si el motor no expuso el neto.
+          // Base imponible NETA por componente. Fuente del NETO, en orden:
+          //   1. metalHechuraBreakdown.{metal,hechura}SaleFinal (listas
+          //      METAL_HECHURA con desglose exacto).
+          //   2. componentSaleBreakdown.{metal,hechura}.final — el motor lo
+          //      deriva TAMBIÉN para listas UNIFICADA/COST_LINES (proporción),
+          //      donde `metalHechuraBreakdown` es null. Sin esto, "Bonif.
+          //      Solo metal/hechura + Impuesto Solo metal/hechura" en lista
+          //      Unificada caía al estimado por proporción de costo (≈ BRUTO).
+          //   3. Bruto solo si el motor no expuso ningún neto.
+          const mhRaw = pricing.metalHechuraBreakdown as any;
+          const csb   = (pricing as any).componentSaleBreakdown ?? null;
+          const netMetal   = mhRaw?.metalSaleFinal   ?? csb?.metal?.final;
+          const netHechura = mhRaw?.hechuraSaleFinal ?? csb?.hechura?.final;
+          const mhForTax =
+            netMetal != null && netHechura != null
+              ? {
+                  metalSale:   parseFloat(String(netMetal)),
+                  hechuraSale: parseFloat(String(netHechura)),
+                }
+              : pricing.metalHechuraBreakdown
+                ? {
+                    metalSale:   parseFloat(String(pricing.metalHechuraBreakdown.metalSale)),
+                    hechuraSale: parseFloat(String(pricing.metalHechuraBreakdown.hechuraSale)),
+                  }
+                : null;
           const { taxBreakdown, taxAmount } = await computeLineTaxes(
             jewelryId,
             taxIds,
@@ -3296,26 +3349,19 @@ export async function previewSale(
     // ── Fase 2A.7 — info doc-level ───────────────────────────────────────
     clientBalanceType:     clientRow?.balanceType ?? null,
     clientCommercialRules,
+    // Metadata READ-ONLY (ya computado en PASO 4b, no recalcula): permite al
+    // frontend mostrar "Exento cliente" vs "sin impuesto".
+    clientTaxExempt,
     requestedPriceListId:  input.priceListId ?? null,
     appliedPriceListId:    consolidatedPriceListId,
     appliedPriceListName:  consolidatedPriceListName,
     priceListWasOverridden,
   };
 
-  // ── Multimoneda (Fase MM) ────────────────────────────────────────────────
-  // Si el operador eligió una moneda distinta a la base, convertir todos los
-  // importes monetarios in-place (incluye lines[*], documentTotals,
-  // channel/coupon/checkout) y adosar metadata. Si no, no-op.
-  // confirmSale NUNCA pasa por acá — sus snapshots quedan en moneda base.
-  // Fase MM ext: si el operador aplicó una cotización manual en el
-  // documento (`draft.fxRate` → `input.currencyRate`), tiene precedencia
-  // sobre la tasa vigente del catálogo. Sin override, fallback al
-  // comportamiento original (última `CurrencyRate`).
-  const currencyCtx = await getCurrencyDisplayContext(
-    jewelryId,
-    input.currencyId   ?? null,
-    input.currencyRate ?? null,
-  );
+  // ── Multimoneda (Fase MM) — conversión del RESPONSE base→display ─────────
+  // Reusa el MISMO `currencyCtx` resuelto al inicio (no se vuelve a pedir):
+  // input se convirtió display→base arriba, acá el response base→display.
+  // Simetría exacta con la misma tasa. confirmSale NUNCA pasa por acá.
   if (currencyCtx?.applied) {
     convertSalesPreviewResponseInPlace(responsePayload, currencyCtx.rate);
   }

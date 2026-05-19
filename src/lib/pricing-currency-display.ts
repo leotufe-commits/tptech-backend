@@ -173,6 +173,23 @@ export function convertFromBase(
 }
 
 /**
+ * Inversa de `convertFromBase`: convierte un monto expresado en la moneda
+ * de DISPLAY (la que el operador tipeó en el documento) a la moneda BASE
+ * que consume el motor. `rate` = "1 unidad display = `rate` unidades base"
+ * (mismo `rate` que usa `convertFromBase`, pero multiplicando en vez de
+ * dividir). No-op si no hay conversión real.
+ */
+export function convertToBase(
+  amount: number | null | undefined,
+  rate: number,
+): number | null {
+  if (amount == null) return null;
+  if (!Number.isFinite(rate) || rate <= 0) return null;
+  if (!Number.isFinite(amount)) return null;
+  return Math.round((amount * rate) * 10000) / 10000;
+}
+
+/**
  * Variante que devuelve string fixed(4) — útil para campos que originalmente
  * son string (Prisma.Decimal serializado como string en muchos endpoints).
  */
@@ -617,6 +634,70 @@ export function convertSalesPreviewResponseInPlace(res: any, rate: number): void
   convertFieldNumber(res, "subtotal", rate);
   convertFieldNumber(res, "total",    rate);
   convertSaleDocumentTotalsInPlace(res.documentTotals, rate);
+}
+
+/**
+ * Inversa de `convertSalesPreviewResponseInPlace`. Convierte los inputs
+ * MONETARIOS que el operador tipeó en la moneda del documento (display) a
+ * moneda BASE, ANTES de que el motor (que trabaja 100% en base) los consuma.
+ *
+ * Simetría obligatoria: input display→base acá, response base→display al
+ * final. Sin esto, un descuento/impuesto/precio AMOUNT de "20" (p.ej. USD)
+ * se aplicaba como "20" en base (p.ej. ARS) y volvía como ~"0,01" tras la
+ * conversión del response.
+ *
+ * Whitelist EXPLÍCITA (mismo criterio que el response):
+ *   - Montos AMOUNT: SÍ. Porcentajes (mode/type PERCENT): NO (son adimensionales).
+ *   - Cantidades físicas (gramos, merma, weight): NO.
+ *   - `currencyRate`: NO (es la tasa, no un monto).
+ *   - Overrides de composición de costo (hechura/gramos/merma/costLines):
+ *     fuera de alcance acá (capa de costo, no input monetario del documento).
+ *
+ * Solo se invoca cuando hay moneda de display ≠ base (`ctx.applied`).
+ */
+export function convertSalesPreviewInputInPlace(
+  input: {
+    lines?: Array<{
+      manualPriceOverride?: number | null;
+      manualDiscountOverride?: { mode: "PERCENT" | "AMOUNT"; value: number } | null;
+      taxOverride?:           { mode: "PERCENT" | "AMOUNT"; value: number } | null;
+    }> | null;
+    shippingAmount?: number;
+    shipping?: { mode: "FIXED" | "BY_WEIGHT" | "FREE"; value?: number | null; weight?: number | null } | null;
+    globalDiscountAmount?: number;
+    globalDiscount?: { type: "PERCENT" | "AMOUNT"; value: number } | null;
+  } | null | undefined,
+  rate: number,
+): void {
+  if (!input || rate === 1 || !Number.isFinite(rate) || rate <= 0) return;
+  const toB = (n: number) => Math.round((n * rate) * 10000) / 10000;
+
+  for (const l of input.lines ?? []) {
+    if (typeof l.manualPriceOverride === "number") {
+      l.manualPriceOverride = toB(l.manualPriceOverride);
+    }
+    // SOLO AMOUNT: PERCENT es adimensional y NO se convierte.
+    if (l.manualDiscountOverride && l.manualDiscountOverride.mode === "AMOUNT") {
+      l.manualDiscountOverride.value = toB(l.manualDiscountOverride.value);
+    }
+    if (l.taxOverride && l.taxOverride.mode === "AMOUNT") {
+      l.taxOverride.value = toB(l.taxOverride.value);
+    }
+  }
+
+  if (typeof input.shippingAmount === "number") {
+    input.shippingAmount = toB(input.shippingAmount);
+  }
+  if (input.shipping && input.shipping.mode === "FIXED"
+      && typeof input.shipping.value === "number") {
+    input.shipping.value = toB(input.shipping.value);
+  }
+  if (typeof input.globalDiscountAmount === "number") {
+    input.globalDiscountAmount = toB(input.globalDiscountAmount);
+  }
+  if (input.globalDiscount && input.globalDiscount.type === "AMOUNT") {
+    input.globalDiscount.value = toB(input.globalDiscount.value);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

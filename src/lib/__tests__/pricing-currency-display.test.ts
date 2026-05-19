@@ -17,6 +17,9 @@ import { describe, it, expect } from "vitest";
 import {
   convertArticlePreviewResponseInPlace,
   convertSalesPreviewResponseInPlace,
+  convertToBase,
+  convertFromBase,
+  convertSalesPreviewInputInPlace,
 } from "../pricing-currency-display.js";
 
 // `convertFromBase` divide por `rate`. Para tener números exactos en el test,
@@ -272,5 +275,131 @@ describe("pricing-currency-display — composition[].lineSale en multimoneda", (
     convertSalesPreviewResponseInPlace(res, RATE);
     expect(res.lines[0].marginPercent).toBe(25);
     expect(res.lines[0].metalHechuraBreakdown.metalMarginPct).toBe(20);
+  });
+});
+
+// ============================================================================
+// Simetría de INPUTS: convertToBase / convertSalesPreviewInputInPlace.
+//
+// Bug real: bonificación por MONTO FIJO (AMOUNT). El operador tipea "20" en
+// la moneda del documento (p.ej. USD). El motor trabaja en BASE; sin
+// convertir el input, aplicaba "20" como base (ARS) y el response volvía
+// como ~"0,01" tras dividir por la tasa. PERCENT funcionaba porque es
+// adimensional. Estos tests fijan: AMOUNT se convierte display→base con la
+// MISMA tasa que el response base→display (round-trip = identidad); los
+// porcentajes y cantidades físicas NO se tocan.
+// ============================================================================
+
+describe("convertToBase — inversa exacta de convertFromBase", () => {
+  // 1 USD = 1000 ARS → rate = 1000.
+  const RATE_USD = 1000;
+
+  it("convertToBase multiplica por rate (display→base)", () => {
+    expect(convertToBase(20, RATE_USD)).toBe(20000);
+  });
+
+  it("round-trip: display → base → display = identidad (no aparece 0,01)", () => {
+    const display = 20;
+    const base = convertToBase(display, RATE_USD)!;       // 20000 (ARS)
+    const back = convertFromBase(base, RATE_USD)!;        // 20 (USD)
+    expect(base).toBe(20000);
+    expect(back).toBe(20);
+    expect(back).not.toBeCloseTo(0.01, 2);
+  });
+
+  it("rate = 1 (moneda base, p.ej. ARS) → no-op", () => {
+    expect(convertToBase(20, 1)).toBe(20);
+  });
+
+  it("null / rate inválido → null (sin romper)", () => {
+    expect(convertToBase(null, RATE_USD)).toBeNull();
+    expect(convertToBase(20, 0)).toBeNull();
+    expect(convertToBase(undefined, RATE_USD)).toBeNull();
+  });
+});
+
+describe("convertSalesPreviewInputInPlace — display→base antes del motor", () => {
+  const RATE_USD = 1000; // 1 USD = 1000 ARS
+
+  function makeInput() {
+    return {
+      lines: [
+        {
+          manualPriceOverride: 234.86,
+          manualDiscountOverride: { mode: "AMOUNT" as const, value: 20 },
+          taxOverride: null as null | { mode: "PERCENT" | "AMOUNT"; value: number },
+        },
+        {
+          manualPriceOverride: null as number | null,
+          manualDiscountOverride: { mode: "PERCENT" as const, value: 10 },
+          taxOverride: { mode: "AMOUNT" as const, value: 5 },
+        },
+      ],
+      shippingAmount: 7,
+      shipping: { mode: "FIXED" as const, value: 7, weight: null },
+      globalDiscount: { type: "AMOUNT" as const, value: 50 },
+      globalDiscountAmount: 50,
+    };
+  }
+
+  it("bonif. AMOUNT se convierte (20 USD → 20000 base); PERCENT NO se toca", () => {
+    const input = makeInput();
+    convertSalesPreviewInputInPlace(input, RATE_USD);
+    expect(input.lines[0].manualDiscountOverride.value).toBe(20000); // AMOUNT → base
+    expect(input.lines[1].manualDiscountOverride.value).toBe(10);    // PERCENT intacto
+  });
+
+  it("manualPriceOverride se convierte; null queda null", () => {
+    const input = makeInput();
+    convertSalesPreviewInputInPlace(input, RATE_USD);
+    expect(input.lines[0].manualPriceOverride).toBe(234860); // 234.86 × 1000
+    expect(input.lines[1].manualPriceOverride).toBeNull();
+  });
+
+  it("taxOverride AMOUNT se convierte; PERCENT NO", () => {
+    const input = makeInput();
+    input.lines[0].taxOverride = { mode: "PERCENT", value: 10 };
+    convertSalesPreviewInputInPlace(input, RATE_USD);
+    expect(input.lines[0].taxOverride!.value).toBe(10);  // PERCENT intacto
+    expect(input.lines[1].taxOverride!.value).toBe(5000); // AMOUNT → base
+  });
+
+  it("globalDiscount AMOUNT, globalDiscountAmount y shipping FIXED se convierten", () => {
+    const input = makeInput();
+    convertSalesPreviewInputInPlace(input, RATE_USD);
+    expect(input.globalDiscount.value).toBe(50000);
+    expect(input.globalDiscountAmount).toBe(50000);
+    expect(input.shippingAmount).toBe(7000);
+    expect(input.shipping.value).toBe(7000);
+  });
+
+  it("moneda BASE (rate = 1, p.ej. ARS) → no-op total: AMOUNT funciona igual", () => {
+    const input = makeInput();
+    convertSalesPreviewInputInPlace(input, 1);
+    expect(input.lines[0].manualDiscountOverride.value).toBe(20);
+    expect(input.lines[0].manualPriceOverride).toBe(234.86);
+    expect(input.globalDiscount.value).toBe(50);
+  });
+
+  it("simetría input↔response: precio 234.86 − bonif. 20 (AMOUNT) en USD", () => {
+    // Tras convertir el input a base, el motor aplica el descuento real:
+    //   base precio  = 234.86 × 1000 = 234860
+    //   base bonif.  =  20.00 × 1000 =  20000
+    //   base neto    = 234860 − 20000 = 214860
+    // El response se devuelve dividiendo por rate → display:
+    //   neto display = 214860 / 1000 = 214.86  (NO 234.85)
+    //   bonif display = 20000 / 1000 = 20.00   (NO 0.01)
+    const input = makeInput();
+    convertSalesPreviewInputInPlace(input, RATE_USD);
+    const basePrice  = input.lines[0].manualPriceOverride!;            // 234860
+    const baseBonif  = input.lines[0].manualDiscountOverride.value;    // 20000
+    const baseNet    = basePrice - baseBonif;                          // 214860
+    expect(convertFromBase(baseBonif, RATE_USD)).toBe(20);             // label −US$ 20,00
+    expect(convertFromBase(baseNet,   RATE_USD)).toBe(214.86);         // neto correcto
+    // Impuesto 10% sobre base descontada (se calcula en el motor en base):
+    const baseTax = Math.round(baseNet * 0.10 * 10000) / 10000;        // 21486
+    expect(convertFromBase(baseTax, RATE_USD)).toBeCloseTo(21.49, 2);  // ≈ US$ 21,49
+    const baseTotal = baseNet + baseTax;                               // 236346
+    expect(convertFromBase(baseTotal, RATE_USD)).toBeCloseTo(236.35, 2); // ≈ US$ 236,35
   });
 });
