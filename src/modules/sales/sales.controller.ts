@@ -106,6 +106,19 @@ export async function cancel(req: any, res: Response) {
   return res.json(await service.cancelSale(id, req.user.jewelryId, userId, note));
 }
 
+// 1.B — Genera el PDF oficial de la factura. 409 si la venta no esta en un
+// estado emitido (DRAFT o CANCELLED).
+export async function downloadPdf(req: any, res: Response) {
+  const id = s(req.params?.id);
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  assert(id, "Id inválido.");
+  const { buffer, filename } = await service.generateSalePdf(id, req.user.jewelryId);
+  res.setHeader("Content-Type",        "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Content-Length",      String(buffer.length));
+  return res.send(buffer);
+}
+
 // Preview — calcula precios + checkout sin crear la venta
 export async function previewSale(req: any, res: Response) {
   assert(req.user?.jewelryId, "Tenant inválido.");

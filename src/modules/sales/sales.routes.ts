@@ -13,5 +13,9 @@ router.put("/:id", asyncHandler(controller.update));
 router.post("/:id/confirm", asyncHandler(controller.confirm));
 router.post("/:id/payments", asyncHandler(controller.addPayment));
 router.patch("/:id/cancel", asyncHandler(controller.cancel));
+// 1.B — Descarga del PDF oficial del comprobante. Requiere venta confirmada
+// (DRAFT → 409 SALE_NOT_CONFIRMED, CANCELLED → 409 SALE_CANCELLED). Lee
+// snapshot + Receipt.code + DocumentTemplate FACTURA y devuelve un PDF.
+router.get("/:id/pdf", asyncHandler(controller.downloadPdf));
 
 export default router;

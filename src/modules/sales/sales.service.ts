@@ -1,5 +1,9 @@
 import { prisma } from "../../lib/prisma.js";
 import { Prisma } from "@prisma/client";
+// 1.B — Render del PDF oficial. El renderer es PURO (read-only sobre el
+// snapshot). DocumentTemplate sigue siendo la SSOT de configuracion.
+import { renderInvoicePdf } from "./pdf/renderInvoicePdf.js";
+import { getOrCreateTemplate } from "../document-templates/document-templates.service.js";
 import {
   calculateCostFromLines,
   buildBatchCostContext,
@@ -300,6 +304,23 @@ const SALE_DETAIL_SELECT = {
       paidAt: true,
       createdAt: true,
       paymentMethod: { select: { id: true, name: true, type: true } },
+    },
+  },
+  // 1.A — Receipts emitidos al confirmar la venta. `Receipt.code` es la
+  // numeracion oficial del comprobante (formato `<prefix>-<pos>-<n>`,
+  // ej. "A-0001-00000001") generada atomicamente por `ReceiptSeries` en
+  // `sale.hook.ts`. El frontend usa este code como "Factura N°" en el
+  // header del modal y como nombre del PDF descargado.
+  receipts: {
+    orderBy: { issuedAt: "asc" as const },
+    select: {
+      id:        true,
+      code:      true,
+      type:      true,
+      direction: true,
+      status:    true,
+      issueDate: true,
+      issuedAt:  true,
     },
   },
 } satisfies Prisma.SaleSelect;
@@ -3370,4 +3391,143 @@ export async function previewSale(
   }
 
   return responsePayload;
+}
+
+// =============================================================================
+// 1.B — PDF oficial de la factura.
+//
+// Lee:
+//   · `getSale(id, jewelryId)` → snapshot persistido + receipts[].
+//   · `getOrCreateTemplate(jewelryId, "FACTURA")` → SSOT de configuracion
+//     documental (columnas/secciones/margenes/header/footer/logo flag).
+//   · `jewelry` minimo para componer el bloque emisor.
+//
+// Estados bloqueados:
+//   · DRAFT     → 409 SALE_NOT_CONFIRMED (mensaje de UX listo).
+//   · CANCELLED → 409 SALE_CANCELLED.
+// Cualquier otro (`CONFIRMED`, `PAID`, `PARTIALLY_PAID`) deja generar.
+//
+// El render es PURO — esta funcion solo orquesta lectura + delega al renderer.
+// =============================================================================
+export async function generateSalePdf(id: string, jewelryId: string): Promise<{ buffer: Buffer; filename: string }> {
+  // getSale ya valida tenant + 404 y devuelve `receipts[]` (1.A).
+  const sale = await getSale(id, jewelryId) as any;
+
+  if (sale.status === "DRAFT") {
+    const e: any = new Error("Para generar el PDF oficial, primero confirmá la factura.");
+    e.status = 409; e.code = "SALE_NOT_CONFIRMED";
+    throw e;
+  }
+  if (sale.status === "CANCELLED") {
+    const e: any = new Error("Esta factura está anulada. No se puede generar el PDF oficial.");
+    e.status = 409; e.code = "SALE_CANCELLED";
+    throw e;
+  }
+
+  const receipt = (sale.receipts && sale.receipts.length > 0) ? sale.receipts[0] : null;
+
+  const [template, jewelry] = await Promise.all([
+    getOrCreateTemplate(jewelryId, "FACTURA"),
+    prisma.jewelry.findUnique({
+      where: { id: jewelryId },
+      select: {
+        name: true, legalName: true, cuit: true, ivaCondition: true,
+        logoUrl: true, email: true, website: true,
+        phoneCountry: true, phoneNumber: true,
+        street: true, number: true, floor: true, apartment: true,
+        city: true, province: true, postalCode: true, country: true,
+      },
+    }),
+  ]);
+
+  if (!jewelry) {
+    const e: any = new Error("Joyería no encontrada.");
+    e.status = 404;
+    throw e;
+  }
+
+  // Adaptador → PdfSale (numeros ya planos; el renderer es pure).
+  const pdfSale = {
+    id:              sale.id,
+    code:            sale.code,
+    status:          sale.status,
+    saleDate:        sale.saleDate,
+    notes:           sale.notes ?? "",
+    subtotal:        toN(sale.subtotal),
+    discountAmount:  toN(sale.discountAmount),
+    taxAmount:       toN(sale.taxAmount),
+    total:           toN(sale.total),
+    paidAmount:      toN(sale.paidAmount),
+    currencySnapshot: sale.currencySnapshot ?? null,
+    clientSnapshot:  sale.clientSnapshot ?? null,
+    sellerSnapshot:  sale.sellerSnapshot ?? null,
+    client:          sale.client
+      ? {
+          displayName:    sale.client.displayName ?? "",
+          documentType:   sale.client.documentType ?? "",
+          documentNumber: sale.client.documentNumber ?? "",
+          ivaCondition:   sale.client.ivaCondition ?? "",
+        }
+      : null,
+    lines: (sale.lines ?? []).map((l: any) => ({
+      articleName: l.articleName ?? "",
+      variantName: l.variantName ?? "",
+      sku:         l.sku ?? "",
+      barcode:     l.barcode ?? "",
+      quantity:    toN(l.quantity),
+      unitPrice:   toN(l.unitPrice),
+      discountPct: toN(l.discountPct),
+      lineTotal:   toN(l.lineTotal),
+      taxAmount:   l.taxAmount == null ? null : toN(l.taxAmount),
+    })),
+  };
+
+  const pdfReceipt = receipt
+    ? { id: receipt.id, code: receipt.code, type: receipt.type, issueDate: receipt.issueDate }
+    : null;
+
+  // Componer la direccion completa del emisor desde los campos atomicos.
+  // El renderer NO arma direcciones; solo dibuja la string que recibe.
+  const addrParts = [
+    [jewelry.street, jewelry.number].filter(Boolean).join(" "),
+    [jewelry.floor && `Piso ${jewelry.floor}`, jewelry.apartment && `Dpto ${jewelry.apartment}`].filter(Boolean).join(" "),
+    [jewelry.city, jewelry.province, jewelry.postalCode].filter(Boolean).join(", "),
+    jewelry.country,
+  ].filter((p) => p && p.trim().length > 0);
+  const fullAddress = addrParts.join(" — ");
+  const phone = [jewelry.phoneCountry, jewelry.phoneNumber].filter((s) => s && s.trim().length > 0).join(" ");
+
+  const pdfJewelry = {
+    name:         jewelry.name ?? "",
+    legalName:    jewelry.legalName ?? "",
+    cuit:         jewelry.cuit ?? "",
+    ivaCondition: jewelry.ivaCondition ?? "",
+    logoUrl:      jewelry.logoUrl ?? "",
+    fullAddress,
+    phone,
+    email:        jewelry.email ?? "",
+    website:      jewelry.website ?? "",
+  };
+
+  const buffer = await renderInvoicePdf({
+    sale:     pdfSale,
+    receipt:  pdfReceipt,
+    template: template as any,
+    jewelry:  pdfJewelry,
+  });
+
+  // Nombre del archivo: priorizar el numero oficial; fallback al code interno.
+  const filename = `Factura-${receipt?.code ?? sale.code}.pdf`;
+
+  return { buffer, filename };
+}
+
+/** Conversion segura Decimal/string/number → number. Solo para serializar
+ *  al renderer; NO se usa para calcular nada. */
+function toN(v: any): number {
+  if (v == null) return 0;
+  if (typeof v === "number") return v;
+  if (typeof v === "string") return Number(v) || 0;
+  if (typeof v === "object" && typeof v.toString === "function") return Number(v.toString()) || 0;
+  return 0;
 }
