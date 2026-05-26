@@ -3455,3 +3455,54 @@ model CurrentAccountMovement {
   @@index([receiptId])
   @@index([paymentAllocationId])
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DocumentEmailLog — Historial documental de emails enviados desde TPTech.
+//
+// TPTech es la SSOT del historial de comunicaciones documentales (los
+// emails NO aparecen en "Elementos enviados" del Outlook/Gmail del
+// usuario porque salen desde el provider del backend, Postmark).
+// Este log es lo que garantiza trazabilidad.
+//
+// Reglas:
+//   · `documentId` es string libre (NO FK obligatoria). Sobrevive a
+//     soft-delete del Sale: la auditoría de "qué se mandó" no debe
+//     desaparecer aunque el Sale se anule.
+//   · `saleId` opcional para el caso v1 (Factura de Ventas). Otros
+//     `documentKind` no usan este campo todavía.
+//   · `bodySnapshot` es TEXTO PLANO del mensaje enviado al cliente
+//     (no HTML). Refleja exactamente lo que el operador puso en el
+//     modal de envío.
+//   · `status` enum-like string: "PENDING" | "SENT" | "FAILED".
+//     Default "SENT" — se setea después de la respuesta del provider.
+//     "PENDING" reservado para futuros flujos async.
+//   · Multi-tenant obligatorio: `jewelryId` siempre presente. Todo
+//     query filtra por él.
+//   · Inmutable post-create: este modelo no expone `update` en v1.
+// ─────────────────────────────────────────────────────────────────────────────
+model DocumentEmailLog {
+  id                 String   @id @default(cuid())
+
+  jewelryId          String
+  documentKind       String
+  documentId         String
+
+  saleId             String?
+
+  recipientEmail     String
+  subjectSnapshot    String
+  bodySnapshot       String   @db.Text
+
+  attachmentFilename String?
+
+  provider           String
+  providerMessageId  String?
+
+  status             String   @default("SENT")
+
+  sentByUserId       String?
+
+  createdAt          DateTime @default(now())
+
+  @@index([jewelryId, documentKind, documentId, createdAt])
+}
