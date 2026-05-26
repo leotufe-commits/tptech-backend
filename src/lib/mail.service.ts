@@ -5,6 +5,19 @@ import crypto from "node:crypto";
 // ✅ ESM + node16/nodenext: imports relativos con extensión .js
 import { postmarkSendMail } from "./mail.provider.postmark.js";
 
+/**
+ * 1.C — Adjuntos genericos de mail. Buffer + filename + contentType es
+ * suficiente para Postmark (base64 wrapping) y el preview dev (solo
+ * listamos metadata, no el buffer entero para no inflar memoria).
+ * Si en el futuro hay que soportar streams o paths-a-disco, se agrega
+ * sin romper la firma actual (el campo `content` ya es Buffer concreto).
+ */
+export type MailAttachment = {
+  filename:    string;     // ej. "Factura-A-0001-00000001.pdf"
+  content:     Buffer;     // binario en memoria
+  contentType: string;     // ej. "application/pdf"
+};
+
 export type SendMailOptions = {
   to: string;
   subject: string;
@@ -12,23 +25,48 @@ export type SendMailOptions = {
   text?: string;
   from?: string;
   replyTo?: string; // Reply-To header — toma valor de TenantMailContext.replyTo
+  /** 1.C — Adjuntos opcionales. En modo `preview` solo guardamos metadata
+   *  (filename + contentType + size); en `production` viajan al provider
+   *  Postmark como base64; en `console` se loggea cantidad y total bytes. */
+  attachments?: MailAttachment[];
 };
 
 const MAIL_MODE = String(process.env.MAIL_MODE || "preview").toLowerCase(); // preview | console | production
 
+type PreviewAttachmentMeta = { filename: string; contentType: string; size: number };
+
 const previewStore = new Map<
   string,
-  { subject: string; html: string; text?: string; to: string; from?: string; createdAt: number }
+  {
+    subject: string;
+    html: string;
+    text?: string;
+    to: string;
+    from?: string;
+    createdAt: number;
+    attachments?: PreviewAttachmentMeta[];
+  }
 >();
 
 export async function sendMail(options: SendMailOptions) {
-  const { to, subject, html, text, from, replyTo } = options;
+  const { to, subject, html, text, from, replyTo, attachments } = options;
 
   if (MAIL_MODE === "preview") {
     const id = crypto.randomUUID();
-    previewStore.set(id, { subject, html, text, to, from: replyTo ? `${from} (Reply-To: ${replyTo})` : from, createdAt: Date.now() });
+    // No guardamos el buffer del adjunto en memoria — solo metadata. El
+    // dev igual ve qué archivos viajarian y de qué tamaño.
+    const attMeta: PreviewAttachmentMeta[] | undefined = attachments && attachments.length > 0
+      ? attachments.map((a) => ({ filename: a.filename, contentType: a.contentType, size: a.content.length }))
+      : undefined;
+    previewStore.set(id, {
+      subject, html, text, to,
+      from: replyTo ? `${from} (Reply-To: ${replyTo})` : from,
+      createdAt:   Date.now(),
+      attachments: attMeta,
+    });
 
     console.log("📧 [MAIL PREVIEW] Subject:", subject);
+    if (attMeta) console.log(`📎 [MAIL PREVIEW] Attachments: ${attMeta.length} file(s)`, attMeta.map((a) => `${a.filename} (${a.size}B)`).join(", "));
     console.log("👉 Preview URL:", `/dev/mail/${id}`);
     return { previewId: id };
   }
@@ -36,6 +74,10 @@ export async function sendMail(options: SendMailOptions) {
   if (MAIL_MODE === "console") {
     console.log("📧 [MAIL CONSOLE]");
     console.log({ to, from, subject });
+    if (attachments && attachments.length > 0) {
+      const totalBytes = attachments.reduce((acc, a) => acc + a.content.length, 0);
+      console.log(`📎 attachments: ${attachments.length} file(s), ${totalBytes} bytes`);
+    }
     console.log(text || "");
     return;
   }
@@ -44,10 +86,11 @@ export async function sendMail(options: SendMailOptions) {
     await postmarkSendMail({
       to,
       from: from || process.env.MAIL_FROM || "no-reply@tptech.local",
-      replyTo,  // TODO: postmark provider debe leer este campo y pasarlo como ReplyTo
+      replyTo,
       subject,
       html,
       text,
+      attachments,
     });
     return;
   }
@@ -91,6 +134,11 @@ export function registerMailPreviewRoute(app: any) {
       <div><strong>De:</strong> <span>${escapeHtml(mail.from || "(default)")}</span></div>
       <div><strong>Asunto:</strong> <span>${escapeHtml(mail.subject)}</span></div>
       <div style="margin-top:4px;"><strong>Enviado:</strong> <span>${new Date(mail.createdAt).toLocaleString("es-AR")}</span></div>
+      ${mail.attachments && mail.attachments.length > 0
+        ? `<div style="margin-top:6px;"><strong>📎 Adjuntos:</strong> <span>${mail.attachments
+            .map((a) => `${escapeHtml(a.filename)} (${escapeHtml(a.contentType)}, ${a.size} B)`)
+            .join(", ")}</span></div>`
+        : ""}
     </div>
     <iframe
       class="preview-frame"

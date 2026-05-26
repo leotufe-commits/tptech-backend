@@ -27,13 +27,25 @@ export async function postmarkSendMail(options: SendMailOptions) {
     throw new Error("[MAIL] Missing email body (html or text)");
   }
 
-  const payload = {
+  // 1.C — Adjuntos: Postmark espera `Attachments: [{ Name, Content (base64),
+  // ContentType }]`. Si options.attachments esta vacio/undefined, no enviamos
+  // la prop (Postmark se queja con array vacio).
+  const attachmentsPayload = (options.attachments ?? []).map((a) => ({
+    Name:        a.filename,
+    Content:     a.content.toString("base64"),
+    ContentType: a.contentType,
+  }));
+
+  const payload: Record<string, unknown> = {
     From: options.from || defaultFrom,
     To: options.to,
     Subject: options.subject,
     HtmlBody: options.html || undefined,
     TextBody: options.text || undefined,
     MessageStream: messageStream,
+    // Reply-To: header opcional. Postmark lo respeta nativamente.
+    ReplyTo: options.replyTo || undefined,
+    ...(attachmentsPayload.length > 0 ? { Attachments: attachmentsPayload } : {}),
   };
 
   if (!payload.From) {
@@ -45,6 +57,7 @@ export async function postmarkSendMail(options: SendMailOptions) {
     to: payload.To,
     subject: payload.Subject,
     stream: payload.MessageStream,
+    attachments: attachmentsPayload.length,
   });
 
   // ⏱ Timeout de seguridad
