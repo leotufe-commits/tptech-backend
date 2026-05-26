@@ -204,6 +204,11 @@ export function buildDefaultTemplateResponse(kind: DocumentKind, layoutType = "A
     columns:        COLUMNS_AVAILABLE[kind] ?? [],
     columnsVersion: 1,
 
+    // Plantilla de mail vacia → el modal `SendInvoiceEmailModal` usa los
+    // defaults state-aware (BORRADOR / FACTURA ANULADA / Factura).
+    emailSubjectTemplate: "",
+    emailMessageTemplate: "",
+
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };

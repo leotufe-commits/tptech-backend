@@ -29,6 +29,11 @@ const TEMPLATE_SELECT = {
   footerTerms: true, footerShowPageNumbers: true,
   footerPageFormat: true, footerPagePosition: true,
   sections: true, columns: true, columnsVersion: true,
+  // Plantilla de mail tenant-wide por tipo de documento. Strings vacios =
+  // el frontend usa los defaults state-aware. Soporta variables
+  // `{{cliente}}`, `{{numero}}`, `{{joyeria}}`, `{{estado}}`, `{{fecha}}`.
+  emailSubjectTemplate: true,
+  emailMessageTemplate: true,
   createdAt: true, updatedAt: true,
 } as const;
 
@@ -143,6 +148,13 @@ export async function saveTemplate(jewelryId: string, kind: DocumentKind, data: 
       // JSON
       sections: data.sections != null ? JSON.stringify(data.sections) : undefined,
       columns:  data.columns  != null ? JSON.stringify(data.columns)  : undefined,
+
+      // Plantilla de mail (subject + message templates con variables
+      // {{cliente}} {{numero}} {{joyeria}} {{estado}} {{fecha}}).
+      // Aceptan string vacio para "limpiar" la plantilla y volver al
+      // default state-aware del frontend.
+      emailSubjectTemplate: typeof data.emailSubjectTemplate === "string" ? data.emailSubjectTemplate : undefined,
+      emailMessageTemplate: typeof data.emailMessageTemplate === "string" ? data.emailMessageTemplate : undefined,
     },
     select: TEMPLATE_SELECT,
   });

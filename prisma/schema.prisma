@@ -2936,6 +2936,15 @@ model DocumentTemplate {
   columns        String @default("[]")
   columnsVersion Int    @default(1)
 
+  // ── Plantilla de mail por joyería + tipo de documento ────────────────────
+  // Variables soportadas al interpolar (frontend, modal SendInvoiceEmailModal):
+  //   {{cliente}}, {{numero}}, {{joyeria}}, {{estado}}, {{fecha}}
+  // Vacío = el modal cae al default state-aware (BORRADOR / FACTURA ANULADA /
+  // Factura). El botón "Guardar como predeterminado" del modal persiste el
+  // subject/message ACTUAL del operador acá (con o sin variables).
+  emailSubjectTemplate String @default("")
+  emailMessageTemplate String @default("")
+
   // ── Timestamps ────────────────────────────────────────────────────────────
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
