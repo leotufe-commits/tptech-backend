@@ -3397,36 +3397,26 @@ export async function previewSale(
 }
 
 // =============================================================================
-// 1.B — PDF oficial de la factura.
+// PDF del comprobante — disponible para cualquier estado.
+//
+// Pivot funcional: ya NO bloqueamos por DRAFT / CANCELLED. La diferencia
+// se hace VISUALMENTE en el PDF (watermark BORRADOR / ANULADA renderado
+// por `renderInvoicePdf`). Mismo criterio que el printable HTML — el
+// sello es la proteccion comercial, no el bloqueo del sistema.
 //
 // Lee:
-//   · `getSale(id, jewelryId)` → snapshot persistido + receipts[].
+//   · `getSale(id, jewelryId)` → snapshot persistido + receipts[]
+//     (`getSale` ya valida tenant + 404 — sigue siendo la unica defensa
+//     del scoping multi-tenant).
 //   · `getOrCreateTemplate(jewelryId, "FACTURA")` → SSOT de configuracion
 //     documental (columnas/secciones/margenes/header/footer/logo flag).
 //   · `jewelry` minimo para componer el bloque emisor.
 //
-// Estados bloqueados:
-//   · DRAFT     → 409 SALE_NOT_CONFIRMED (mensaje de UX listo).
-//   · CANCELLED → 409 SALE_CANCELLED.
-// Cualquier otro (`CONFIRMED`, `PAID`, `PARTIALLY_PAID`) deja generar.
-//
 // El render es PURO — esta funcion solo orquesta lectura + delega al renderer.
 // =============================================================================
 export async function generateSalePdf(id: string, jewelryId: string): Promise<{ buffer: Buffer; filename: string }> {
-  // getSale ya valida tenant + 404 y devuelve `receipts[]` (1.A).
+  // getSale valida tenant + 404 y devuelve `receipts[]` (1.A).
   const sale = await getSale(id, jewelryId) as any;
-
-  if (sale.status === "DRAFT") {
-    const e: any = new Error("Para generar el PDF oficial, primero confirmá la factura.");
-    e.status = 409; e.code = "SALE_NOT_CONFIRMED";
-    throw e;
-  }
-  if (sale.status === "CANCELLED") {
-    const e: any = new Error("Esta factura está anulada. No se puede generar el PDF oficial.");
-    e.status = 409; e.code = "SALE_CANCELLED";
-    throw e;
-  }
-
   return generateSalePdfFromLoadedSale(sale, jewelryId);
 }
 
@@ -3527,8 +3517,20 @@ async function generateSalePdfFromLoadedSale(sale: any, jewelryId: string): Prom
     jewelry:  pdfJewelry,
   });
 
-  // Nombre del archivo: priorizar el numero oficial; fallback al code interno.
-  const filename = `Factura-${receipt?.code ?? sale.code}.pdf`;
+  // Filename adaptive segun estado — alineado con el subject del envio
+  // por mail y el watermark del PDF:
+  //   · DRAFT     → Borrador-<Sale.code>.pdf
+  //   · CANCELLED → Factura-ANULADA-<numero visible>.pdf
+  //   · otros     → Factura-<Receipt.code o Sale.code>.pdf
+  // Para DRAFT no usamos Receipt.code aunque exista (raro pero defensivo):
+  // un PDF de borrador no debe sugerir un numero oficial.
+  const visibleNumber = receipt?.code ?? sale.code;
+  let filename: string;
+  switch (sale.status) {
+    case "DRAFT":     filename = `Borrador-${sale.code}.pdf`; break;
+    case "CANCELLED": filename = `Factura-ANULADA-${visibleNumber}.pdf`; break;
+    default:          filename = `Factura-${visibleNumber}.pdf`;
+  }
 
   return { buffer, filename };
 }
@@ -3544,22 +3546,25 @@ function toN(v: any): number {
 }
 
 // =============================================================================
-// 1.D — Envio de la factura por mail.
+// Envio de la factura por mail — disponible para cualquier estado.
 //
-// Reglas:
-//   · DRAFT      → 409 SALE_NOT_CONFIRMED.
-//   · CANCELLED  → 409 SALE_CANCELLED.
-//   · Sin Receipt.code (raro: confirmada pero sin comprobante asignado)
-//                → 409 SALE_WITHOUT_RECEIPT_NUMBER.
+// Pivot funcional: ya NO bloqueamos por DRAFT / CANCELLED ni por
+// ausencia de Receipt.code. El operador puede mandar:
+//   · BORRADOR (DRAFT)             → subject con prefijo "BORRADOR"
+//   · ANULADA  (CANCELLED)         → subject con prefijo "FACTURA ANULADA"
+//   · final (CONFIRMED/PAID/...)   → subject "Factura <Receipt.code>"
+// El PDF adjunto lleva el watermark correspondiente. El subject/body los
+// arma el FRONTEND con texto state-aware; este service no impone formato.
 //
-// El PDF lo genera `generateSalePdf` (misma SSOT que el endpoint /pdf) —
-// si el renderer cambia, ambos flujos (descarga + envio) se actualizan
-// automaticamente sin riesgo de divergencia.
+// Sigue valiendo:
+//   · getSale valida tenant + 404 (multi-tenancy).
+//   · email valido y subject/message no vacios → validados en controller.
+//   · attachment = PDF generado por el MISMO renderer que /pdf (zero
+//     divergencia entre descargar y enviar).
+//   · snapshot + template = SSOT — no se recalcula nada.
 //
 // El `from` lo toma del env `MAIL_FROM` (dominio TPTech validado en
-// Postmark). `ReplyTo` se setea al email de la joyeria si existe, asi
-// las respuestas del cliente caen en la casilla del tenant sin pedir
-// domain auth por tenant.
+// Postmark). `ReplyTo` se setea al email de la joyeria si existe.
 // =============================================================================
 
 export interface SendSaleByEmailInput {
@@ -3573,33 +3578,16 @@ export async function sendSaleByEmail(
   jewelryId:  string,
   input:      SendSaleByEmailInput,
 ): Promise<{ messagedRecipient: string; filename: string }> {
-  // 1) Validacion de estado del comprobante. Reusamos getSale (1.A trae receipts).
+  // getSale valida tenant + 404. No bloqueamos por estado.
   const sale = await getSale(id, jewelryId) as any;
 
-  if (sale.status === "DRAFT") {
-    const e: any = new Error("Para enviar el PDF oficial por mail, primero confirmá la factura.");
-    e.status = 409; e.code = "SALE_NOT_CONFIRMED";
-    throw e;
-  }
-  if (sale.status === "CANCELLED") {
-    const e: any = new Error("Esta factura está anulada. No se puede enviar el PDF oficial.");
-    e.status = 409; e.code = "SALE_CANCELLED";
-    throw e;
-  }
-
-  const receipt = (sale.receipts && sale.receipts.length > 0) ? sale.receipts[0] : null;
-  if (!receipt?.code) {
-    const e: any = new Error("La factura no tiene número oficial de comprobante asignado.");
-    e.status = 409; e.code = "SALE_WITHOUT_RECEIPT_NUMBER";
-    throw e;
-  }
-
-  // 2) Generar el PDF reusando el helper interno con el sale ya cargado
+  // 1) Generar el PDF reusando el helper interno con el sale ya cargado
   //    (evita un segundo getSale). El renderer sigue siendo la misma
-  //    SSOT que /pdf — descargar vs enviar producen el MISMO PDF.
+  //    SSOT que /pdf — descargar vs enviar producen el MISMO PDF, con
+  //    el mismo watermark segun estado.
   const { buffer, filename } = await generateSalePdfFromLoadedSale(sale, jewelryId);
 
-  // 3) ReplyTo: si el tenant configuro un email de joyeria, lo usamos para
+  // 2) ReplyTo: si el tenant configuro un email de joyeria, lo usamos para
   //    que la respuesta del cliente caiga directo en su casilla.
   const tenant = await prisma.jewelry.findUnique({
     where:  { id: jewelryId },
@@ -3607,7 +3595,7 @@ export async function sendSaleByEmail(
   });
   const replyTo = tenant?.email && tenant.email.trim().length > 0 ? tenant.email : undefined;
 
-  // 4) HTML del cuerpo: envolvemos el `message` plano del usuario en <pre>
+  // 3) HTML del cuerpo: envolvemos el `message` plano del usuario en <pre>
   //    con `white-space: pre-wrap` para preservar saltos de linea. El text
   //    plano va aparte (clientes de mail sin HTML).
   const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;

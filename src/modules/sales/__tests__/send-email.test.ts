@@ -99,26 +99,30 @@ const HAPPY_INPUT = {
   message: "Hola,\n\nAdjunto te enviamos la factura A-0001-00000001.\n\nSaludos.",
 };
 
-describe("sendSaleByEmail — 1.D", () => {
-  it("DRAFT → 409 SALE_NOT_CONFIRMED y NO llama a sendMail", async () => {
+describe("sendSaleByEmail — pivot funcional (sellos, no bloqueos)", () => {
+  it("DRAFT → envia con attachment Borrador-<code>.pdf (no bloquea)", async () => {
     mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ status: "DRAFT", receipts: [] }));
-    await expect(sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT))
-      .rejects.toMatchObject({ status: 409, code: "SALE_NOT_CONFIRMED" });
-    expect(mockSendMail).not.toHaveBeenCalled();
+    const out = await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    expect(out.filename).toBe("Borrador-VTA-0001.pdf");
+    expect(mockSendMail).toHaveBeenCalledTimes(1);
+    expect(mockSendMail.mock.calls[0]![0]!.attachments[0]).toMatchObject({
+      filename:    "Borrador-VTA-0001.pdf",
+      contentType: "application/pdf",
+    });
   });
 
-  it("CANCELLED → 409 SALE_CANCELLED y NO llama a sendMail", async () => {
+  it("CANCELLED → envia con attachment Factura-ANULADA-<num>.pdf (no bloquea)", async () => {
     mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ status: "CANCELLED" }));
-    await expect(sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT))
-      .rejects.toMatchObject({ status: 409, code: "SALE_CANCELLED" });
-    expect(mockSendMail).not.toHaveBeenCalled();
+    const out = await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    expect(out.filename).toBe("Factura-ANULADA-A-0001-00000001.pdf");
+    expect(mockSendMail).toHaveBeenCalledTimes(1);
   });
 
-  it("CONFIRMED sin receipts → 409 SALE_WITHOUT_RECEIPT_NUMBER", async () => {
+  it("CONFIRMED sin receipts → envia con filename Factura-<Sale.code>.pdf (fallback, no bloquea)", async () => {
     mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ receipts: [] }));
-    await expect(sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT))
-      .rejects.toMatchObject({ status: 409, code: "SALE_WITHOUT_RECEIPT_NUMBER" });
-    expect(mockSendMail).not.toHaveBeenCalled();
+    const out = await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    expect(out.filename).toBe("Factura-VTA-0001.pdf");
+    expect(mockSendMail).toHaveBeenCalledTimes(1);
   });
 
   it("cross-tenant → 404 (getSale devuelve null) y NO llama a sendMail", async () => {

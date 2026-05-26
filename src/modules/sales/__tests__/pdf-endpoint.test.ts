@@ -100,21 +100,26 @@ beforeEach(() => {
   mockPrisma.jewelry.findUnique.mockResolvedValue(makeJewelry());
 });
 
-describe("generateSalePdf — 1.B", () => {
-  it("DRAFT → 409 SALE_NOT_CONFIRMED", async () => {
+describe("generateSalePdf — pivot funcional (sellos, no bloqueos)", () => {
+  it("DRAFT → genera PDF con filename Borrador-<Sale.code>.pdf", async () => {
     mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ status: "DRAFT", receipts: [] }));
-    await expect(generateSalePdf("sale-1", "jw-1")).rejects.toMatchObject({
-      status: 409,
-      code:   "SALE_NOT_CONFIRMED",
-    });
+    const out = await generateSalePdf("sale-1", "jw-1");
+    expect(out.buffer.length).toBeGreaterThan(1000);
+    expect(out.buffer.subarray(0, 5).toString("ascii")).toBe("%PDF-");
+    expect(out.filename).toBe("Borrador-VTA-0001.pdf");
   });
 
-  it("CANCELLED → 409 SALE_CANCELLED", async () => {
+  it("CANCELLED → genera PDF con filename Factura-ANULADA-<numero>.pdf", async () => {
     mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ status: "CANCELLED" }));
-    await expect(generateSalePdf("sale-1", "jw-1")).rejects.toMatchObject({
-      status: 409,
-      code:   "SALE_CANCELLED",
-    });
+    const out = await generateSalePdf("sale-1", "jw-1");
+    expect(out.buffer.length).toBeGreaterThan(1000);
+    expect(out.filename).toBe("Factura-ANULADA-A-0001-00000001.pdf");
+  });
+
+  it("CANCELLED sin receipt → filename Factura-ANULADA-<Sale.code>.pdf", async () => {
+    mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ status: "CANCELLED", receipts: [] }));
+    const out = await generateSalePdf("sale-1", "jw-1");
+    expect(out.filename).toBe("Factura-ANULADA-VTA-0001.pdf");
   });
 
   it("CONFIRMED → buffer PDF valido + filename con Receipt.code", async () => {
@@ -126,7 +131,7 @@ describe("generateSalePdf — 1.B", () => {
     expect(out.filename).toBe("Factura-A-0001-00000001.pdf");
   });
 
-  it("sin Receipt persistido → filename cae al Sale.code interno", async () => {
+  it("CONFIRMED sin Receipt → filename Factura-<Sale.code>.pdf (fallback)", async () => {
     mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale({ receipts: [] }));
     const out = await generateSalePdf("sale-1", "jw-1");
     expect(out.filename).toBe("Factura-VTA-0001.pdf");
