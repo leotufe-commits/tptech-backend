@@ -1,0 +1,60 @@
+# render.yaml — TPTech backend
+# =============================================================================
+# Blueprint de Render para el web service `tptech-backend`. Hoy el deploy
+# corre desde la UI del dashboard (build / start command configurados a
+# mano). Este archivo NO cambia el deploy por sí solo: Render solo
+# respeta render.yaml cuando el servicio se sincroniza explícitamente
+# como Blueprint (o si nunca existió y se crea uno nuevo desde este YAML).
+#
+# 👉 Para activar las fuentes de Chromium en el deploy actual sin
+#    sincronizar Blueprint, copiar el `buildCommand` de abajo y pegarlo
+#    como `Build Command` en el dashboard del servicio.
+#
+# Motivación (C3): el motor PDF que se va a activar en C4-C5 usa
+# Puppeteer (chromium-min). Sin fuentes del sistema, Chromium renderiza
+# tildes, ñ, símbolos monetarios y emojis como cuadrados. Pre-instalar
+# `fonts-noto-core` + `fonts-liberation` + `fonts-noto-color-emoji`
+# cubre:
+#   · español completo (tildes, ñ, ¡¿)
+#   · símbolos monetarios ($, €, ¥, ₡, ₿, US$)
+#   · familias serif/sans estilo Arial/Times (por si el CSS del
+#     printable las pide explícitamente)
+#   · emojis (no esenciales pero baratos)
+#
+# `fc-cache -f` refresca el índice de fontconfig para que Chromium las
+# vea en el primer arranque.
+#
+# NOTA: `apt-get install` funciona en el Node native runtime de Render
+# (la build corre como root). Si el servicio se migrara a Docker, esto
+# debería volcarse al Dockerfile y `render.yaml` quedaría con
+# `runtime: docker` apuntando al Dockerfile.
+# =============================================================================
+
+services:
+  - type: web
+    name: tptech-backend
+    runtime: node
+    plan: starter            # ajustar según el plan real del servicio
+    region: oregon           # ajustar según la región real del servicio
+    branch: main
+    rootDir: tptech-backend  # si el servicio apunta al repo raíz; si apunta
+                             # directo al repo del backend, dejar en blanco
+
+    # Build: instala fuentes del sistema antes del install/build de Node.
+    buildCommand: >-
+      apt-get update -qq &&
+      apt-get install -y --no-install-recommends
+        fonts-noto-core
+        fonts-liberation
+        fonts-noto-color-emoji
+        fontconfig &&
+      fc-cache -f &&
+      npm install &&
+      npm run build
+
+    # Start: igual que el script actual (`prisma migrate deploy + node dist`).
+    startCommand: npm run start
+
+    # Variables de entorno: se siguen gestionando desde el dashboard
+    # (DATABASE_URL, JWT_SECRET, POSTMARK_TOKEN, R2_*, etc.). NO se
+    # listan acá para evitar duplicar configuración secreta en VCS.
