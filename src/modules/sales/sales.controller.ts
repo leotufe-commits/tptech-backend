@@ -1,5 +1,9 @@
 import type { Response } from "express";
 import * as service from "./sales.service.js";
+// C5-fix Opcion A — Endpoint render-only desde el draft del frontend.
+// Vive en su propio service para no entrar en conflicto con cambios
+// en curso de `sales.service.ts`.
+import * as draftPdfService from "./sales.draft-pdf.service.js";
 
 function s(v: any) { return String(v ?? "").trim(); }
 function assert(cond: any, msg: string) {
@@ -138,6 +142,83 @@ export async function sendEmail(req: any, res: Response) {
   assert(message,           "El mensaje (message) es requerido.");
 
   await service.sendSaleByEmail(id, req.user.jewelryId, { to, subject, message });
+  return res.json({ ok: true, message: "Factura enviada correctamente." });
+}
+
+// =============================================================================
+// C5-fix Opción A — Endpoints render-only desde el draft del frontend.
+//
+// El frontend manda EXACTAMENTE las mismas props que pasa al
+// `<SaleInvoicePrintable>` cuando hace `window.print()`. El backend
+// solo renderea — no crea Sale, no toca pricing-engine, no persiste.
+// Garantiza paridad visual Imprimir ↔ Descargar ↔ Mail.
+// =============================================================================
+
+/** Valida que el body tenga la forma mínima de `RenderDraftPdfInput`.
+ *  No usa Zod para mantener el patrón inline del módulo. */
+function validateRenderDraftBody(body: any): {
+  printable: any;
+  page:      { widthMm: number; heightMm: number; orientation?: "portrait" | "landscape" };
+  filename?: string;
+} {
+  assert(body && typeof body === "object", "Body inválido.");
+  assert(body.printable && typeof body.printable === "object", "Falta `printable` (props del componente).");
+  assert(body.page && typeof body.page === "object", "Falta `page` (config de página).");
+  const widthMm  = Number(body.page.widthMm);
+  const heightMm = Number(body.page.heightMm);
+  assert(widthMm > 0  && widthMm  < 2000, "`page.widthMm` inválido.");
+  assert(heightMm > 0 && heightMm < 2000, "`page.heightMm` inválido.");
+
+  const p = body.printable;
+  assert(typeof p.documentNumber === "string", "Falta printable.documentNumber.");
+  assert(typeof p.documentDate   === "string", "Falta printable.documentDate.");
+  assert(typeof p.clientName     === "string", "Falta printable.clientName.");
+  assert(Array.isArray(p.lines),                "Falta printable.lines (array).");
+  assert(p.totals && typeof p.totals === "object", "Falta printable.totals.");
+  assert(typeof p.totals.subtotal       === "number", "totals.subtotal debe ser numero.");
+  assert(typeof p.totals.discountAmount === "number", "totals.discountAmount debe ser numero.");
+  assert(typeof p.totals.taxAmount      === "number", "totals.taxAmount debe ser numero.");
+  assert(typeof p.totals.total          === "number", "totals.total debe ser numero.");
+  assert(typeof p.currencyCode === "string", "Falta printable.currencyCode.");
+
+  return {
+    printable: p,
+    page: {
+      widthMm,
+      heightMm,
+      orientation: body.page.orientation === "landscape" ? "landscape" : "portrait",
+    },
+    filename: typeof body.filename === "string" ? body.filename : undefined,
+  };
+}
+
+export async function renderDraftPdf(req: any, res: Response) {
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  const input    = validateRenderDraftBody(req.body);
+  const buffer   = await draftPdfService.renderSaleDraftPdf(input);
+  const filename = input.filename ?? "Factura.pdf";
+  res.setHeader("Content-Type",        "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Content-Length",      String(buffer.length));
+  return res.send(buffer);
+}
+
+export async function sendDraftEmail(req: any, res: Response) {
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  const base = validateRenderDraftBody(req.body);
+
+  const to      = s(req.body?.to);
+  const subject = s(req.body?.subject);
+  const message = s(req.body?.message);
+  assert(to,                "El destinatario (to) es requerido.");
+  assert(EMAIL_RX.test(to), "El destinatario no es un email válido.");
+  assert(subject,           "El asunto (subject) es requerido.");
+  assert(message,           "El mensaje (message) es requerido.");
+
+  await draftPdfService.sendSaleDraftByEmail(
+    { ...base, to, subject, message },
+    req.user.jewelryId,
+  );
   return res.json({ ok: true, message: "Factura enviada correctamente." });
 }
 

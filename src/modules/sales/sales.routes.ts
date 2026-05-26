@@ -22,4 +22,11 @@ router.get("/:id/pdf", asyncHandler(controller.downloadPdf));
 // 409 SALE_WITHOUT_RECEIPT_NUMBER si no hay Receipt.code.
 router.post("/:id/send-email", asyncHandler(controller.sendEmail));
 
+// C5-fix Opción A — Endpoints render-only desde el draft del frontend.
+// Body: { printable, page, filename? } (+ { to, subject, message } para email).
+// El frontend manda los mismos props que pasa a `<SaleInvoicePrintable>` en
+// `window.print()` → paridad garantizada Imprimir ↔ Descargar ↔ Mail.
+router.post("/render-pdf",        asyncHandler(controller.renderDraftPdf));
+router.post("/send-draft-email",  asyncHandler(controller.sendDraftEmail));
+
 export default router;
