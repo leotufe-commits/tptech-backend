@@ -3484,7 +3484,19 @@ async function generateSalePdfFromLoadedSale(sale: any, jewelryId: string): Prom
       discountPct: toN(l.discountPct),
       lineTotal:   toN(l.lineTotal),
       taxAmount:   l.taxAmount == null ? null : toN(l.taxAmount),
+      // Subtotal pre-descuento de la linea: si el snapshot lo trae
+      // explicito, usalo; si no, fallback a `lineTotal` (NO se
+      // recalcula — el printable acepta ambos como source de display).
+      subtotal:    l.subtotal != null ? toN(l.subtotal) : toN(l.lineTotal),
     })),
+    // C5 fix — meta consumida por el printable shared (paridad con
+    // el print del browser). Leen del Sale persistido — cero calculo.
+    sellerName:      sale.seller?.displayName
+                       ?? sale.sellerSnapshot?.displayName
+                       ?? sale.sellerSnapshot?.name
+                       ?? undefined,
+    warehouseName:   sale.warehouse?.name ?? undefined,
+    paymentTermName: sale.payments?.[0]?.paymentMethodName ?? undefined,
   };
 
   const pdfReceipt = receipt

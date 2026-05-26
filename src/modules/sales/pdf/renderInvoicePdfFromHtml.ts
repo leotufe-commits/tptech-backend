@@ -74,7 +74,11 @@ function mapStatus(raw: string): SaleInvoicePrintableProps["status"] {
  *  printable. `articleId` se setea a un placeholder no vacío SOLO para
  *  satisfacer el filtro interno del componente (`renderableLines`), que
  *  descarta filas sin `articleId`/`isManual`/HEADER. Esto es display, no
- *  business logic — la verdad sigue siendo el snapshot. */
+ *  business logic — la verdad sigue siendo el snapshot.
+ *
+ *  Paridad con el print del browser: el printable muestra columnas
+ *  Articulo / Cant. / P.unit. / Subtotal / Total. Los 5 valores vienen
+ *  del snapshot — cero recálculo. */
 function mapLine(line: PdfSaleLine, index: number): SaleInvoicePrintableLine {
   return {
     id:        String(index),
@@ -84,6 +88,11 @@ function mapLine(line: PdfSaleLine, index: number): SaleInvoicePrintableLine {
     sku:       line.sku,
     quantity:  line.quantity,
     unitPrice: line.unitPrice,
+    // `subtotal` viaja en el snapshot (con fallback a lineTotal en el
+    // adapter de sales.service). El printable lo usa para la columna
+    // "Subtotal" — si no se pasa, la columna sale en 0 (regresion
+    // visual contra el print del browser).
+    subtotal:  line.subtotal,
     lineTotal: line.lineTotal,
   };
 }
@@ -151,9 +160,19 @@ function buildPrintableProps(input: RenderInvoiceInput): SaleInvoicePrintablePro
     currencyCode: getCurrencyCode(sale),
     fxRate:       getFxRate(sale),
     notes:        sale.notes,
-    terms:        template.footerTerms,
-    sellerName:   sale.sellerSnapshot?.displayName ?? sale.sellerSnapshot?.name,
-    status:       mapStatus(sale.status),
+    // Terminos: el SaleLine model no persiste `terms` (es local del
+    // draft del frontend). Para el PDF server-side caemos al texto
+    // global de la plantilla — es lo mas cercano al print de browser
+    // sin tocar schema. Si en el futuro se persiste sale.terms, este
+    // mapeo lee primero ese campo.
+    terms:        ((sale as { terms?: string }).terms?.trim() || undefined)
+                   ?? (template.footerTerms?.trim() || undefined),
+    // Meta del documento — paridad con el print del browser. El sale
+    // ya trae estos campos del adapter en sales.service (sin recálculo).
+    sellerName:      sale.sellerName,
+    warehouseName:   sale.warehouseName,
+    paymentTermName: sale.paymentTermName,
+    status:          mapStatus(sale.status),
   };
 }
 

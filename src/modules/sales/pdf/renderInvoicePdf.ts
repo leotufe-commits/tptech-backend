@@ -36,6 +36,12 @@ export interface PdfSaleLine {
   discountPct: number;
   lineTotal:   number;
   taxAmount:   number | null;
+  /** Subtotal pre-descuento de la linea, tal como lo entrega el
+   *  snapshot del pricing-engine. Opcional para back-compat — el
+   *  renderer HTML (C4) lo usa para la columna "Subtotal" del
+   *  printable shared; el renderer pdfkit lo ignora (usa otras
+   *  columnas declaradas por DocumentTemplate). NO se recalcula. */
+  subtotal?:   number;
 }
 
 export interface PdfSale {
@@ -55,6 +61,12 @@ export interface PdfSale {
   sellerSnapshot:  { displayName?: string; name?: string } | null;
   lines:           PdfSaleLine[];
   client:          { displayName: string; documentType: string; documentNumber: string; ivaCondition: string } | null;
+  /** Campos meta consumidos por el printable shared (renderer HTML).
+   *  Opcionales para back-compat — el renderer pdfkit los ignora.
+   *  No se recalcula nada: estos vienen del Sale persistido. */
+  sellerName?:      string;
+  warehouseName?:   string;
+  paymentTermName?: string;
 }
 
 export interface PdfReceipt {
