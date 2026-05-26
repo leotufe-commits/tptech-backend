@@ -98,6 +98,10 @@ function makeSale(over: Partial<any> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.jewelry.findUnique.mockResolvedValue(makeJewelry());
+  // C5 — Fijamos el motor en pdfkit para validar el PDF buffer real
+  // sin lanzar Chromium. La selección de motor (default html, fallback,
+  // etc.) se cubre en `pdf-engine-switch.test.ts`.
+  process.env.PDF_ENGINE = "pdfkit";
 });
 
 describe("generateSalePdf — pivot funcional (sellos, no bloqueos)", () => {

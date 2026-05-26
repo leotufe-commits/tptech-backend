@@ -91,6 +91,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.jewelry.findUnique.mockResolvedValue(makeJewelry());
   mockSendMail.mockResolvedValue(undefined);
+  // C5 — Fijamos el motor en pdfkit para que el attachment sea un PDF
+  // real sin lanzar Chromium. La selección de motor se cubre en
+  // `pdf-engine-switch.test.ts`.
+  process.env.PDF_ENGINE = "pdfkit";
 });
 
 const HAPPY_INPUT = {

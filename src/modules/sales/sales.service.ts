@@ -2,7 +2,11 @@ import { prisma } from "../../lib/prisma.js";
 import { Prisma } from "@prisma/client";
 // 1.B — Render del PDF oficial. El renderer es PURO (read-only sobre el
 // snapshot). DocumentTemplate sigue siendo la SSOT de configuracion.
-import { renderInvoicePdf } from "./pdf/renderInvoicePdf.js";
+// C5 — `renderInvoicePdfBuffer` (helper privado abajo) elige entre el
+// motor HTML/Puppeteer (default) y el legacy pdfkit segun PDF_ENGINE,
+// con fallback automatico a pdfkit si HTML falla.
+import { renderInvoicePdf, type RenderInvoiceInput } from "./pdf/renderInvoicePdf.js";
+import { renderInvoicePdfFromHtml } from "./pdf/renderInvoicePdfFromHtml.js";
 import { getOrCreateTemplate } from "../document-templates/document-templates.service.js";
 // 1.D — Envio de la factura por mail. Reusamos `sendMail` (que ya soporta
 // attachments tras 1.C) y `generateSalePdf` para NO duplicar el PDF.
@@ -3510,7 +3514,7 @@ async function generateSalePdfFromLoadedSale(sale: any, jewelryId: string): Prom
     website:      jewelry.website ?? "",
   };
 
-  const buffer = await renderInvoicePdf({
+  const buffer = await renderInvoicePdfBuffer({
     sale:     pdfSale,
     receipt:  pdfReceipt,
     template: template as any,
@@ -3533,6 +3537,43 @@ async function generateSalePdfFromLoadedSale(sale: any, jewelryId: string): Prom
   }
 
   return { buffer, filename };
+}
+
+// =============================================================================
+// C5 — Selector de motor PDF + fallback automatico.
+//
+// `PDF_ENGINE` env var:
+//   · "html"   (default) → renderer HTML/Puppeteer (paridad visual con
+//                         Imprimir y con el mail adjunto).
+//   · "pdfkit"           → renderer legacy pdfkit (rollback).
+//
+// Si HTML falla por cualquier motivo (Chromium caido, modulo
+// `@tptech/shared` no resoluble en runtime, etc.), se cae al pdfkit y
+// se emite un `console.warn` con la razon. El caller nunca ve el error
+// del primer intento — el contrato es: "siempre devolvemos un Buffer
+// PDF mientras pdfkit este disponible".
+//
+// NO calcula nada — solo selecciona el motor y propaga el input al
+// renderer elegido. Ambos renderers reciben el mismo `RenderInvoiceInput`.
+// =============================================================================
+async function renderInvoicePdfBuffer(input: RenderInvoiceInput): Promise<Buffer> {
+  const engine = (process.env.PDF_ENGINE ?? "html").toLowerCase();
+
+  if (engine === "pdfkit") {
+    console.info("[PDF] engine=pdfkit");
+    return renderInvoicePdf(input);
+  }
+
+  // Default y "html": intentamos HTML, fallback transparente a pdfkit.
+  try {
+    const buffer = await renderInvoicePdfFromHtml(input);
+    console.info("[PDF] engine=html");
+    return buffer;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`[PDF] fallback=pdfkit reason=${reason}`);
+    return renderInvoicePdf(input);
+  }
 }
 
 /** Conversion segura Decimal/string/number → number. Solo para serializar
