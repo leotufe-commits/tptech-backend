@@ -20,8 +20,24 @@
     "resolveJsonModule": true,
     "verbatimModuleSyntax": true,
 
+    /* JSX habilitado para que TS pueda inferir tipos del
+       `SaleInvoicePrintable.tsx` importado vía @tptech/shared. El runtime
+       react-jsx no requiere `import React from "react"` en cada archivo. */
+    "jsx": "react-jsx",
+
     "noUnusedLocals": false,
-    "noUnusedParameters": false
+    "noUnusedParameters": false,
+
+    /* Submodulo tptech-shared (C1). NO declaramos `paths` acá porque
+       eso le diría a TS que vaya a buscar el .tsx real fuera del
+       `rootDir`, rompiendo `tsc --noEmit`. La resolución de tipos pasa
+       por la declaración ambient en `src/types/tptech-shared.d.ts`.
+       Resolución en runtime:
+         · vitest → `vitest.config.ts` declara `resolve.alias`.
+         · tsx (dev/start) → cuando C5 active el renderer real, se
+           agregará el alias en runtime (tsconfig-paths loader, o
+           tsc-alias post-build, o cambio de runtime). Hoy el renderer
+           HTML está creado pero no se invoca, así que esto no bloquea. */
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist"]
