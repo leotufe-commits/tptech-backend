@@ -153,6 +153,41 @@ function visibleColumns(cols: ColumnConfig[]): ColumnConfig[] {
   return cols.filter((c) => c.visible).slice().sort((a, b) => a.sortOrder - b.sortOrder);
 }
 
+/** Pivot funcional — el PDF se genera para CUALQUIER estado; el sello
+ *  visual es la proteccion comercial (no el bloqueo del sistema). Mismo
+ *  criterio que `SaleInvoicePrintable` frontend para que la version
+ *  impresa HTML y la descargada PDF coincidan en concepto:
+ *    · DRAFT     → "BORRADOR"  (no es comprobante oficial todavia)
+ *    · CANCELLED → "ANULADA"   (anulada — no surte efecto fiscal)
+ *    · resto     → null (CONFIRMED / PAID / PARTIALLY_PAID = sin sello) */
+function getStampLabelFromStatus(status: string): string | null {
+  switch (status) {
+    case "DRAFT":     return "BORRADOR";
+    case "CANCELLED": return "ANULADA";
+    default:          return null;
+  }
+}
+
+/** Dibuja el watermark/sello sobre el centro de la pagina actual.
+ *  Usa save/restore para aislar la transformacion (rotacion + opacity)
+ *  y no contaminar el cursor del contenido subsiguiente. Llama esto
+ *  ANTES de renderear el contenido para que el watermark quede de
+ *  fondo (opacity baja → el texto se ve por arriba sin ocluir). */
+function drawWatermark(doc: PDFKit.PDFDocument, label: string, status: string): void {
+  doc.save();
+  const color = status === "CANCELLED" ? "#b91c1c" : "#9ca3af";
+  doc.fillColor(color).fillOpacity(0.14);
+  const fontSize = label.length > 8 ? 90 : 130;
+  doc.font("Helvetica-Bold").fontSize(fontSize);
+  const cx = doc.page.width  / 2;
+  const cy = doc.page.height / 2;
+  doc.rotate(-28, { origin: [cx, cy] });
+  const w = doc.widthOfString(label);
+  const h = doc.currentLineHeight();
+  doc.text(label, cx - w / 2, cy - h / 2, { lineBreak: false });
+  doc.restore();
+}
+
 function getPageSize(template: PdfTemplate): [number, number] | string {
   if (template.isCustomSize && template.pageWidthMm > 0 && template.pageHeightMm > 0) {
     return [mmToPt(template.pageWidthMm), mmToPt(template.pageHeightMm)];
@@ -216,6 +251,13 @@ export async function renderInvoicePdf(input: RenderInvoiceInput): Promise<Buffe
       Title:  `Factura ${receipt?.code ?? sale.code}`,
       Author: jewelry.name || "TPTech",
     },
+    // Sin compresion de streams: el PDF queda ~10-20% mas grande pero
+    // (a) los tests pueden verificar el contenido textual del watermark
+    // / labels grepeando el buffer; (b) en debug de prod un PDF se puede
+    // abrir con `strings` o `cat` para verificar que columnas y secciones
+    // se rendearon. El tradeoff de tamano es despreciable para una
+    // factura (< 100 KB tipicos).
+    compress: false,
   });
 
   const chunks: Buffer[] = [];
@@ -226,6 +268,17 @@ export async function renderInvoicePdf(input: RenderInvoiceInput): Promise<Buffe
   });
 
   doc.font("Helvetica").fontSize(base);
+
+  // ── Sello / watermark segun estado del sale ─────────────────────────────
+  // Se dibuja ANTES del contenido para que quede de fondo (opacity baja).
+  // Para PDFs multipagina, registramos handler `pageAdded` que repite el
+  // sello en cada pagina nueva (el `pageAdded` no dispara para la primera
+  // pagina porque el constructor de PDFDocument ya la creo).
+  const stamp = getStampLabelFromStatus(sale.status);
+  if (stamp) {
+    drawWatermark(doc, stamp, sale.status);
+    doc.on("pageAdded", () => drawWatermark(doc, stamp, sale.status));
+  }
 
   // ── Header ───────────────────────────────────────────────────────────────
   renderHeaderAndMeta({ doc, template, jewelry, sale, receipt, accent, base });

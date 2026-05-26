@@ -17,6 +17,7 @@ function buildInput(over: {
   sections?:        Record<string, boolean>;
   withDiscount?:    boolean;
   withClient?:      boolean;
+  status?:          "DRAFT" | "CONFIRMED" | "CANCELLED" | "PAID" | "PARTIALLY_PAID";
 } = {}): RenderInvoiceInput {
   const allColumns = [
     { key: "position",    label: "#",            visible: false, width: 28,  align: "center" as const, sortOrder: 0 },
@@ -39,7 +40,7 @@ function buildInput(over: {
     sale: {
       id:             "sale-1",
       code:           "VTA-0001",
-      status:         "CONFIRMED",
+      status:         over.status ?? "CONFIRMED",
       saleDate:       new Date("2026-05-25T10:00:00Z"),
       notes:          "Entrega martes 9 hs",
       subtotal:       200,
@@ -135,11 +136,11 @@ describe("renderInvoicePdf — render puro", () => {
   });
 
   it("incluye el numero del Receipt en el contenido", async () => {
-    const buf = await renderInvoicePdf(buildInput({ withClient: true }));
-    // pdfkit escribe strings literales dentro de streams comprimidos; el
-    // numero aparece dentro del objeto `Title` de metadata sin compresion.
+    const buf  = await renderInvoicePdf(buildInput({ withClient: true }));
     const text = buf.toString("latin1");
-    expect(text).toContain("Factura A-0001-00000001");
+    // El numero aparece en el metadata `Title` (ASCII plano) y/o en el
+    // cuerpo del documento como hex en TJ — pdfHasText cubre ambos.
+    expect(pdfHasText(text, "Factura A-0001-00000001")).toBe(true);
   });
 
   it("respeta columnas: si `unitPrice.visible=false`, no aparece su label", async () => {
@@ -148,7 +149,7 @@ describe("renderInvoicePdf — render puro", () => {
       withClient:     true,
     }));
     const text = buf.toString("latin1");
-    expect(text).not.toContain("Precio unit.");
+    expect(pdfHasText(text, "Precio unit.")).toBe(false);
   });
 
   it("respeta sections: si `total=false`, no imprime 'Total' en el bloque", async () => {
@@ -156,16 +157,67 @@ describe("renderInvoicePdf — render puro", () => {
       sections: { subtotal: true, total: false, discount: false, taxes: false, observations: false },
     }));
     const text = buf.toString("latin1");
-    // El label "Total" no debe aparecer (no confundir con "Subtotal" que SI
-    // se imprime).
-    // Buscamos la string exacta "Total" rodeada de paréntesis o seguida de
-    // saltos de texto típicos de pdfkit.
-    const hasStandaloneTotal = /\(Total\)/.test(text);
-    expect(hasStandaloneTotal).toBe(false);
+    // "Subtotal" SI debe estar (su label completo incluye "Total" como
+    // sufijo); "Total" como label aislado NO. pdfHasText extrae runs
+    // completos de TJ, asi que diferencia entre las dos.
+    expect(pdfHasText(text, "Subtotal")).toBe(true);
+    // Buscamos un run que SEA exactamente "Total" — extraemos los runs y
+    // chequeamos que ninguno sea "Total" pelado (no que contenga "Total").
+    const runs = extractPdfTexts(text);
+    expect(runs).not.toContain("Total");
   });
 
   it("acepta sale sin cliente (consumidor final) sin lanzar", async () => {
     const buf = await renderInvoicePdf(buildInput({ withClient: false }));
     expect(buf.length).toBeGreaterThan(1000);
+  });
+
+  // PDFKit con Helvetica-Bold codifica los glifos como hex strings dentro
+  // de operadores TJ con kerning. Cada par de letras con kerning interrumpe
+  // el hex con un numero, ej. `[<414e554c4144> 40 <41> 0] TJ` = "ANULADA".
+  // Para verificar contenido textual, extraemos cada TJ, juntamos sus
+  // bloques `<hex>` y los decodificamos como latin1 — eso da la string
+  // logica que se imprimio en ese run.
+  function extractPdfTexts(pdfBuffer: string): string[] {
+    // TJ arrays (con kerning) — el caso comun con Helvetica.
+    const TJs = pdfBuffer.match(/\[[^\]]*\]\s*TJ/g) || [];
+    const fromTJ = TJs.map((tj) => {
+      const hexParts = tj.match(/<([0-9a-fA-F]+)>/g) || [];
+      return hexParts
+        .map((h) => Buffer.from(h.slice(1, -1), "hex").toString("latin1"))
+        .join("");
+    });
+    // Tj simples (sin kerning) — fallback por si pdfkit los emite.
+    const Tjs = pdfBuffer.match(/\(([^)]*)\)\s*Tj/g) || [];
+    const fromTj = Tjs.map((m) => m.replace(/^\(/, "").replace(/\)\s*Tj$/, ""));
+    return [...fromTJ, ...fromTj];
+  }
+  function pdfHasText(pdfBuffer: string, needle: string): boolean {
+    if (pdfBuffer.includes(needle)) return true;  // metadata plana (Title, etc.)
+    const runs = extractPdfTexts(pdfBuffer);
+    return runs.some((r) => r.includes(needle));
+  }
+
+  it("DRAFT → renderea watermark BORRADOR sobre el PDF", async () => {
+    const buf = await renderInvoicePdf(buildInput({ status: "DRAFT" }));
+    const text = buf.toString("latin1");
+    expect(pdfHasText(text, "BORRADOR")).toBe(true);
+    expect(pdfHasText(text, "ANULADA")).toBe(false);
+  });
+
+  it("CANCELLED → renderea watermark ANULADA sobre el PDF", async () => {
+    const buf = await renderInvoicePdf(buildInput({ status: "CANCELLED" }));
+    const text = buf.toString("latin1");
+    expect(pdfHasText(text, "ANULADA")).toBe(true);
+    expect(pdfHasText(text, "BORRADOR")).toBe(false);
+  });
+
+  it("CONFIRMED / PAID / PARTIALLY_PAID → sin watermark", async () => {
+    for (const status of ["CONFIRMED", "PAID", "PARTIALLY_PAID"] as const) {
+      const buf = await renderInvoicePdf(buildInput({ status }));
+      const text = buf.toString("latin1");
+      expect(pdfHasText(text, "BORRADOR"), `status=${status}`).toBe(false);
+      expect(pdfHasText(text, "ANULADA"),  `status=${status}`).toBe(false);
+    }
   });
 });
