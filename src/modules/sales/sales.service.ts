@@ -11,6 +11,8 @@ import { getOrCreateTemplate } from "../document-templates/document-templates.se
 // 1.D — Envio de la factura por mail. Reusamos `sendMail` (que ya soporta
 // attachments tras 1.C) y `generateSalePdf` para NO duplicar el PDF.
 import { sendMail } from "../../lib/mail.service.js";
+// E2 — Log documental del envío. Inmutable, sin propagar errores.
+import { createDocumentEmailLog } from "../../lib/document-email-log.js";
 import {
   calculateCostFromLines,
   buildBatchCostContext,
@@ -3627,9 +3629,10 @@ export interface SendSaleByEmailInput {
 }
 
 export async function sendSaleByEmail(
-  id:         string,
-  jewelryId:  string,
-  input:      SendSaleByEmailInput,
+  id:           string,
+  jewelryId:    string,
+  input:        SendSaleByEmailInput,
+  sentByUserId?: string | null,
 ): Promise<{ messagedRecipient: string; filename: string }> {
   // getSale valida tenant + 404. No bloqueamos por estado.
   const sale = await getSale(id, jewelryId) as any;
@@ -3653,16 +3656,47 @@ export async function sendSaleByEmail(
   //    plano va aparte (clientes de mail sin HTML).
   const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;
 
-  await sendMail({
-    to:      input.to,
-    subject: input.subject,
-    html,
-    text:    input.message,
-    replyTo,
-    attachments: [
-      { filename, content: buffer, contentType: "application/pdf" },
-    ],
+  // E2 — envoltura para capturar messageId y errores del provider,
+  // luego persistir el log documental. El log NUNCA rompe el envío
+  // (createDocumentEmailLog traga errores internamente).
+  let mailResult: { messageId: string | null } = { messageId: null };
+  let sendError:  Error | null = null;
+  try {
+    mailResult = await sendMail({
+      to:      input.to,
+      subject: input.subject,
+      html,
+      text:    input.message,
+      replyTo,
+      attachments: [
+        { filename, content: buffer, contentType: "application/pdf" },
+      ],
+    });
+  } catch (err) {
+    sendError = err instanceof Error ? err : new Error(String(err));
+  }
+
+  // E2 — Log documental inmutable. status SENT u FAILED segun el
+  // resultado del provider. saleId queda como documentId Y como
+  // saleId anchor para el index del historial.
+  await createDocumentEmailLog({
+    jewelryId,
+    documentKind:       "SALE_INVOICE",
+    documentId:         id,
+    saleId:             id,
+    recipientEmail:     input.to,
+    subjectSnapshot:    input.subject,
+    bodySnapshot:       input.message,
+    attachmentFilename: filename,
+    provider:           "postmark",
+    providerMessageId:  mailResult.messageId,
+    status:             sendError ? "FAILED" : "SENT",
+    sentByUserId:       sentByUserId ?? null,
   });
+
+  // Si el provider tiró, propagamos DESPUÉS del log para que el
+  // operador vea el toast de error pero la auditoría quede registrada.
+  if (sendError) throw sendError;
 
   return { messagedRecipient: input.to, filename };
 }

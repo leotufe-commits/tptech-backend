@@ -27,6 +27,8 @@ import { Prisma } from "@prisma/client";
 const mockPrisma = vi.hoisted(() => ({
   sale:    { findFirst: vi.fn() },
   jewelry: { findUnique: vi.fn() },
+  // E2 — log documental persistido al final del flujo de envío.
+  documentEmailLog: { create: vi.fn().mockResolvedValue({ id: "log-1" }) },
 }));
 vi.mock("../../../lib/prisma.js", () => ({ prisma: mockPrisma, Prisma }));
 
@@ -51,7 +53,7 @@ vi.mock("../../document-templates/document-templates.service.js", () => ({
   }),
 }));
 
-const mockSendMail = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockSendMail = vi.hoisted(() => vi.fn().mockResolvedValue({ messageId: null }));
 vi.mock("../../../lib/mail.service.js", () => ({ sendMail: mockSendMail }));
 
 // Mock de AMBOS renderers. Devuelven Buffers con marcador identificable

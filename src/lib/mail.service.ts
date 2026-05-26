@@ -48,7 +48,20 @@ const previewStore = new Map<
   }
 >();
 
-export async function sendMail(options: SendMailOptions) {
+/** Resultado normalizado de `sendMail` — uniforme entre los 3 modos
+ *  (preview / console / production).
+ *    · `messageId` es el ID del provider en producción (ej. Postmark
+ *      MessageID) o `null` en los otros modos.
+ *    · `previewId` viene poblado SOLO en preview mode — es el id
+ *      bajo el que el dev server expone el render en `/dev/mail/:id`.
+ *
+ *  Los callers que quieran auditar/loggear leen `messageId`. */
+export type SendMailResult = {
+  messageId: string | null;
+  previewId?: string;
+};
+
+export async function sendMail(options: SendMailOptions): Promise<SendMailResult> {
   const { to, subject, html, text, from, replyTo, attachments } = options;
 
   if (MAIL_MODE === "preview") {
@@ -68,7 +81,10 @@ export async function sendMail(options: SendMailOptions) {
     console.log("📧 [MAIL PREVIEW] Subject:", subject);
     if (attMeta) console.log(`📎 [MAIL PREVIEW] Attachments: ${attMeta.length} file(s)`, attMeta.map((a) => `${a.filename} (${a.size}B)`).join(", "));
     console.log("👉 Preview URL:", `/dev/mail/${id}`);
-    return { previewId: id };
+    // En preview NO hay messageId del provider. Devolvemos null para
+    // que el caller (sendSale*ByEmail) sepa que el log queda sin id.
+    // `previewId` queda accesible para tests / dashboards locales.
+    return { messageId: null, previewId: id };
   }
 
   if (MAIL_MODE === "console") {
@@ -79,11 +95,11 @@ export async function sendMail(options: SendMailOptions) {
       console.log(`📎 attachments: ${attachments.length} file(s), ${totalBytes} bytes`);
     }
     console.log(text || "");
-    return;
+    return { messageId: null };
   }
 
   if (MAIL_MODE === "production") {
-    await postmarkSendMail({
+    const data = await postmarkSendMail({
       to,
       from: from || process.env.MAIL_FROM || "no-reply@tptech.local",
       replyTo,
@@ -92,13 +108,18 @@ export async function sendMail(options: SendMailOptions) {
       text,
       attachments,
     });
-    return;
+    // postmarkSendMail devuelve la response de Postmark, que incluye
+    // `MessageID` (string). Lo propagamos al caller para persistir en
+    // `DocumentEmailLog` y poder matchear webhooks futuros (E5).
+    const messageId = (data as { MessageID?: unknown } | null | undefined)?.MessageID;
+    return { messageId: typeof messageId === "string" ? messageId : null };
   }
 
   // fallback
   console.log("⚠️ [MAIL] MAIL_MODE inválido, usando console");
   console.log({ to, from, subject });
   console.log(text || "");
+  return { messageId: null };
 }
 
 export function registerMailPreviewRoute(app: any) {

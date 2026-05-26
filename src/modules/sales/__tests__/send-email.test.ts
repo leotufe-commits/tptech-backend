@@ -18,6 +18,9 @@ import { Prisma } from "@prisma/client";
 const mockPrisma = vi.hoisted(() => ({
   sale:    { findFirst:  vi.fn() },
   jewelry: { findUnique: vi.fn() },
+  // E2 — el flujo de envío persiste un log documental al final.
+  // Mockeado para que no contamine los asserts del happy path.
+  documentEmailLog: { create: vi.fn().mockResolvedValue({ id: "log-1" }) },
 }));
 vi.mock("../../../lib/prisma.js", () => ({ prisma: mockPrisma, Prisma }));
 
@@ -47,7 +50,7 @@ vi.mock("../../document-templates/document-templates.service.js", () => ({
   }),
 }));
 
-const mockSendMail = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockSendMail = vi.hoisted(() => vi.fn().mockResolvedValue({ messageId: null }));
 vi.mock("../../../lib/mail.service.js", () => ({ sendMail: mockSendMail }));
 
 import { sendSaleByEmail } from "../sales.service.js";
@@ -90,7 +93,7 @@ function makeSale(over: Partial<any> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.jewelry.findUnique.mockResolvedValue(makeJewelry());
-  mockSendMail.mockResolvedValue(undefined);
+  mockSendMail.mockResolvedValue({ messageId: null });
   // C5 — Fijamos el motor en pdfkit para que el attachment sea un PDF
   // real sin lanzar Chromium. La selección de motor se cubre en
   // `pdf-engine-switch.test.ts`.

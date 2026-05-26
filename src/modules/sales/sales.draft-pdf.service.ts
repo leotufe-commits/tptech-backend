@@ -36,6 +36,9 @@ import {
 } from "../../lib/pdf/renderPrintableToPdf.js";
 import { sendMail } from "../../lib/mail.service.js";
 import { prisma } from "../../lib/prisma.js";
+// E2 — Log documental del envío. Inmutable, sin propagar errores —
+// si el log falla, el envío sigue ok. El log NO impacta el flujo.
+import { createDocumentEmailLog } from "../../lib/document-email-log.js";
 
 // ─── Tipos del request ───────────────────────────────────────────────────────
 
@@ -52,6 +55,11 @@ export interface SendDraftEmailInput extends RenderDraftPdfInput {
   to:      string;
   subject: string;
   message: string;
+  /** E2 — REQUERIDO. Anchor al Sale persistido para que el log
+   *  documental tenga referencia trazable. El frontend persiste el
+   *  draft via `ensurePersistedSaleDraft` antes de invocar este flujo
+   *  → emails huérfanos sin documento ya no son aceptados. */
+  saleId:  string;
 }
 
 // ─── Render principal ────────────────────────────────────────────────────────
@@ -71,10 +79,15 @@ export async function renderSaleDraftPdf(input: RenderDraftPdfInput): Promise<Bu
 }
 
 /** Envía por mail el PDF del draft. Mismo renderer que el download
- *  → un único buffer por operación → adjunto == descarga. */
+ *  → un único buffer por operación → adjunto == descarga.
+ *
+ *  E2 — Después del envío (OK o no), persiste un log documental
+ *  inmutable en `DocumentEmailLog`. El log NUNCA rompe el envío:
+ *  el helper `createDocumentEmailLog` traga errores internamente. */
 export async function sendSaleDraftByEmail(
-  input:     SendDraftEmailInput,
-  jewelryId: string,
+  input:        SendDraftEmailInput,
+  jewelryId:    string,
+  sentByUserId?: string | null,
 ): Promise<{ messagedRecipient: string; filename: string }> {
   const buffer   = await renderSaleDraftPdf(input);
   const filename = input.filename ?? "Factura.pdf";
@@ -89,16 +102,45 @@ export async function sendSaleDraftByEmail(
 
   const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;
 
-  await sendMail({
-    to:      input.to,
-    subject: input.subject,
-    html,
-    text:    input.message,
-    replyTo,
-    attachments: [
-      { filename, content: buffer, contentType: "application/pdf" },
-    ],
+  let mailResult: { messageId: string | null } = { messageId: null };
+  let sendError:  Error | null = null;
+  try {
+    mailResult = await sendMail({
+      to:      input.to,
+      subject: input.subject,
+      html,
+      text:    input.message,
+      replyTo,
+      attachments: [
+        { filename, content: buffer, contentType: "application/pdf" },
+      ],
+    });
+  } catch (err) {
+    sendError = err instanceof Error ? err : new Error(String(err));
+  }
+
+  // E2 — Log documental. Inmutable. NUNCA propaga errores (el helper
+  // traga la excepción y devuelve null) → si la DB falla, el envío
+  // sigue su curso (caller recibe el sendError si lo hubo, o el OK).
+  await createDocumentEmailLog({
+    jewelryId,
+    documentKind:       "SALE_INVOICE",
+    documentId:         input.saleId,
+    saleId:             input.saleId,
+    recipientEmail:     input.to,
+    subjectSnapshot:    input.subject,
+    bodySnapshot:       input.message,
+    attachmentFilename: filename,
+    provider:           "postmark",
+    providerMessageId:  mailResult.messageId,
+    status:             sendError ? "FAILED" : "SENT",
+    sentByUserId:       sentByUserId ?? null,
   });
+
+  // Si el envío falló, propagamos el error al caller DESPUÉS de
+  // haber persistido el log FAILED — así el operador ve el toast
+  // de error Y la auditoría queda registrada.
+  if (sendError) throw sendError;
 
   return { messagedRecipient: input.to, filename };
 }

@@ -141,7 +141,12 @@ export async function sendEmail(req: any, res: Response) {
   assert(subject,           "El asunto (subject) es requerido.");
   assert(message,           "El mensaje (message) es requerido.");
 
-  await service.sendSaleByEmail(id, req.user.jewelryId, { to, subject, message });
+  await service.sendSaleByEmail(
+    id,
+    req.user.jewelryId,
+    { to, subject, message },
+    req.user?.id ?? null,
+  );
   return res.json({ ok: true, message: "Factura enviada correctamente." });
 }
 
@@ -210,14 +215,22 @@ export async function sendDraftEmail(req: any, res: Response) {
   const to      = s(req.body?.to);
   const subject = s(req.body?.subject);
   const message = s(req.body?.message);
+  // E2 — `saleId` requerido. El frontend persiste el draft via
+  // `ensurePersistedSaleDraft` antes de invocar este endpoint, y
+  // manda el id resultante. Sin saleId no aceptamos el envío —
+  // emails huérfanos rompen la trazabilidad documental.
+  const saleId  = s(req.body?.saleId);
+
   assert(to,                "El destinatario (to) es requerido.");
   assert(EMAIL_RX.test(to), "El destinatario no es un email válido.");
   assert(subject,           "El asunto (subject) es requerido.");
   assert(message,           "El mensaje (message) es requerido.");
+  assert(saleId,            "Falta `saleId` — el draft debe estar persistido antes de enviar el mail (E2).");
 
   await draftPdfService.sendSaleDraftByEmail(
-    { ...base, to, subject, message },
+    { ...base, to, subject, message, saleId },
     req.user.jewelryId,
+    req.user?.id ?? null,
   );
   return res.json({ ok: true, message: "Factura enviada correctamente." });
 }

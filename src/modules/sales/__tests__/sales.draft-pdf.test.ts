@@ -16,14 +16,19 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Mock prisma — el test verifica que el flujo NO llame a prisma.
+// Mock prisma — el test verifica que el flujo NO llame a prisma.sale.
+// `documentEmailLog.create` SÍ se invoca (E2) pero el helper traga
+// errores → el comportamiento del flujo de envío no cambia si la
+// persistencia del log falla. Los tests dedicados al log están en
+// `src/lib/__tests__/document-email-log.test.ts`.
 const mockPrisma = vi.hoisted(() => ({
   sale:    { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() },
   jewelry: { findUnique: vi.fn().mockResolvedValue({ email: "tenant@example.com" }) },
+  documentEmailLog: { create: vi.fn().mockResolvedValue({ id: "log-1" }) },
 }));
 vi.mock("../../../lib/prisma.js", () => ({ prisma: mockPrisma }));
 
-const mockSendMail = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockSendMail = vi.hoisted(() => vi.fn().mockResolvedValue({ messageId: null }));
 vi.mock("../../../lib/mail.service.js", () => ({ sendMail: mockSendMail }));
 
 // Mock del helper de render (no lanzamos Puppeteer real). Devolvemos un
@@ -169,6 +174,7 @@ describe("sendSaleDraftByEmail — adjunto == download", () => {
       to:      "cliente@example.com",
       subject: "Factura A-0001-00000001",
       message: "Adjuntamos su factura.",
+      saleId:  "sale-1",
     };
 
     await sendSaleDraftByEmail(req, "jw-1");
@@ -192,6 +198,7 @@ describe("sendSaleDraftByEmail — adjunto == download", () => {
       to:      "cliente@example.com",
       subject: "Test",
       message: "Test",
+      saleId:  "sale-1",
     };
     await sendSaleDraftByEmail(req, "jw-1");
 
@@ -206,6 +213,7 @@ describe("sendSaleDraftByEmail — adjunto == download", () => {
       to:      "cliente@example.com",
       subject: "Test",
       message: "Test",
+      saleId:  "sale-1",
     };
     await sendSaleDraftByEmail(req, "jw-1");
 
@@ -213,12 +221,13 @@ describe("sendSaleDraftByEmail — adjunto == download", () => {
     expect(mailArgs.replyTo).toBeUndefined();
   });
 
-  it("NO toca prisma.sale (cero persistencia)", async () => {
+  it("NO toca prisma.sale (cero persistencia del documento — solo persiste el log)", async () => {
     const req = {
       ...buildDraftRequest(),
       to:      "cliente@example.com",
       subject: "Test",
       message: "Test",
+      saleId:  "sale-1",
     };
     await sendSaleDraftByEmail(req, "jw-1");
 

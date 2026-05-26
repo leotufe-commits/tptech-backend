@@ -43,7 +43,7 @@ describe("mail.service / postmark — attachments", () => {
       ],
     });
 
-    const previewId = (res as { previewId: string }).previewId;
+    const previewId = res.previewId;
     expect(previewId).toBeTruthy();
 
     // Verificamos indirectamente via la ruta de preview HTML — capturamos
