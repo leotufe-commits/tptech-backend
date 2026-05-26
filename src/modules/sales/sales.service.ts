@@ -4,6 +4,9 @@ import { Prisma } from "@prisma/client";
 // snapshot). DocumentTemplate sigue siendo la SSOT de configuracion.
 import { renderInvoicePdf } from "./pdf/renderInvoicePdf.js";
 import { getOrCreateTemplate } from "../document-templates/document-templates.service.js";
+// 1.D — Envio de la factura por mail. Reusamos `sendMail` (que ya soporta
+// attachments tras 1.C) y `generateSalePdf` para NO duplicar el PDF.
+import { sendMail } from "../../lib/mail.service.js";
 import {
   calculateCostFromLines,
   buildBatchCostContext,
@@ -3424,6 +3427,14 @@ export async function generateSalePdf(id: string, jewelryId: string): Promise<{ 
     throw e;
   }
 
+  return generateSalePdfFromLoadedSale(sale, jewelryId);
+}
+
+/** 1.D — Variante interna que recibe el sale YA cargado (con receipts).
+ *  Evita el doble roundtrip a Prisma cuando el caller ya tiene la venta
+ *  en memoria (ej. `sendSaleByEmail` que valida estado antes de generar
+ *  el PDF). NO valida estado — eso es responsabilidad del caller. */
+async function generateSalePdfFromLoadedSale(sale: any, jewelryId: string): Promise<{ buffer: Buffer; filename: string }> {
   const receipt = (sale.receipts && sale.receipts.length > 0) ? sale.receipts[0] : null;
 
   const [template, jewelry] = await Promise.all([
@@ -3530,4 +3541,99 @@ function toN(v: any): number {
   if (typeof v === "string") return Number(v) || 0;
   if (typeof v === "object" && typeof v.toString === "function") return Number(v.toString()) || 0;
   return 0;
+}
+
+// =============================================================================
+// 1.D — Envio de la factura por mail.
+//
+// Reglas:
+//   · DRAFT      → 409 SALE_NOT_CONFIRMED.
+//   · CANCELLED  → 409 SALE_CANCELLED.
+//   · Sin Receipt.code (raro: confirmada pero sin comprobante asignado)
+//                → 409 SALE_WITHOUT_RECEIPT_NUMBER.
+//
+// El PDF lo genera `generateSalePdf` (misma SSOT que el endpoint /pdf) —
+// si el renderer cambia, ambos flujos (descarga + envio) se actualizan
+// automaticamente sin riesgo de divergencia.
+//
+// El `from` lo toma del env `MAIL_FROM` (dominio TPTech validado en
+// Postmark). `ReplyTo` se setea al email de la joyeria si existe, asi
+// las respuestas del cliente caen en la casilla del tenant sin pedir
+// domain auth por tenant.
+// =============================================================================
+
+export interface SendSaleByEmailInput {
+  to:      string;
+  subject: string;
+  message: string;
+}
+
+export async function sendSaleByEmail(
+  id:         string,
+  jewelryId:  string,
+  input:      SendSaleByEmailInput,
+): Promise<{ messagedRecipient: string; filename: string }> {
+  // 1) Validacion de estado del comprobante. Reusamos getSale (1.A trae receipts).
+  const sale = await getSale(id, jewelryId) as any;
+
+  if (sale.status === "DRAFT") {
+    const e: any = new Error("Para enviar el PDF oficial por mail, primero confirmá la factura.");
+    e.status = 409; e.code = "SALE_NOT_CONFIRMED";
+    throw e;
+  }
+  if (sale.status === "CANCELLED") {
+    const e: any = new Error("Esta factura está anulada. No se puede enviar el PDF oficial.");
+    e.status = 409; e.code = "SALE_CANCELLED";
+    throw e;
+  }
+
+  const receipt = (sale.receipts && sale.receipts.length > 0) ? sale.receipts[0] : null;
+  if (!receipt?.code) {
+    const e: any = new Error("La factura no tiene número oficial de comprobante asignado.");
+    e.status = 409; e.code = "SALE_WITHOUT_RECEIPT_NUMBER";
+    throw e;
+  }
+
+  // 2) Generar el PDF reusando el helper interno con el sale ya cargado
+  //    (evita un segundo getSale). El renderer sigue siendo la misma
+  //    SSOT que /pdf — descargar vs enviar producen el MISMO PDF.
+  const { buffer, filename } = await generateSalePdfFromLoadedSale(sale, jewelryId);
+
+  // 3) ReplyTo: si el tenant configuro un email de joyeria, lo usamos para
+  //    que la respuesta del cliente caiga directo en su casilla.
+  const tenant = await prisma.jewelry.findUnique({
+    where:  { id: jewelryId },
+    select: { email: true },
+  });
+  const replyTo = tenant?.email && tenant.email.trim().length > 0 ? tenant.email : undefined;
+
+  // 4) HTML del cuerpo: envolvemos el `message` plano del usuario en <pre>
+  //    con `white-space: pre-wrap` para preservar saltos de linea. El text
+  //    plano va aparte (clientes de mail sin HTML).
+  const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;
+
+  await sendMail({
+    to:      input.to,
+    subject: input.subject,
+    html,
+    text:    input.message,
+    replyTo,
+    attachments: [
+      { filename, content: buffer, contentType: "application/pdf" },
+    ],
+  });
+
+  return { messagedRecipient: input.to, filename };
+}
+
+/** Escape minimo para inyectar texto del usuario en HTML del cuerpo del
+ *  mail. NO es un sanitizador completo — el cuerpo va dentro de un
+ *  <pre>, asi que solo necesitamos neutralizar `<` `>` `&` `"` `'`. */
+function escapeHtmlForMail(s: string): string {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }

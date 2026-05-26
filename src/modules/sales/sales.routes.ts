@@ -17,5 +17,9 @@ router.patch("/:id/cancel", asyncHandler(controller.cancel));
 // (DRAFT → 409 SALE_NOT_CONFIRMED, CANCELLED → 409 SALE_CANCELLED). Lee
 // snapshot + Receipt.code + DocumentTemplate FACTURA y devuelve un PDF.
 router.get("/:id/pdf", asyncHandler(controller.downloadPdf));
+// 1.D — Envia el PDF oficial por mail al destinatario indicado.
+// Body: { to, subject, message }. Mismas reglas de estado que /pdf +
+// 409 SALE_WITHOUT_RECEIPT_NUMBER si no hay Receipt.code.
+router.post("/:id/send-email", asyncHandler(controller.sendEmail));
 
 export default router;

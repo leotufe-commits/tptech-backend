@@ -119,6 +119,28 @@ export async function downloadPdf(req: any, res: Response) {
   return res.send(buffer);
 }
 
+// 1.D — Envia el PDF oficial por mail al destinatario indicado.
+// Validaciones inline (sin Zod para mantener simetria con los otros
+// handlers del modulo). 409 SALE_NOT_CONFIRMED / SALE_CANCELLED /
+// SALE_WITHOUT_RECEIPT_NUMBER segun el estado de la venta.
+const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export async function sendEmail(req: any, res: Response) {
+  const id = s(req.params?.id);
+  assert(req.user?.jewelryId, "Tenant inválido.");
+  assert(id, "Id inválido.");
+
+  const to      = s(req.body?.to);
+  const subject = s(req.body?.subject);
+  const message = s(req.body?.message);
+  assert(to,                "El destinatario (to) es requerido.");
+  assert(EMAIL_RX.test(to), "El destinatario no es un email válido.");
+  assert(subject,           "El asunto (subject) es requerido.");
+  assert(message,           "El mensaje (message) es requerido.");
+
+  await service.sendSaleByEmail(id, req.user.jewelryId, { to, subject, message });
+  return res.json({ ok: true, message: "Factura enviada correctamente." });
+}
+
 // Preview — calcula precios + checkout sin crear la venta
 export async function previewSale(req: any, res: Response) {
   assert(req.user?.jewelryId, "Tenant inválido.");
