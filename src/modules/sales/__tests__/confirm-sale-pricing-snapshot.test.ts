@@ -54,6 +54,9 @@ vi.mock("../../../lib/pricing-engine/pricing-engine.js", () => ({
   // sin metalHechuraBreakdown como agregados=0; no afecta los assertions
   // existentes de este archivo de tests).
   deriveMetalHechuraBreakdown:    () => null,
+  // POLICY §Tax.3 — porción FIXED del impuesto (no escala con descuentos doc).
+  // Mock retorna 0 → los tests no validan tax FIXED, equivale a "todo escalable".
+  sumFixedTaxComponent:           () => 0,
   // F17 — sales.service ahora llama computePurchaseTaxes en
   // getLinePricingSnapshotForConfirm (legacy recompute path) para que el
   // snapshot v7 persistido incluya el bloque de impuestos de costo.

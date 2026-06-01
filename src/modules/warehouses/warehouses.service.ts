@@ -1,5 +1,10 @@
 // tptech-backend/src/modules/warehouses/warehouses.service.ts
 import { prisma } from "../../lib/prisma.js";
+import {
+  getSalesDefaultWarehouseId,
+  setSalesDefaultWarehouseId,
+  reassignSalesDefaultWarehouse,
+} from "../user-preferences/user-preferences.service.js";
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -60,14 +65,8 @@ async function getOrAssignEffectiveFavoriteWarehouseId(opts: {
   const userId = opts.userId;
   const warehouses = opts.warehouses;
 
-  const user = await prisma.user.findFirst({
-    where: { id: userId, jewelryId, deletedAt: null },
-    select: { id: true, favoriteWarehouseId: true },
-  });
-
-  assert(user, "Usuario no encontrado.");
-
-  const currentFavId = user.favoriteWarehouseId || null;
+  // Fuente de verdad: UserPreference (con fallback legacy SOLO LECTURA).
+  const currentFavId = await getSalesDefaultWarehouseId(jewelryId, userId);
 
   const currentFavOk =
     !!currentFavId && warehouses.some((w) => w.id === currentFavId && w.isActive === true);
@@ -80,10 +79,8 @@ async function getOrAssignEffectiveFavoriteWarehouseId(opts: {
     if (firstActive) {
       effectiveFavId = firstActive.id;
 
-      await prisma.user.updateMany({
-        where: { id: userId, jewelryId, deletedAt: null },
-        data: { favoriteWarehouseId: effectiveFavId },
-      });
+      // Persistir el auto-asignado en la NUEVA fuente de verdad.
+      await setSalesDefaultWarehouseId(jewelryId, userId, effectiveFavId);
     }
   }
 
@@ -185,17 +182,11 @@ export async function createWarehouse(jewelryId: string, userId: string, data: a
     },
   });
 
-  // si el user todavía no tiene favorito -> asignar
-  const user = await prisma.user.findFirst({
-    where: { id: userId, jewelryId, deletedAt: null },
-    select: { id: true, favoriteWarehouseId: true },
-  });
-
-  if (user && !user.favoriteWarehouseId) {
-    await prisma.user.updateMany({
-      where: { id: userId, jewelryId, deletedAt: null },
-      data: { favoriteWarehouseId: created.id },
-    });
+  // si el user todavía no tiene almacén por defecto -> asignar este
+  // (fuente de verdad: UserPreference; legacy solo lectura).
+  const currentFav = await getSalesDefaultWarehouseId(jewelryId, userId);
+  if (!currentFav) {
+    await setSalesDefaultWarehouseId(jewelryId, userId, created.id);
   }
 
   return created;
@@ -432,43 +423,20 @@ async function getWarehouseNetGrams(opts: { jewelryId: string; warehouseId: stri
    - no toca users borrados
 ========================= */
 async function reassignFavoriteIfNeeded(jewelryId: string, removedWarehouseId: string) {
-  const users = await prisma.user.findMany({
-    where: {
-      jewelryId,
-      deletedAt: null,
-      favoriteWarehouseId: removedWarehouseId,
-    },
-    select: { id: true },
-  });
-
-  if (!users.length) return;
-
   const newFavorite = await prisma.warehouse.findFirst({
     where: { jewelryId, deletedAt: null, isActive: true },
     orderBy: { createdAt: "asc" },
     select: { id: true },
   });
 
-  if (!newFavorite) {
-    await prisma.user.updateMany({
-      where: {
-        jewelryId,
-        deletedAt: null,
-        favoriteWarehouseId: removedWarehouseId,
-      },
-      data: { favoriteWarehouseId: null },
-    });
-    return;
-  }
-
-  await prisma.user.updateMany({
-    where: {
-      jewelryId,
-      deletedAt: null,
-      favoriteWarehouseId: removedWarehouseId,
-    },
-    data: { favoriteWarehouseId: newFavorite.id },
-  });
+  // Solo opera sobre UserPreference (fuente de verdad). Los usuarios que
+  // todavía dependen del legacy se autocuran lazy en listWarehousesForUser
+  // vía getOrAssignEffectiveFavoriteWarehouseId.
+  await reassignSalesDefaultWarehouse(
+    jewelryId,
+    removedWarehouseId,
+    newFavorite?.id ?? null
+  );
 }
 
 /* =========================
@@ -500,10 +468,9 @@ export async function setFavoriteWarehouse(opts: {
   });
   assert(warehouse, "No se puede marcar como favorito.");
 
-  await prisma.user.updateMany({
-    where: { id: userId, jewelryId, deletedAt: null },
-    data: { favoriteWarehouseId: warehouseId },
-  });
+  // Preferencia PERSONAL del usuario → UserPreference (fuente de verdad).
+  // NO se escribe el legacy User.favoriteWarehouseId.
+  await setSalesDefaultWarehouseId(jewelryId, userId, warehouseId);
 
   return { ok: true, favoriteWarehouseId: warehouseId };
 }

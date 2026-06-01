@@ -17,6 +17,7 @@ import { describe, it, expect } from "vitest";
 import {
   convertArticlePreviewResponseInPlace,
   convertSalesPreviewResponseInPlace,
+  convertSalesLineInPlace,
   convertToBase,
   convertFromBase,
   convertSalesPreviewInputInPlace,
@@ -53,11 +54,20 @@ function makeSyntheticDocumentTotals() {
     metalSaleSubtotal:          600,
     hechuraSaleSubtotal:        200,
     breakdownEstimated:         false,
-    // Subobjeto `documentRoundingApplied` (modo UNIFIED).
+    // Subobjeto `documentRoundingApplied` (Etapa 1B — shape discriminado).
     documentRoundingApplied: {
-      source: "TENANT_POLICY", applyOn: "DOC_TOTAL",
-      mode: "TEN", direction: "NEAREST",
-      preRounding: 856, postRounding: 860, adjustment: 4,
+      source:  "TENANT_POLICY",
+      scope:   "UNIFIED",
+      applyOn: "DOC_TOTAL",
+      totalAdjustment: 4,
+      unified: {
+        applyOn:      "DOC_TOTAL",
+        mode:         "TEN",
+        direction:    "NEAREST",
+        preRounding:  856,
+        postRounding: 860,
+        adjustment:   4,
+      },
     },
     // Campos que NO deben convertirse:
     sourceTrace:        [{ step: "channel", amount: 50, note: "test" }],
@@ -124,19 +134,22 @@ describe("pricing-currency-display — simetría de moneda articles vs sales", (
     expect(res.documentTotals.sourceTrace[0].amount).toBeCloseTo(50 / RATE, 4);
   });
 
-  it("convierte `documentRoundingApplied` (preRounding/postRounding/adjustment)", () => {
+  it("convierte `documentRoundingApplied.unified` y `totalAdjustment` (Etapa 1B)", () => {
     const res: any = { documentTotals: makeSyntheticDocumentTotals() };
     convertArticlePreviewResponseInPlace(res, RATE);
 
     const dra = res.documentTotals.documentRoundingApplied;
-    expect(dra.preRounding ).toBeCloseTo(856 / RATE, 4);
-    expect(dra.postRounding).toBeCloseTo(860 / RATE, 4);
-    expect(dra.adjustment  ).toBeCloseTo(4   / RATE, 4);
-    // Texto NO se toca.
+    // Montos de la capa unified se convierten.
+    expect(dra.unified.preRounding ).toBeCloseTo(856 / RATE, 4);
+    expect(dra.unified.postRounding).toBeCloseTo(860 / RATE, 4);
+    expect(dra.unified.adjustment  ).toBeCloseTo(4   / RATE, 4);
+    expect(dra.totalAdjustment).toBeCloseTo(4 / RATE, 4);
+    // Texto NO se toca (scope, source, applyOn, mode, direction).
+    expect(dra.scope).toBe("UNIFIED");
     expect(dra.source).toBe("TENANT_POLICY");
     expect(dra.applyOn).toBe("DOC_TOTAL");
-    expect(dra.mode).toBe("TEN");
-    expect(dra.direction).toBe("NEAREST");
+    expect(dra.unified.mode).toBe("TEN");
+    expect(dra.unified.direction).toBe("NEAREST");
   });
 
   it("`breakdownEstimated` (boolean) NO se convierte", () => {
@@ -401,5 +414,133 @@ describe("convertSalesPreviewInputInPlace — display→base antes del motor", (
     expect(convertFromBase(baseTax, RATE_USD)).toBeCloseTo(21.49, 2);  // ≈ US$ 21,49
     const baseTotal = baseNet + baseTax;                               // 236346
     expect(convertFromBase(baseTotal, RATE_USD)).toBeCloseTo(236.35, 2); // ≈ US$ 236,35
+  });
+});
+
+// ============================================================================
+// T42 — Bug FX en `pricingSteps`: el card contextual de Bonificación/Recargo
+// (frontend SaleLineDiscountSummary) lee `pricingSteps[i].meta.discountBase`
+// y `discountAmount` para mostrar el detalle paso a paso. Antes NO se
+// convertían: con documento USD y datos del motor en ARS, el card mostraba
+// "US$ 400.062,50" en lugar de "US$ 100,02".
+//
+// `convertPricingStepsInPlace` (interno) convierte:
+//   · step.value
+//   · step.meta.discountBase
+//   · step.meta.discountAmount
+// Sin tocar campos NO monetarios (type, valueType, applyOn, promoName, etc).
+// ============================================================================
+
+/** Pipeline sintético con un step de PROMOCION + uno de DESCUENTO POR CANTIDAD,
+ *  cada uno con base/amount monetarios + meta no-monetario. */
+function makeSyntheticPricingSteps() {
+  return [
+    {
+      key:    "PRICE_LIST",
+      label:  "Lista de precios",
+      status: "ok",
+      value:  1000, // subtotal resultante (monetario)
+      meta:   { listId: "list-1", listName: "Lista A" },
+    },
+    {
+      key:    "PROMOTION",
+      label:  "Promo Verano",
+      status: "ok",
+      value:  900, // subtotal post-promo
+      meta:   {
+        discountBase:   1000, // base de cálculo (monetario)
+        discountAmount: 100,  // monto del descuento (monetario)
+        value:          10,   // % de descuento (NO monetario)
+        type:           "PERCENTAGE", // discriminador (NO se convierte)
+        applyOn:        "TOTAL",
+        promoName:      "Verano",
+      },
+    },
+    {
+      key:    "QUANTITY_DISCOUNT",
+      label:  "Desc. cantidad",
+      status: "ok",
+      value:  800,
+      meta:   {
+        discountBase:   900,
+        discountAmount: 100,
+        value:          11.11,
+        type:           "PERCENTAGE",
+      },
+    },
+  ];
+}
+
+describe("T42 — convertSalesLineInPlace convierte pricingSteps[].meta + .value", () => {
+  it("convierte step.value, meta.discountBase y meta.discountAmount con RATE", () => {
+    const line: any = { pricingSteps: makeSyntheticPricingSteps() };
+    convertSalesLineInPlace(line, RATE);
+    // step[0] PRICE_LIST: value monetario
+    expect(line.pricingSteps[0].value).toBeCloseTo(1000 / RATE, 4);
+    // step[1] PROMOTION: value + meta.discountBase + meta.discountAmount
+    expect(line.pricingSteps[1].value                ).toBeCloseTo(900  / RATE, 4);
+    expect(line.pricingSteps[1].meta.discountBase    ).toBeCloseTo(1000 / RATE, 4);
+    expect(line.pricingSteps[1].meta.discountAmount  ).toBeCloseTo(100  / RATE, 4);
+    // step[2] QUANTITY_DISCOUNT
+    expect(line.pricingSteps[2].value                ).toBeCloseTo(800  / RATE, 4);
+    expect(line.pricingSteps[2].meta.discountBase    ).toBeCloseTo(900  / RATE, 4);
+    expect(line.pricingSteps[2].meta.discountAmount  ).toBeCloseTo(100  / RATE, 4);
+  });
+
+  it("NO toca meta.value (porcentaje), meta.type, applyOn, promoName, listName, listId", () => {
+    const line: any = { pricingSteps: makeSyntheticPricingSteps() };
+    convertSalesLineInPlace(line, RATE);
+    // PROMOTION: el % y el discriminador siguen intactos.
+    expect(line.pricingSteps[1].meta.value    ).toBe(10);
+    expect(line.pricingSteps[1].meta.type     ).toBe("PERCENTAGE");
+    expect(line.pricingSteps[1].meta.applyOn  ).toBe("TOTAL");
+    expect(line.pricingSteps[1].meta.promoName).toBe("Verano");
+    // PRICE_LIST: ids y nombres intactos.
+    expect(line.pricingSteps[0].meta.listId  ).toBe("list-1");
+    expect(line.pricingSteps[0].meta.listName).toBe("Lista A");
+  });
+
+  it("rate === 1 → no-op (pipeline queda en BASE)", () => {
+    const original = makeSyntheticPricingSteps();
+    const line: any = { pricingSteps: makeSyntheticPricingSteps() };
+    convertSalesLineInPlace(line, 1);
+    expect(line.pricingSteps[1].value              ).toBe(original[1].value);
+    expect(line.pricingSteps[1].meta.discountBase  ).toBe(original[1].meta.discountBase);
+    expect(line.pricingSteps[1].meta.discountAmount).toBe(original[1].meta.discountAmount);
+  });
+
+  it("pricingSteps undefined / vacío → no rompe (defensivo)", () => {
+    expect(() => convertSalesLineInPlace({} as any, RATE)).not.toThrow();
+    expect(() => convertSalesLineInPlace({ pricingSteps: null } as any, RATE)).not.toThrow();
+    expect(() => convertSalesLineInPlace({ pricingSteps: [] } as any, RATE)).not.toThrow();
+  });
+
+  it("step sin meta o sin campos monetarios → no rompe", () => {
+    const line: any = {
+      pricingSteps: [
+        { key: "NO_META", label: "x", status: "ok", value: 500 },
+        { key: "EMPTY_META", label: "y", status: "ok", value: 250, meta: {} },
+        null,
+      ],
+    };
+    expect(() => convertSalesLineInPlace(line, RATE)).not.toThrow();
+    expect(line.pricingSteps[0].value).toBeCloseTo(500 / RATE, 4);
+    expect(line.pricingSteps[1].value).toBeCloseTo(250 / RATE, 4);
+  });
+
+  // PARIDAD: el bug reportado fue en sales/preview, pero el simulador usa
+  // articles/pricing-preview con el mismo shape de pipeline. Si ambos endpoints
+  // no convirtieran igual, simulador y factura mostrarían el card con
+  // magnitudes distintas — paridad rota.
+  it("PARIDAD articles ↔ sales: pricingSteps se convierten con el mismo rate", () => {
+    const articleRes: any = { pricingSteps: makeSyntheticPricingSteps() };
+    const salesRes:   any = { lines: [{ pricingSteps: makeSyntheticPricingSteps() }] };
+    convertArticlePreviewResponseInPlace(articleRes, RATE);
+    convertSalesPreviewResponseInPlace(salesRes, RATE);
+    const a = articleRes.pricingSteps[1];
+    const s = salesRes.lines[0].pricingSteps[1];
+    expect(a.value).toBeCloseTo(s.value, 4);
+    expect(a.meta.discountBase  ).toBeCloseTo(s.meta.discountBase,   4);
+    expect(a.meta.discountAmount).toBeCloseTo(s.meta.discountAmount, 4);
   });
 });

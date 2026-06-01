@@ -221,3 +221,109 @@ describe("previewSale — taxOverride por línea (mismo artículo)", () => {
     expect(out.lines[0].lineTaxAmount).toBe(0);
   });
 });
+
+// ============================================================================
+// Cliente exento + override manual de impuesto — bug reportado: el guard
+// externo `!clientTaxExempt` (sales.service.ts:2873) saltaba TODO el bloque
+// de cálculo de tax cuando cliente es exento, incluyendo el override del
+// operador. Resultado: TPNumber mostraba 30%, badge "Impuesto manual", pero
+// el footer mostraba "Impuestos: ARS 0,00" y el total no sumaba.
+//
+// Fix: el guard ahora permite entrar también cuando hay override manual:
+//   (!clientTaxExempt || lineHasManualTaxOverride)
+// Y dentro, taxIds se vacía para cliente exento (la exención cubre los
+// heredados; solo el override cuenta).
+// ============================================================================
+describe("previewSale — cliente exento + override manual (BUG REPORTADO)", () => {
+  beforeEach(() => {
+    // Override del beforeEach del describe anterior: cliente exento.
+    mockPrisma.commercialEntity.findFirst.mockResolvedValue({
+      id: "client-exempt", taxExempt: true,
+      paymentTermDays: null, balanceType: null, taxApplyOnOverride: null,
+      discountRuleId: null, discountRule: null,
+      clientDiscountValue: null, clientDiscountValueType: null, clientDiscountApplyOn: null,
+    } as any);
+  });
+
+  it("exento + sin override → tax=0 (modo automático preservado)", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1 },
+      ],
+      clientId: "client-exempt",
+    });
+    // Sin override + exento → tax=0 (la exención cubre el IVA 21% heredado).
+    expect(out.lines[0].lineTaxAmount).toBe(0);
+    expect(out.lines[0].lineTotalWithTax).toBeCloseTo(UNIT, 2);
+    // Footer también en 0.
+    expect(out.documentTotals.taxAmount).toBe(0);
+  });
+
+  it("FIX: exento + override 30% → tax > 0 (el override gana sobre la exención)", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          taxOverride: { mode: "PERCENT", value: 30, appliesTo: "TOTAL" } },
+      ],
+      clientId: "client-exempt",
+    });
+    // El operador eligió explícitamente 30% manual sobre un cliente exento:
+    // el motor debe calcular el tax y el footer debe sumarlo. Sin el fix
+    // del guard, el bloque se saltaba completo y devolvía 0.
+    expect(out.lines[0].lineTaxAmount).toBeCloseTo(UNIT * 0.30, 1);
+    expect(out.lines[0].lineTotalWithTax).toBeCloseTo(UNIT * 1.30, 1);
+    // Footer documento suma correctamente el override manual.
+    expect(out.documentTotals.taxAmount).toBeCloseTo(UNIT * 0.30, 1);
+    // El breakdown debe ser del OVERRIDE, NO del IVA 21% heredado del
+    // artículo (que también está configurado en mockPrisma.tax). Eso lo
+    // garantiza el vaciado de taxIds=[] para cliente exento dentro del
+    // bloque.
+    const tb = out.lines[0].taxBreakdown as any[];
+    expect(tb).toHaveLength(1);
+    expect(tb[0].code).toBe("MANUAL_OVERRIDE");
+    expect(tb[0].rate).toBe(30);
+  });
+
+  it("FIX: exento + override AMOUNT $500 → tax = $500 efectivo", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          taxOverride: { mode: "AMOUNT", value: 500, appliesTo: "TOTAL" } },
+      ],
+      clientId: "client-exempt",
+    });
+    expect(out.lines[0].lineTaxAmount).toBeCloseTo(500, 1);
+    expect(out.documentTotals.taxAmount).toBeCloseTo(500, 1);
+  });
+
+  it("FIX: exento + override 0 (X = manual 0) → tax=0 (correcto por override, NO por exención)", async () => {
+    // Con la semántica X=manual 0, escribir 0 (o tocar X) deja
+    // taxOverride={value:0}. El motor aplica 0 manual. Visualmente igual
+    // al modo automático exento, pero la causa es distinta (override).
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          taxOverride: { mode: "PERCENT", value: 0, appliesTo: "TOTAL" } },
+      ],
+      clientId: "client-exempt",
+    });
+    expect(out.lines[0].lineTaxAmount).toBe(0);
+    expect((out.lines[0] as any).manualOverridesApplied.tax).toBe(true);
+  });
+
+  it("FIX: 2 líneas (1 sin override + 1 con override) → solo la segunda suma tax al footer", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        // Línea 1: exenta, sin override → tax 0.
+        { articleId: "ART-1", variantId: null, quantity: 1 },
+        // Línea 2: exenta + override 30% → tax aplicado.
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          taxOverride: { mode: "PERCENT", value: 30, appliesTo: "TOTAL" } },
+      ],
+      clientId: "client-exempt",
+    });
+    expect(out.lines[0].lineTaxAmount).toBe(0);
+    expect(out.lines[1].lineTaxAmount).toBeCloseTo(UNIT * 0.30, 1);
+    expect(out.documentTotals.taxAmount).toBeCloseTo(UNIT * 0.30, 1);
+  });
+});

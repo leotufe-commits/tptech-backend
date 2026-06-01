@@ -184,3 +184,49 @@ describe("previewSale — override de base 'Aplica a' independiente del valor", 
     expect((out.lines[1].taxBreakdown as any[])[0].rate).toBe(21);
   });
 });
+
+describe("previewSale — lista UNIFICADA (metalHechuraBreakdown=null): impuesto sobre NETO por componente", () => {
+  // Reproduce el bug real: lista "Valor Unificado" NO emite
+  // metalHechuraBreakdown; el motor sí expone el NETO por componente en
+  // componentSaleBreakdown.{metal,hechura}.final. El recompute de
+  // sales.service debe usar ESE neto (no caer al estimado por proporción
+  // de costo ≈ BRUTO). Simétrico metal/hechura.
+  it("Impuesto Solo hechura usa hechura.final NETA (no la bruta)", async () => {
+    const HECHURA_GROSS = 600;
+    const HECHURA_NET   = 540; // 600 − bonificación 60 imputada a HECHURA
+    mockResolveFinalSalePrice.mockResolvedValue({
+      unitPrice: new (Prisma as any).Decimal(String(UNIT)),
+      basePrice: new (Prisma as any).Decimal(String(UNIT)),
+      quantityDiscountAmount: new (Prisma as any).Decimal("60"),
+      promotionDiscountAmount: new (Prisma as any).Decimal("0"),
+      discountAmount: new (Prisma as any).Decimal("60"),
+      priceSource: "PRICE_LIST", baseSource: "PRICE_LIST",
+      unitCost: null, unitMargin: null, marginPercent: null, costPartial: true,
+      costMode: "NONE", partial: false, appliedPriceListId: null,
+      appliedPriceListName: null, appliedPromotionId: null, appliedPromotionName: null,
+      appliedDiscountId: null, steps: [], alerts: [],
+      policy: { canConfirm: true, blockingAlerts: [] }, stackingMode: "NONE",
+      // Lista UNIFICADA → SIN metalHechuraBreakdown.
+      metalHechuraBreakdown: null,
+      // El motor sí derivó el split y el NETO por componente.
+      componentSaleBreakdown: {
+        metal:   { base: 400, adjustments: [], final: 400, salePreManualDiscount: 400 },
+        hechura: { base: HECHURA_GROSS, adjustments: [{ kind: "MANUAL_DISCOUNT", amount: 60 }],
+                   final: HECHURA_NET, salePreManualDiscount: HECHURA_GROSS },
+      },
+      taxAmount: new (Prisma as any).Decimal("0"), taxBreakdown: [],
+      totalWithTax: new (Prisma as any).Decimal(String(UNIT)), taxExemptByEntity: false,
+    });
+
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualTaxAppliesToOverride: "HECHURA" },
+      ],
+      clientId: null,
+    });
+    // IVA 21% sobre hechura NETA 540 = 113.4 (NO 600 → 126).
+    expect(out.lines[0].lineTaxAmount).toBeCloseTo(HECHURA_NET * 0.21, 2);
+    expect(out.lines[0].lineTaxAmount).not.toBeCloseTo(HECHURA_GROSS * 0.21, 2);
+  });
+});

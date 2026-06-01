@@ -128,14 +128,22 @@ beforeEach(() => {
     resolvedAt: "2026-05-17T00:00:00.000Z",
   }));
 
-  // ECHO determinístico: aplica la bonificación sobre BASE.
+  // ECHO determinístico: aplica el ajuste (bonif/recargo) sobre BASE.
+  // BONUS resta, SURCHARGE suma. `discountAmount` se clampea a 0 cuando es
+  // recargo (igual semántica que el motor real: lineDiscount ≥ 0).
   mockResolveFinalSalePrice.mockImplementation((_j: string, opts: any) => {
     const od = opts.manualDiscountOverride ?? null;
     let unit = BASE;
     let disc = 0;
     if (od && Number.isFinite(od.value) && od.value >= 0) {
-      disc = od.mode === "PERCENT" ? (BASE * od.value) / 100 : od.value;
-      unit = Math.max(0, BASE - disc);
+      const adj = od.mode === "PERCENT" ? (BASE * od.value) / 100 : od.value;
+      if (od.kind === "SURCHARGE") {
+        unit = BASE + adj;
+        disc = 0;
+      } else {
+        disc = adj;
+        unit = Math.max(0, BASE - adj);
+      }
     }
     return Promise.resolve({
       unitPrice: new D(String(unit)), basePrice: new D(String(BASE)),
@@ -236,5 +244,124 @@ describe("previewSale — Bonificación por línea (mismo artículo)", () => {
       .toEqual({ mode: "AMOUNT", value: 15_000, appliesTo: "TOTAL" });
     expect(out.lines[0].unitPrice).toBe(BASE - 15_000);
     expect(out.lines[0].lineTotal).toBe((BASE - 15_000) * 2);
+  });
+});
+
+// =============================================================================
+// Recargo manual por línea (kind=SURCHARGE)
+// =============================================================================
+// Mismo contrato que la bonificación, pero el override lleva
+// `kind: "SURCHARGE"` y el motor SUMA en lugar de restar. Cubre:
+//   · PERCENT y AMOUNT
+//   · appliesTo TOTAL / METAL / HECHURA (passthrough — el echo no diferencia
+//     por base, pero verifica que el override viaja completo al motor)
+//   · limpiar (value 0) → no aplica nada (vuelve a BASE)
+//   · default kind ausente sigue comportándose como BONUS (back-compat)
+// =============================================================================
+
+describe("previewSale — Recargo manual por línea (kind=SURCHARGE)", () => {
+  it("forwardea kind=SURCHARGE al pricing-engine y SUMA al precio (PERCENT)", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "PERCENT", value: 15, appliesTo: "TOTAL", kind: "SURCHARGE" } },
+      ],
+      clientId: null,
+    });
+    expect(mockResolveFinalSalePrice.mock.calls[0][1].manualDiscountOverride)
+      .toEqual({ mode: "PERCENT", value: 15, appliesTo: "TOTAL", kind: "SURCHARGE" });
+    // toBeCloseTo (no toBe) — el motor usa Decimal y normaliza la FP error
+    // (115000 vs 114999.99…). Misma técnica que el resto de tests del motor.
+    expect(out.lines[0].unitPrice).toBeCloseTo(BASE * 1.15, 4);
+    expect(out.lines[0].lineDiscount).toBe(0); // recargo NO es descuento
+    expect(out.lines[0].lineTotalWithTax).toBeCloseTo(BASE * 1.15, 4);
+  });
+
+  it("SURCHARGE AMOUNT (FIXED) suma monto fijo por unidad", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 3,
+          manualDiscountOverride: { mode: "AMOUNT", value: 5_000, appliesTo: "TOTAL", kind: "SURCHARGE" } },
+      ],
+      clientId: null,
+    });
+    expect(out.lines[0].unitPrice).toBe(BASE + 5_000);
+    expect(out.lines[0].lineTotal).toBe((BASE + 5_000) * 3);
+    expect(out.lines[0].lineDiscount).toBe(0);
+  });
+
+  it("SURCHARGE appliesTo=METAL viaja al motor (passthrough completo)", async () => {
+    await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL", kind: "SURCHARGE" } },
+      ],
+      clientId: null,
+    });
+    expect(mockResolveFinalSalePrice.mock.calls[0][1].manualDiscountOverride)
+      .toEqual({ mode: "PERCENT", value: 10, appliesTo: "METAL", kind: "SURCHARGE" });
+  });
+
+  it("SURCHARGE appliesTo=HECHURA viaja al motor (passthrough completo)", async () => {
+    await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "AMOUNT", value: 2_000, appliesTo: "HECHURA", kind: "SURCHARGE" } },
+      ],
+      clientId: null,
+    });
+    expect(mockResolveFinalSalePrice.mock.calls[0][1].manualDiscountOverride)
+      .toEqual({ mode: "AMOUNT", value: 2_000, appliesTo: "HECHURA", kind: "SURCHARGE" });
+  });
+
+  it("BONUS vs SURCHARGE con mismo % aplican OPUESTOS al precio (lado a lado)", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL", kind: "BONUS" } },
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL", kind: "SURCHARGE" } },
+      ],
+      clientId: null,
+    });
+    expect(out.lines[0].unitPrice).toBeCloseTo(BASE * 0.9, 4);  // BONUS resta
+    expect(out.lines[1].unitPrice).toBeCloseTo(BASE * 1.1, 4);  // SURCHARGE suma
+    // documentTotals combina los dos efectos
+    expect(out.documentTotals.subtotalAfterLineDiscounts).toBeCloseTo(BASE * 0.9 + BASE * 1.1, 4);
+  });
+
+  it("SURCHARGE con value=0 NO aplica nada (vuelve a BASE)", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "PERCENT", value: 0, appliesTo: "TOTAL", kind: "SURCHARGE" } },
+      ],
+      clientId: null,
+    });
+    expect(out.lines[0].unitPrice).toBe(BASE);
+    expect(out.lines[0].lineDiscount).toBe(0);
+  });
+
+  it("limpiar el override (manualDiscountOverride: null) vuelve a lista", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: null },
+      ],
+      clientId: null,
+    });
+    expect(mockResolveFinalSalePrice.mock.calls[0][1].manualDiscountOverride).toBeNull();
+    expect(out.lines[0].unitPrice).toBe(BASE);
+  });
+
+  it("back-compat: override SIN kind se comporta como BONUS (resta)", async () => {
+    const out = await previewSale("j1", {
+      lines: [
+        { articleId: "ART-1", variantId: null, quantity: 1,
+          manualDiscountOverride: { mode: "PERCENT", value: 20, appliesTo: "TOTAL" } },
+      ],
+      clientId: null,
+    });
+    expect(out.lines[0].unitPrice).toBe(BASE * 0.8);  // restó (BONUS implícito)
   });
 });

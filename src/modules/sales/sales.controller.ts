@@ -4,11 +4,29 @@ import * as service from "./sales.service.js";
 // Vive en su propio service para no entrar en conflicto con cambios
 // en curso de `sales.service.ts`.
 import * as draftPdfService from "./sales.draft-pdf.service.js";
+import { sanitizeManualAdjustmentInput as sanitizeMA } from "../../lib/manual-adjustment/index.js";
 
 function s(v: any) { return String(v ?? "").trim(); }
 function assert(cond: any, msg: string) {
   if (!cond) { const e: any = new Error(msg); e.status = 400; throw e; }
 }
+
+// =============================================================================
+// Manual Adjustment — re-export del sanitizer canónico (Etapa A + Etapa C).
+// =============================================================================
+// El sanitizer vive en `lib/manual-adjustment/sanitize.ts` para que el
+// service también lo pueda usar como defensa en profundidad sin duplicar
+// reglas. El controller lo expone con el nombre histórico para back-compat
+// con tests del módulo.
+//
+// Reglas (POLICY §R-Rounding-1 capa 17):
+//   · Etapa A — scope "UNIFIED": amount global sobre engineTotal.
+//   · Etapa C — scope "BREAKDOWN": metals[] (targetGrams/deltaGrams) +
+//     monetaryAmount opcional. El gate "documento debe estar en modo
+//     BREAKDOWN" lo aplica el service.
+//   · Cualquier otro scope → 400.
+// =============================================================================
+export const sanitizeManualAdjustmentInput = sanitizeMA;
 
 // P1: el motor de precios es la única fuente de verdad. Si el frontend manda
 // estos campos en el body, los ignoramos y dejamos rastro en logs para
@@ -251,6 +269,11 @@ export async function previewSale(req: any, res: Response) {
     // del frontend). Si viene válida, tiene precedencia sobre la última
     // tasa del catálogo `CurrencyRate`.
     currencyRate,
+    // Fase 4.2 — override manual del Balance Mode del documento.
+    balanceModeOverride,
+    // Etapa A — Manual Adjustment (POLICY §R-Rounding-1 capa 17). Solo
+    // scope=UNIFIED. El sanitizer rechaza otros scopes con 400.
+    manualAdjustment,
   } = req.body ?? {};
   assert(Array.isArray(lines) && lines.length > 0, "lines[] requerido.");
   const num = (v: any): number | undefined =>
@@ -261,6 +284,12 @@ export async function previewSale(req: any, res: Response) {
     const v = num(globalDiscount.value);
     if (v != null && v > 0) gd = { type: globalDiscount.type, value: v };
   }
+  // Etapa A — validar/sanitizar `manualAdjustment`. Falla con 400 si scope
+  // distinto de UNIFIED. Si no hay ajuste utilizable → `null` (passthrough).
+  const manualAdjustmentInput = sanitizeManualAdjustmentInput(
+    manualAdjustment,
+    "sales.preview.manualAdjustment",
+  );
   return res.json(
     await service.previewSale(req.user.jewelryId, {
       lines,
@@ -275,6 +304,11 @@ export async function previewSale(req: any, res: Response) {
       priceListId:          priceListId     ?? null,
       currencyId:           currencyId      ?? null,
       currencyRate:         num(currencyRate) ?? null,
+      balanceModeOverride:
+        balanceModeOverride === "UNIFIED" || balanceModeOverride === "BREAKDOWN"
+          ? balanceModeOverride
+          : null,
+      manualAdjustment:     manualAdjustmentInput,
     }),
   );
 }

@@ -30,11 +30,20 @@ export {
   buildBatchCostContext,
   getArticleMetalVariantIds,
   loadArticleMetalVariantsBatch,
+  // Etapa C/D — re-export del enrich de steps `COST_LINES_METAL`.
+  // `calculateCostFromLines` deja los steps con sólo `variantId`;
+  // `enrichCostMetalSteps` los completa con `metalId`/`purity`/etc.
+  // consultando `MetalVariant`. Imprescindible para
+  // `extractMetalItemsFromSteps` y por ende para `balanceBreakdown.metals`.
+  enrichCostMetalSteps,
 } from "./pricing-engine.cost.js";
 export {
   resolveFinalSalePrice,
   evaluatePricingPolicy,
   computeLineTaxes,
+  // POLICY §Tax.3 — separa la parte FIXED del breakdown para que
+  // `computeSaleDocumentTotals` no escale los impuestos fijos.
+  sumFixedTaxComponent,
   applyTaxesFromMap,
   computePurchaseTaxes,
   buildPricingSnapshot,
@@ -55,6 +64,31 @@ export { resolveCheckoutPrice } from "./pricing-engine.payment.js";
 export { getBaseCurrencyId, getExchangeRate, convertMoney, normalizeToBaseCurrency } from "./pricing-engine.currency.js";
 export { buildBalanceBreakdownFromPrice } from "./pricing-engine.balance.js";
 export type { BalanceBreakdown, BalanceMetalItem } from "./pricing-engine.balance.js";
+// T52/T53/T55 — Balance Mode (Snapshot v3, POLICY.md §11)
+export {
+  buildDocumentBalanceBreakdown,
+  readBalanceBreakdown,
+  mapBalanceTypeToMode,
+} from "./pricing-engine.balance.js";
+export type {
+  BuildDocumentBalanceBreakdownInput,
+  BuildBreakdownLineInput,
+  BalanceBreakdownReadResult,
+  BalanceBreakdownReadSource,
+} from "./pricing-engine.balance.js";
+export { resolveBalanceMode } from "./balance-mode-resolver.js";
+export type {
+  BalanceMode,
+  BalanceModeSource,
+  BalanceModeResolution,
+  BalanceModeResolverInput,
+  DocumentBalanceBreakdown,
+  DocumentBalanceMetalEntry,
+  DocumentBalanceMetalVariant,
+  DocumentBalanceMonetary,
+  DocumentBalanceMonetaryComponent,
+  LineBalanceContribution,
+} from "./pricing-engine.types.js";
 // Canal de venta — ajuste posterior a lista, previo a forma de pago
 export { applySalesChannelAdjustment } from "./pricing-engine.channel.js";
 export type { ChannelAdjustmentInput, ChannelAdjustmentResult } from "./pricing-engine.channel.js";
@@ -67,7 +101,7 @@ export { resolveShippingAmount } from "./pricing-engine.shipping.js";
 export type { ShippingInput, ShippingResult, ShippingMode } from "./pricing-engine.shipping.js";
 // Utilidades de lista de precios — expuestas para batch pricing en services
 export { resolvePriceList, applyPriceList, PL_COMPUTE_SELECT, isPriceListValidNow } from "./pricing-engine.pricelist.js";
-export type { CostBreakdown, ResolvedPriceList } from "./pricing-engine.pricelist.js";
+export type { CostBreakdown, ResolvedPriceList, ApplyPriceListOptions } from "./pricing-engine.pricelist.js";
 // Fase 5: snapshot de documento para comprobantes
 // Fase 3 refactor Ventas: + computeSaleDocumentTotals como fuente única de
 // verdad de los totales del comprobante de venta.
@@ -97,8 +131,52 @@ export type {
   SaleDocumentTotalsInput,
   SaleDocumentTotals,
   SaleDocumentTotalsTraceStep,
+  TaxScalingResult,
   DocumentRoundingInput,
+  DocumentRoundingScope,
+  DocumentRoundingMode,
+  DocumentRoundingDirection,
+  DocumentRoundingPartConfig,
+  DocumentRoundingApplied,
+  DocumentRoundingLayerResult,
+  SnapshotSourceDocument,
 } from "./pricing-engine.document.js";
+
+// Etapa D' — Redondeo Comercial PER_DOCUMENT.
+export {
+  applyCommercialDocumentRounding,
+} from "./commercial-document-rounding.js";
+export {
+  resolveDocCommercialRoundingContext,
+  buildCommercialDocRoundingFromPriceList,
+  assertCommercialDocRoundingConsistency,
+} from "./commercial-document-rounding-context.js";
+export type {
+  PriceListSummaryForContext,
+  DocCommercialRoundingMode,
+  DocCommercialRoundingContext,
+  ResolveDocCommercialRoundingArgs,
+  ContextApplyPriceListOptions,
+} from "./commercial-document-rounding-context.js";
+export type {
+  CommercialDocRoundingMode,
+  CommercialDocRoundingDirection,
+  CommercialDocRoundingPartConfig,
+  CommercialDocRoundingInput,
+  CommercialDocRoundingInputUnified,
+  CommercialDocRoundingInputBreakdown,
+  CommercialDocMetalParentInput,
+  CommercialDocRoundingArgs,
+  CommercialDocRoundingResult,
+  CommercialDocRoundingApplied,
+  CommercialDocMetalSnapshotEntry,
+  CommercialDocHechuraSnapshot,
+  CommercialDocUnifiedSnapshot,
+  CommercialDocRoundingFallback,
+  // Etapa D' — cierre conceptual: alias canónico sin infijo "Doc".
+  CommercialRoundingApplied,
+  CommercialRoundingAppliedAt,
+} from "./commercial-document-rounding.js";
 
 export type {
   PricingStep,

@@ -46,6 +46,20 @@ import {
 // factura suprime ese redondeo y delega al motor doc-totals; el simulador
 // debe espejar esa supresión para mostrar el mismo `unitPrice`.
 import { loadDocumentRoundingConfig } from "../../lib/document-rounding.js";
+// Paridad Simulador ↔ Factura — Redondeo Comercial PER_DOCUMENT. El Simulador
+// reusa EXACTAMENTE el mismo wiring que `previewSale` para listas PER_DOCUMENT:
+// resuelve el contexto comercial, suprime el PER_LINE legacy y emite los mismos
+// campos (commercialRoundingContext / metalRoundingMonetaryImpact /
+// lineMonetarySaldoPostCommercialRounding / lineTotalWithTaxPostCommercialRounding).
+import {
+  resolveDocumentCommercialContextForSale,
+  aggregateMetalsForCommercialDocRounding,
+  computeCommercialRoundingPerLineImpacts,
+  computeLineCommercialRoundingMetals,
+  computeLineAutonomousCommercialMoney,
+} from "../sales/commercial-doc-rounding-wiring.js";
+import { assertCommercialDocRoundingConsistency } from "../../lib/pricing-engine/commercial-document-rounding-context.js";
+import { extractMetalItemsFromSteps } from "../sales/balance-mode-runtime.js";
 
 function s(v: any) { return String(v ?? "").trim(); }
 function assert(cond: any, msg: string) { if (!cond) { const e: any = new Error(msg); e.status = 400; throw e; } }
@@ -1098,6 +1112,19 @@ export async function getPricingPreview(req: any, res: Response) {
     req.user.jewelryId,
   );
 
+  // ── Paridad Simulador ↔ Factura — contexto comercial PER_DOCUMENT ─────────
+  // Mismo resolvedor que `previewSale`. Para una lista PER_DOCUMENT, esto:
+  //   · suprime el redondeo PER_LINE de hechura/metal (`applyPriceListOptions`),
+  //   · habilita la capa comercial PER_DOCUMENT en `computeSaleDocumentTotals`.
+  // Para PER_LINE_LEGACY el objeto queda vacío y el simulador mantiene el
+  // comportamiento legacy intacto (fallback).
+  const commercialDocCtx = await resolveDocumentCommercialContextForSale({
+    jewelryId:               req.user.jewelryId,
+    lineInputs:              [{ priceListIdOverride }],
+    defaultPriceListIdInput: priceListIdOverride,
+  });
+  assertCommercialDocRoundingConsistency(commercialDocCtx);
+
   const result = await resolveFinalSalePrice(req.user.jewelryId, {
     articleId,
     variantId,
@@ -1113,6 +1140,8 @@ export async function getPricingPreview(req: any, res: Response) {
     metalVariantIdOverride: metalVariantIdOverride,
     hechuraOverrideAmount:  hechuraAmount,
     suppressListDeferredRounding,
+    // Etapa D' — gate anti-doble: PER_DOCUMENT suprime el PER_LINE de la lista.
+    applyPriceListOptions:  commercialDocCtx.applyPriceListOptions,
   });
 
   const fmt = (v: any) => v != null ? v.toFixed(4) : null;
@@ -1356,6 +1385,52 @@ export async function getPricingPreview(req: any, res: Response) {
       : {}),
   };
 
+  // ── Paridad Factura — agregados del Redondeo Comercial PER_DOCUMENT ────────
+  // Mismo armado que `previewSale` (1 sola "línea" = el artículo). Solo cuando
+  // la lista es PER_DOCUMENT; si no, queda vacío y la capa comercial no actúa.
+  let commercialMetalNames = new Map<string, string>();
+  const commercialMetalRefValues = new Map<string, number>();
+  let commercialDocAggregates: {
+    metalsByParent: ReturnType<typeof aggregateMetalsForCommercialDocRounding>["metalsByParent"];
+    metalValuationSum: number;
+    gramsPureByParentByLineIdx: Map<string, Map<number, number>>;
+  } = { metalsByParent: [], metalValuationSum: 0, gramsPureByParentByLineIdx: new Map() };
+  if (commercialDocCtx.mode === "PER_DOCUMENT" && commercialDocCtx.commercialDocumentRounding) {
+    const metalIds = new Set<string>();
+    for (const m of extractMetalItemsFromSteps(result.steps as any)) {
+      if (m.metalId) metalIds.add(m.metalId);
+    }
+    if (metalIds.size > 0) {
+      try {
+        const metals = await prisma.metal.findMany({
+          where:  { id: { in: [...metalIds] }, jewelryId: req.user.jewelryId, deletedAt: null },
+          select: { id: true, name: true, referenceValue: true },
+        });
+        commercialMetalNames = new Map(metals.map((m) => [m.id, m.name]));
+        for (const m of metals) {
+          const rv = m.referenceValue != null ? Number(m.referenceValue.toString()) : NaN;
+          if (Number.isFinite(rv) && rv > 0) commercialMetalRefValues.set(m.id, rv);
+        }
+      } catch { /* fallback al id */ }
+    }
+    commercialDocAggregates = aggregateMetalsForCommercialDocRounding([
+      {
+        quantity,
+        // R-COMMERCIAL-GRAMS-WITH-MERMA — solo items con gramsFineEquivalent
+        // (post pureza + merma); mismo filtro que `previewSale`.
+        metals: extractMetalItemsFromSteps(result.steps as any)
+          .filter((m) => m.metalId && typeof m.gramsFineEquivalent === "number" && Number.isFinite(m.gramsFineEquivalent))
+          .map((m) => ({
+            metalParentId:       m.metalId!,
+            metalParentName:     commercialMetalNames.get(m.metalId!) ?? m.metalId!,
+            appliedGramsPerUnit: m.gramsFineEquivalent as number,
+            quotePriceSnapshot:  m.unitValue ?? null,
+            metalReferenceValue: commercialMetalRefValues.get(m.metalId!) ?? null,
+          })),
+      },
+    ]);
+  }
+
   const documentTotalsRaw = computeSaleDocumentTotals({
     lines:                   [docLine],
     channel:                 channelInputForTotals,
@@ -1364,10 +1439,14 @@ export async function getPricingPreview(req: any, res: Response) {
     shippingAmount:          shippingResult?.amount             ?? 0,
     globalDiscountAmount:    0,
     roundingAdjustment:      0,
-    // Simulador no aplica política doc — la regla queda exclusiva del flujo
-    // de venta. El `unitPrice` ya respeta `suppressListDeferredRounding`
-    // para mantener paridad numérica con la factura.
+    // Redondeo FINANCIERO del comprobante: el Simulador NO lo aplica (no hay
+    // comprobante) — eso queda exclusivo de la Factura. NO se toca.
     documentRounding:        null,
+    // Etapa D' — Redondeo COMERCIAL PER_DOCUMENT (paridad Factura). `null`
+    // cuando la lista es PER_LINE_LEGACY → la capa no actúa (fallback legacy).
+    commercialDocumentRounding:             commercialDocCtx.commercialDocumentRounding,
+    metalsByParentForCommercialRounding:    commercialDocAggregates.metalsByParent,
+    metalValuationSumForCommercialRounding: commercialDocAggregates.metalValuationSum,
   });
 
   // Display delta del redondeo de lista: el motor lo absorbió en `lineTotal`
@@ -1394,6 +1473,91 @@ export async function getPricingPreview(req: any, res: Response) {
     roundingAdjustment: docRoundingAdjustment,
     roundingInfo:       docRoundingInfo,
   };
+
+  // ── Paridad Factura — campos del Redondeo Comercial PER_DOCUMENT por línea ──
+  // Mismo contrato que `previewSale.lines[i]`: el frontend del Simulador los
+  // consume IGUAL que la Factura. `null` cuando la lista es PER_LINE_LEGACY.
+  let commercialRoundingContext: any = null;
+  let metalRoundingMonetaryImpact: number | null = null;
+  let hechuraRoundingMonetaryImpact: number | null = null;
+  let lineMonetarySaldoPreCommercialRounding: number | null = null;
+  let lineMonetarySaldoPostCommercialRounding: number | null = null;
+  // Total post-redondeo comercial; sin redondeo comercial, el post === pre.
+  let lineTotalWithTaxPostCommercialRounding: number | null = lineTotalWithTax;
+  // Gramos comerciales POR LÍNEA (mismo contrato que Factura). Una sola línea
+  // en el Simulador ⇒ per-línea === documento; igual se emite para paridad.
+  let lineCommercialRoundingMetals: Array<{
+    metalParentId: string; metalParentName: string;
+    preGrams: number; postGrams: number; deltaGrams: number;
+    metalReferenceValue: number; monetaryImpact: number;
+  }> | null = null;
+  if (documentTotalsRaw.commercialDocumentRoundingApplied) {
+    const ctxBase = documentTotalsRaw.commercialDocumentRoundingApplied;
+    commercialRoundingContext = { ...ctxBase, appliedAt: "DOCUMENT" as const, appliedToLineCount: 1 };
+    const hechuraSaleByLineIdx = new Map<number, number>([
+      [0, mhb ? round2((mhb.hechuraSale ?? 0) * quantity) : 0],
+    ]);
+    const impacts = computeCommercialRoundingPerLineImpacts({
+      breakdown:                  (ctxBase as any)?.breakdown,
+      gramsPureByParentByLineIdx: commercialDocAggregates.gramsPureByParentByLineIdx,
+      hechuraSaleByLineIdx,
+      lineCount:                  1,
+    });
+    const imp = impacts.get(0) ?? { metalImpact: 0, hechuraImpact: 0, monetarySaldoPost: null };
+    // Fallback (no BREAKDOWN) — reparto documental clásico (1 línea ⇒ == propio).
+    metalRoundingMonetaryImpact            = imp.metalImpact;
+    hechuraRoundingMonetaryImpact          = imp.hechuraImpact;
+    lineMonetarySaldoPostCommercialRounding = imp.monetarySaldoPost;
+    lineTotalWithTaxPostCommercialRounding = round2(lineTotalWithTax + imp.metalImpact + imp.hechuraImpact);
+    // Opción B (LINE-AUTONOMOUS) — gramos + dinero comercial de la PROPIA línea.
+    // Una sola línea en el Simulador ⇒ autónomo === documento; usamos la MISMA
+    // ruta que Factura para paridad byte-equivalente.
+    if (commercialDocCtx.commercialDocumentRounding?.scope === "BREAKDOWN") {
+      const metalCfg   = commercialDocCtx.commercialDocumentRounding.metal;
+      const hechuraCfg = commercialDocCtx.commercialDocumentRounding.hechura;
+      const metalNameById = new Map<string, string>(
+        commercialDocAggregates.metalsByParent.map((m) => [m.metalParentId, m.metalParentName]),
+      );
+      const cost = mhb ? Number(mhb.metalCost ?? 0) : 0;
+      const sale = mhb ? Number(mhb.metalSale ?? 0) : 0;
+      const marginFactorByLineIdx = new Map<number, number>([[0, cost > 0 ? sale / cost : 1]]);
+      const refValueByParent = new Map<string, number>(
+        commercialDocAggregates.metalsByParent.map((m) => [
+          m.metalParentId,
+          (typeof m.metalReferenceValue === "number" && m.metalReferenceValue > 0)
+            ? m.metalReferenceValue
+            : m.metalPricePerGram,
+        ]),
+      );
+      const lineMetalsByIdx = computeLineCommercialRoundingMetals({
+        gramsPureByParentByLineIdx: commercialDocAggregates.gramsPureByParentByLineIdx,
+        metalNameById,
+        refValueByParent,
+        marginFactorByLineIdx,
+        metalCfg,
+        lineCount: 1,
+      });
+      lineCommercialRoundingMetals = lineMetalsByIdx.get(0) ?? [];
+
+      const moneyByIdx = computeLineAutonomousCommercialMoney({
+        lineCommercialRoundingMetals: lineMetalsByIdx,
+        refValueByParent,
+        lineTotalWithTaxByIdx: new Map<number, number>([[0, lineTotalWithTax]]),
+        // metalSaleSum = mhb.metalSale (per-unit) × qty, round2 — misma base que Factura.
+        metalSaleSumByIdx: new Map<number, number>([[0, mhb ? round2(Number(mhb.metalSale ?? 0) * quantity) : 0]]),
+        hechuraCfg,
+        lineCount: 1,
+      });
+      const m0 = moneyByIdx.get(0);
+      if (m0) {
+        metalRoundingMonetaryImpact             = m0.metalRoundingMonetaryImpact;
+        hechuraRoundingMonetaryImpact           = m0.hechuraRoundingMonetaryImpact;
+        lineMonetarySaldoPreCommercialRounding  = m0.lineMonetarySaldoPreCommercialRounding;
+        lineMonetarySaldoPostCommercialRounding = m0.lineMonetarySaldoPostCommercialRounding;
+        lineTotalWithTaxPostCommercialRounding  = m0.lineTotalWithTaxPostCommercialRounding;
+      }
+    }
+  }
 
   // Armado del response — sigue idéntico a antes; los importes están en
   // moneda BASE del tenant. Si el operador eligió una moneda distinta, el
@@ -1440,6 +1604,16 @@ export async function getPricingPreview(req: any, res: Response) {
     taxBreakdown:          result.taxBreakdown ?? [],
     totalWithTax:          fmt(result.totalWithTax),
     taxExemptByEntity:     result.taxExemptByEntity ?? false,
+    // ── Paridad Factura — Redondeo Comercial PER_DOCUMENT por línea ────────
+    // MISMO contrato que `SalePreviewLine`. Números (no strings) para que el
+    // converter de moneda los maneje igual que en sales. `null` ⇒ PER_LINE_LEGACY.
+    commercialRoundingContext,
+    metalRoundingMonetaryImpact,
+    hechuraRoundingMonetaryImpact,
+    lineMonetarySaldoPreCommercialRounding,
+    lineMonetarySaldoPostCommercialRounding,
+    lineTotalWithTaxPostCommercialRounding,
+    lineCommercialRoundingMetals,
     // ── Redondeo aplicado por la lista de precios ─────────────────────────
     // El motor expone `appliedRounding` con preRounding / postRounding (per
     // unit). Lo dejo plano para que el frontend pueda compararlo contra

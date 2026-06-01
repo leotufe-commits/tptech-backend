@@ -358,6 +358,29 @@ export function convertMetalHechuraBreakdownInPlace(mhb: any, rate: number): voi
   convertFieldNumber(mhb, "metalPricePerGram", rate);
   // NO: metalMarginPct, hechuraMarginPct (porcentajes).
   // NO: metalGramsBase, metalGramsSale (cantidades físicas).
+
+  // ── Etapa C-comercial / C4-fix (POLICY §R-Rounding-14) ──────────────────
+  // Auditoría del redondeo comercial — monetarios.
+  convertFieldNumber(mhb, "metalSalePreRounding",     rate);
+  convertFieldNumber(mhb, "hechuraSalePreRounding",   rate);
+  convertFieldNumber(mhb, "metalSaleRoundingDelta",   rate);
+  convertFieldNumber(mhb, "hechuraSaleRoundingDelta", rate);
+
+  // Snapshot PHYSICAL — convertir solo los montos $; preservar gramos físicos
+  // y campos textuales (mode/direction/source/fallback).
+  const physical = mhb.physical;
+  if (physical && typeof physical === "object") {
+    convertFieldNumber(physical, "metalMonetaryEquivalent", rate);
+    if (Array.isArray(physical.metals)) {
+      for (const entry of physical.metals) {
+        if (!entry || typeof entry !== "object") continue;
+        convertFieldNumber(entry, "metalPricePerGram",  rate);
+        convertFieldNumber(entry, "monetaryEquivalent", rate);
+        // NO: preGrams, postGrams, deltaGrams (gramos físicos).
+        // NO: mode, direction, source, fallback (strings).
+      }
+    }
+  }
 }
 
 /** `componentSaleBreakdown` — desglose Metal/Hechura post-descuentos. */
@@ -478,12 +501,61 @@ export function convertSaleDocumentTotalsInPlace(dt: any, rate: number): void {
   if (Array.isArray(dt.sourceTrace)) {
     for (const s of dt.sourceTrace) convertFieldNumber(s, "amount", rate);
   }
-  // `documentRoundingApplied` (modo UNIFIED) — campos numéricos del delta.
+  // `taxScaling` (Etapa Tax — POLICY §Tax.4) — convierte los montos.
+  // Los ratios (effectiveSaleRatio / effectiveDiscountRatio) son
+  // adimensionales y NO se convierten. `scalingApplied` es boolean.
+  if (dt.taxScaling) {
+    convertFieldNumber(dt.taxScaling, "subtotalAfterLineDiscounts", rate);
+    convertFieldNumber(dt.taxScaling, "taxableBase",                rate);
+    convertFieldNumber(dt.taxScaling, "originalTaxAmount",          rate);
+    convertFieldNumber(dt.taxScaling, "scalableTaxAmount",          rate);
+    convertFieldNumber(dt.taxScaling, "fixedTaxAmount",             rate);
+    convertFieldNumber(dt.taxScaling, "scaledScalableTax",          rate);
+    convertFieldNumber(dt.taxScaling, "scaledTaxAmount",            rate);
+    // NO: effectiveSaleRatio, effectiveDiscountRatio, scalingApplied.
+  }
+  // `documentRoundingApplied` (Etapa 1B — UNIFIED / BREAKDOWN / BOTH +
+  // Etapa D3 metalPhysical) — shape discriminado por scope. Convertimos
+  // todos los montos. Los campos textuales (scope, source, applyOn,
+  // mode, direction, fallback, metalParentId, metalParentName,
+  // metalDomain) NO se convierten. Los gramos físicos
+  // (preGrams/postGrams/deltaGrams) tampoco — son cantidad física.
   if (dt.documentRoundingApplied) {
-    convertFieldNumber(dt.documentRoundingApplied, "preRounding",  rate);
-    convertFieldNumber(dt.documentRoundingApplied, "postRounding", rate);
-    convertFieldNumber(dt.documentRoundingApplied, "adjustment",   rate);
-    // NO: source, applyOn, mode, direction (texto).
+    convertFieldNumber(dt.documentRoundingApplied, "totalAdjustment", rate);
+    if (dt.documentRoundingApplied.unified) {
+      convertFieldNumber(dt.documentRoundingApplied.unified, "preRounding",  rate);
+      convertFieldNumber(dt.documentRoundingApplied.unified, "postRounding", rate);
+      convertFieldNumber(dt.documentRoundingApplied.unified, "adjustment",   rate);
+    }
+    if (dt.documentRoundingApplied.breakdown) {
+      convertFieldNumber(dt.documentRoundingApplied.breakdown, "combinedAdjustment", rate);
+      for (const part of ["metal", "hechura"] as const) {
+        const layer = dt.documentRoundingApplied.breakdown[part];
+        if (layer) {
+          convertFieldNumber(layer, "preRounding",  rate);
+          convertFieldNumber(layer, "postRounding", rate);
+          convertFieldNumber(layer, "adjustment",   rate);
+        }
+      }
+      // Etapa D3 — metalPhysical: convertir precio $/g + equivalente $.
+      // NO convertir preGrams/postGrams/deltaGrams ni textos.
+      const mp = dt.documentRoundingApplied.breakdown.metalPhysical;
+      if (mp) {
+        if (Array.isArray(mp.metals)) {
+          for (const m of mp.metals) {
+            convertFieldNumber(m, "metalPricePerGram",  rate);
+            convertFieldNumber(m, "monetaryEquivalent", rate);
+          }
+        }
+        convertFieldNumber(mp, "metalMonetaryEquivalent", rate);
+      }
+    }
+    // Etapa D3 — bloque `totals` universal del snapshot de redondeo.
+    if (dt.documentRoundingApplied.totals) {
+      convertFieldNumber(dt.documentRoundingApplied.totals, "monetaryRoundingAdjustment", rate);
+      convertFieldNumber(dt.documentRoundingApplied.totals, "metalMonetaryEquivalent",    rate);
+      convertFieldNumber(dt.documentRoundingApplied.totals, "totalRoundingAdjustment",    rate);
+    }
   }
   // `channelResult` y `couponResult` que viven dentro de documentTotals son
   // referencias distintas a las top-level del response — el caller puede
@@ -497,7 +569,55 @@ export function convertSaleDocumentTotalsInPlace(dt: any, rate: number): void {
   // NO: roundingInfo (mode, applyOn, direction, priceListName — texto).
 }
 
+/**
+ * T42 — Convierte los campos monetarios de `pricingSteps[i]` y su `meta`.
+ *
+ * Los pricingSteps son el "timeline" del cálculo que el motor emite y el
+ * frontend consume para mostrar el detalle de Bonificación/Recargo (card
+ * contextual ⓘ en Factura → SaleLineDiscountSummary → PipelineTimeline).
+ *
+ * Campos monetarios:
+ *   · `step.value`               — subtotal/precio resultante post-step.
+ *   · `step.meta.discountBase`   — base sobre la que se aplica el ajuste.
+ *   · `step.meta.discountAmount` — monto del ajuste aplicado.
+ *
+ * Campos NO monetarios (NO convertir):
+ *   · `meta.type` / `meta.valueType` — discriminador (PERCENTAGE/FIXED_AMOUNT)
+ *   · `meta.value` — puede ser % (PERCENTAGE) o monto (FIXED_AMOUNT). Por
+ *     ambigüedad NO se convierte automáticamente; el frontend ya lo trata
+ *     como "info técnica" y consume el monto real desde `discountAmount`.
+ *   · `meta.applyOn`, `meta.promoName`, `meta.ruleType`, etc.
+ *
+ * Sin esta conversión, el card contextual mostraba importes en BASE con el
+ * símbolo de la moneda display → bug FX reportado por el operador
+ * ("US$ 400.062,50" en lugar de "US$ 100,02" para la base de un descuento).
+ */
+function convertPricingStepsInPlace(steps: any, rate: number): void {
+  if (!Array.isArray(steps) || rate === 1) return;
+  for (const step of steps) {
+    if (!step || typeof step !== "object") continue;
+    // step.value — el subtotal resultante del step en cascada (siempre
+    // monetario en el motor de venta). Si no es número finito, lo dejamos.
+    convertFieldNumber(step, "value", rate);
+    const meta = step.meta;
+    if (meta && typeof meta === "object") {
+      convertFieldNumber(meta, "discountBase",   rate);
+      convertFieldNumber(meta, "discountAmount", rate);
+    }
+  }
+}
+
 /** Una línea del response de sales (`SalePreviewLine`). */
+/** Convierte SOLO los campos monetarios de `lineCommercialRoundingMetals[]`
+ *  (precio/gramo + impacto $). Los gramos (pre/post/delta) NO se convierten. */
+function convertLineCommercialRoundingMetalsInPlace(arr: any, rate: number): void {
+  if (!Array.isArray(arr) || rate === 1) return;
+  for (const m of arr) {
+    convertFieldNumber(m, "metalReferenceValue", rate);
+    convertFieldNumber(m, "monetaryImpact",      rate);
+  }
+}
+
 export function convertSalesLineInPlace(line: any, rate: number): void {
   if (!line || rate === 1) return;
   // Precios y descuentos.
@@ -509,6 +629,17 @@ export function convertSalesLineInPlace(line: any, rate: number): void {
   convertFieldNumber(line, "unitTaxAmount",           rate);
   convertFieldNumber(line, "lineTaxAmount",           rate);
   convertFieldNumber(line, "lineTotalWithTax",        rate);
+  // Opción A — total post-redondeo comercial + impactos $ del redondeo
+  // distribuidos por línea (metal + hechura). Son MONETARIOS → se convierten
+  // junto con sus hermanos para no quedar mezclando BASE vs display.
+  convertFieldNumber(line, "lineTotalWithTaxPostCommercialRounding", rate);
+  convertFieldNumber(line, "lineMonetarySaldoPreCommercialRounding",  rate);
+  convertFieldNumber(line, "lineMonetarySaldoPostCommercialRounding", rate);
+  convertFieldNumber(line, "metalRoundingMonetaryImpact",   rate);
+  convertFieldNumber(line, "hechuraRoundingMonetaryImpact", rate);
+  // lineCommercialRoundingMetals[] — gramos NO se convierten; sí los $ por metal
+  // (metalReferenceValue = precio/gramo, monetaryImpact = delta × precio).
+  convertLineCommercialRoundingMetalsInPlace(line.lineCommercialRoundingMetals, rate);
   convertFieldNumber(line, "quantityDiscountAmount",  rate);
   convertFieldNumber(line, "promotionDiscountAmount", rate);
   // Costo y margen.
@@ -526,6 +657,8 @@ export function convertSalesLineInPlace(line: any, rate: number): void {
   convertComponentSaleBreakdownInPlace(line.componentSaleBreakdown, rate);
   convertCompositionInPlace(line.composition, rate);
   convertAppliedRoundingInPlace(line.appliedRounding, rate);
+  // T42 — pricingSteps[].meta.{discountBase,discountAmount} + .value.
+  convertPricingStepsInPlace(line.pricingSteps, rate);
   // pricingSnapshot — Fase 5 contiene los mismos amounts pero también es
   // serializable; lo persiste confirmSale en moneda BASE. Acá solo mostramos
   // — convertimos en-place pero el caller (sales.service) NO debe reusar
@@ -574,6 +707,14 @@ export function convertArticlePreviewResponseInPlace(res: any, rate: number): vo
   convertFieldNumber(res, "lineTotalWithTax", rate);
   // FASE 1.2 G3.1 — descuento per-line top-level (mismo patrón que G3).
   convertFieldNumber(res, "lineDiscount",     rate);
+  // Paridad Factura — campos del Redondeo Comercial PER_DOCUMENT (MONETARIOS).
+  // Mismo trato que en `convertSalesLineInPlace`.
+  convertFieldNumber(res, "lineTotalWithTaxPostCommercialRounding",  rate);
+  convertFieldNumber(res, "lineMonetarySaldoPreCommercialRounding",  rate);
+  convertFieldNumber(res, "lineMonetarySaldoPostCommercialRounding", rate);
+  convertFieldNumber(res, "metalRoundingMonetaryImpact",   rate);
+  convertFieldNumber(res, "hechuraRoundingMonetaryImpact", rate);
+  convertLineCommercialRoundingMetalsInPlace(res.lineCommercialRoundingMetals, rate);
 
   // Costo de compra.
   convertFieldString(res, "costBase",      rate);
@@ -597,6 +738,12 @@ export function convertArticlePreviewResponseInPlace(res: any, rate: number): vo
   // `sales/preview` y que el comparador y los consumidores frontend reciban
   // todos los importes en la moneda seleccionada.
   convertSaleDocumentTotalsInPlace(res.documentTotals, rate);
+
+  // T42 — pricingSteps[].meta.{discountBase,discountAmount} + .value. El
+  // Simulador (que también consume articles/pricing-preview) los usa para
+  // mostrar el desglose paso a paso; sin conversión, los importes del
+  // pipeline aparecían en BASE con el símbolo de la moneda display.
+  convertPricingStepsInPlace((res as any).pricingSteps, rate);
 }
 
 /**
@@ -622,6 +769,65 @@ export function convertCostPreviewResponseInPlace(res: any, rate: number): void 
   }
 }
 
+/** `manualAdjustment` snapshot (POLICY §R-Rounding-1 capa 17).
+ *
+ *  Etapa A — scope UNIFIED. Etapa C — scope BREAKDOWN.
+ *
+ *  Convierte los campos MONETARIOS del snapshot inmutable. Los gramos
+ *  (`preGrams`, `postGrams`, `deltaGrams`) NUNCA se convierten — son
+ *  cantidad física, no moneda.
+ *
+ *  UNIFIED:
+ *    · `unified.preAmount / postAmount / amount` → SE CONVIERTEN.
+ *
+ *  BREAKDOWN:
+ *    · `breakdown.metals[].metalPricePerGram`      → SE CONVIERTE (precio $/gramo).
+ *    · `breakdown.metals[].monetaryEquivalent`     → SE CONVIERTE.
+ *    · `breakdown.metals[].preGrams/postGrams/deltaGrams` → NO se convierten.
+ *    · `breakdown.monetary.preAmount/amount/postAmount`   → SE CONVIERTEN.
+ *
+ *  TOTALS (universal):
+ *    · `totals.monetaryAdjustment`      → SE CONVIERTE.
+ *    · `totals.metalMonetaryEquivalent` → SE CONVIERTE.
+ *    · `totals.totalMonetaryAdjustment` → SE CONVIERTE.
+ *
+ *  `scope` / `audit.*` / `metalParentId` / `metalParentName` → NO se convierten.
+ *
+ *  Crítico para multimoneda: si este snapshot no se convierte, el frontend
+ *  muestra el ajuste en moneda BASE mientras el resto del response viene
+ *  en DISPLAY → mezcla de monedas y rompe la invariante visual
+ *  `engineTotal + totalMonetaryAdjustment === finalTotal`. */
+export function convertManualAdjustmentSnapshotInPlace(snapshot: any, rate: number): void {
+  if (!snapshot || rate === 1) return;
+  if (snapshot.unified) {
+    convertFieldNumber(snapshot.unified, "preAmount",  rate);
+    convertFieldNumber(snapshot.unified, "postAmount", rate);
+    convertFieldNumber(snapshot.unified, "amount",     rate);
+  }
+  if (snapshot.breakdown) {
+    if (Array.isArray(snapshot.breakdown.metals)) {
+      for (const m of snapshot.breakdown.metals) {
+        // Gramos invariantes (preGrams / postGrams / deltaGrams).
+        convertFieldNumber(m, "metalPricePerGram",  rate);
+        convertFieldNumber(m, "monetaryEquivalent", rate);
+        // metalParentId / metalParentName → texto/id; NO se convierten.
+      }
+    }
+    if (snapshot.breakdown.monetary) {
+      convertFieldNumber(snapshot.breakdown.monetary, "preAmount",  rate);
+      convertFieldNumber(snapshot.breakdown.monetary, "amount",     rate);
+      convertFieldNumber(snapshot.breakdown.monetary, "postAmount", rate);
+    }
+  }
+  if (snapshot.totals) {
+    convertFieldNumber(snapshot.totals, "monetaryAdjustment",      rate);
+    convertFieldNumber(snapshot.totals, "metalMonetaryEquivalent", rate);
+    convertFieldNumber(snapshot.totals, "totalMonetaryAdjustment", rate);
+  }
+  // `scope`, `audit.appliedBy.userId`, `audit.appliedBy.userName`,
+  // `audit.appliedAt`, `audit.reason` → NO se convierten.
+}
+
 /** Response completo de `sales/preview`. */
 export function convertSalesPreviewResponseInPlace(res: any, rate: number): void {
   if (!res || rate === 1) return;
@@ -634,6 +840,63 @@ export function convertSalesPreviewResponseInPlace(res: any, rate: number): void
   convertFieldNumber(res, "subtotal", rate);
   convertFieldNumber(res, "total",    rate);
   convertSaleDocumentTotalsInPlace(res.documentTotals, rate);
+  // T57 (Fase 3B.7) — Balance Mode breakdown a moneda del documento.
+  convertBalanceBreakdownInPlace(res.balanceBreakdown, rate);
+  // Etapa A — Manual Adjustment (POLICY §R-Rounding-1 capa 17).
+  // `engineTotal` y `finalTotal` son top-level del response del preview;
+  // el snapshot `manualAdjustment` lleva sus propios montos en BASE.
+  // Conversión simétrica para que el bloque "TPTech calculó / Ajuste /
+  // Total final" muestre todo en moneda display.
+  convertFieldNumber(res, "engineTotal", rate);
+  convertFieldNumber(res, "finalTotal",  rate);
+  convertManualAdjustmentSnapshotInPlace(res.manualAdjustment, rate);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T57 (Fase 3B.7) — convertBalanceBreakdownInPlace
+//
+// Convierte los campos MONETARIOS del breakdown canónico (POLICY.md §11) de
+// moneda BASE a moneda del DOCUMENTO. Los gramos NO se tocan — son una unidad
+// física, independiente de la moneda.
+//
+// Reglas:
+//   · `monetaryBalance.amount`        → SE CONVIERTE (display en doc currency).
+//   · `monetaryBalance.amountBase`    → NO se toca (es por definición BASE).
+//   · `monetaryBalance.currencyRate`  → NO se toca (snapshot histórico de la tasa).
+//   · `metals[].valuationMonetary`    → SE CONVIERTE.
+//   · `metals[].quotePriceSnapshot`   → SE CONVIERTE (cotización por gramo en doc).
+//   · `metals[].gramsOriginal`/`gramsPure`/`purity` → NO se convierten.
+//   · `components[].amount`           → SE CONVIERTE (todos los componentes display-only).
+//
+// Mismo guard que el resto: `rate === 1` → no-op total.
+// =============================================================================
+/** Convierte BalanceBreakdown de BASE→doc currency in-place. Gramos invariantes. */
+export function convertBalanceBreakdownInPlace(bd: any, rate: number): void {
+  if (!bd || rate === 1) return;
+  // monetaryBalance.amount (NO amountBase).
+  if (bd.monetaryBalance && typeof bd.monetaryBalance === "object") {
+    convertFieldNumber(bd.monetaryBalance, "amount", rate);
+    // amountBase queda intacto (definición = base currency).
+    // currencyRate también intacto (es el snapshot histórico).
+    // components[] display-only.
+    if (Array.isArray(bd.monetaryBalance.components)) {
+      for (const c of bd.monetaryBalance.components) {
+        convertFieldNumber(c, "amount", rate);
+        // type/label/sourceLineId/source NO se tocan.
+      }
+    }
+  }
+  // metals[]: valuación y cotización por gramo se convierten. Gramos NO.
+  if (Array.isArray(bd.metals)) {
+    for (const m of bd.metals) {
+      convertFieldNumber(m, "valuationMonetary",  rate);
+      convertFieldNumber(m, "quotePriceSnapshot", rate);
+      // NO convertir: gramsOriginal, gramsPure, purity, sourceLineIds,
+      // metalParentId, metalParentName, valuationCurrencyCode, variants[].
+      // Las variants[] del breakdown sólo guardan gramos+purity (sin
+      // monetario), nada que convertir.
+    }
+  }
 }
 
 /**
@@ -666,6 +929,11 @@ export function convertSalesPreviewInputInPlace(
     shipping?: { mode: "FIXED" | "BY_WEIGHT" | "FREE"; value?: number | null; weight?: number | null } | null;
     globalDiscountAmount?: number;
     globalDiscount?: { type: "PERCENT" | "AMOUNT"; value: number } | null;
+    /** Manual Adjustment (Etapa A UNIFIED + Etapa C BREAKDOWN). El operador
+     *  tipea en MONEDA DISPLAY; el motor consume en BASE. Conversión
+     *  simétrica con `convertManualAdjustmentSnapshotInPlace` (que hace el
+     *  camino inverso en el response). */
+    manualAdjustment?: any;
   } | null | undefined,
   rate: number,
 ): void {
@@ -697,6 +965,28 @@ export function convertSalesPreviewInputInPlace(
   }
   if (input.globalDiscount && input.globalDiscount.type === "AMOUNT") {
     input.globalDiscount.value = toB(input.globalDiscount.value);
+  }
+
+  // Manual Adjustment (Etapas A + C).
+  //   · UNIFIED: `amount` ($ del operador en moneda display) → base.
+  //   · BREAKDOWN: `monetaryAmount` ($ de hechura) → base. Los `targetGrams`
+  //     y `deltaGrams` NUNCA se convierten (gramos son cantidad física).
+  //   · `reason`, `metalParentId`, `metalParentName` → NO se convierten.
+  const ma = (input as any).manualAdjustment;
+  if (ma && typeof ma === "object") {
+    if (ma.scope === "BREAKDOWN") {
+      if (typeof ma.monetaryAmount === "number" && Number.isFinite(ma.monetaryAmount)) {
+        ma.monetaryAmount = toB(ma.monetaryAmount);
+      }
+    } else {
+      // UNIFIED — `amount` plano o `unified.amount` rico.
+      if (typeof ma.amount === "number" && Number.isFinite(ma.amount)) {
+        ma.amount = toB(ma.amount);
+      }
+      if (ma.unified && typeof ma.unified.amount === "number" && Number.isFinite(ma.unified.amount)) {
+        ma.unified.amount = toB(ma.unified.amount);
+      }
+    }
   }
 }
 

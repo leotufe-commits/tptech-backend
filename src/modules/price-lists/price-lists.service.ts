@@ -57,6 +57,10 @@ const PL_SELECT = {
   roundingDirectionHechura: true,
   roundingValueMetal: true,
   roundingValueHechura: true,
+  // Etapa C-comercial (POLICY §R-Rounding-14) — Default MONETARY; PHYSICAL
+  // habilita redondeo en gramos por metal padre. JSON nullable.
+  commercialRoundingMetalDomain: true,
+  commercialPhysicalRoundingConfig: true,
   validFrom: true,
   validTo: true,
   isFavorite: true,
@@ -118,6 +122,30 @@ function parsePriceListData(data: any) {
   const roundingValueHechura =
     roundingTarget !== "NONE" ? toDecOrNull(data?.roundingValueHechura) : null;
 
+  // ── Etapa C-comercial / C1 (POLICY §R-Rounding-14) ──────────────────────
+  // Discriminador del dominio del metal en el redondeo COMERCIAL. Reusa el
+  // enum `DocumentRoundingMetalDomain` (MONETARY | PHYSICAL). Default
+  // MONETARY = compat hacia atrás. Cualquier valor distinto a "PHYSICAL"
+  // cae a MONETARY (degradación segura).
+  const commercialRoundingMetalDomain: "MONETARY" | "PHYSICAL" =
+    data?.commercialRoundingMetalDomain === "PHYSICAL" ? "PHYSICAL" : "MONETARY";
+
+  // Config JSON nullable — paralela a `documentPhysicalRoundingConfig`.
+  // El parser runtime (Etapa C2) valida el shape detalladamente; acá solo
+  // garantizamos que sea un objeto (o `null`). Si llega un valor con shape
+  // inesperado, lo persistimos tal cual y el parser lo descarta en runtime
+  // con `hasInvalidEntries=true` (mismo contrato que el financiero).
+  let commercialPhysicalRoundingConfig: Record<string, unknown> | null = null;
+  const rawCfg = data?.commercialPhysicalRoundingConfig;
+  if (rawCfg && typeof rawCfg === "object" && !Array.isArray(rawCfg)) {
+    commercialPhysicalRoundingConfig = rawCfg as Record<string, unknown>;
+  }
+  // Coherencia: si el dominio es MONETARY, no persistir config física
+  // (evita JSON huérfano que confunde al operador en el editor).
+  if (commercialRoundingMetalDomain !== "PHYSICAL") {
+    commercialPhysicalRoundingConfig = null;
+  }
+
   const marginTotal = mode === "MARGIN_TOTAL" ? toDecOrNull(data?.marginTotal) : null;
   // MARGIN_TOTAL (unified mode): replicate the value into marginMetal/marginHechura so the
   // pricing engine can treat it the same way as METAL_HECHURA internally.
@@ -161,6 +189,8 @@ function parsePriceListData(data: any) {
     roundingDirectionHechura,
     roundingValueMetal,
     roundingValueHechura,
+    commercialRoundingMetalDomain,
+    commercialPhysicalRoundingConfig,
     validFrom,
     validTo,
     sortOrder: Number(data?.sortOrder ?? 0) || 0,
@@ -206,47 +236,43 @@ async function validateScopeRelations(jewelryId: string, d: ReturnType<typeof pa
   }
 }
 
-/**
- * POLICY.md §1 R1.2 — Si el tenant tiene `documentRoundingEnabled = true` y
- * un modo activo, las listas no pueden aplicar redondeo comercial propio.
- * La combinación produce DOBLE REDONDEO (lista + documento) y rompe la
- * paridad simulador ↔ factura.
- *
- * Configuraciones rechazadas cuando el tenant tiene redondeo de documento:
- *   - roundingTarget = METAL  (cualquier modo / dirección)
- *   - roundingApplyOn = PRICE con roundingMode ≠ NONE
- *
- * Configuraciones permitidas con tenant.documentRoundingEnabled = true:
- *   - roundingTarget = NONE
- *   - roundingTarget = FINAL_PRICE con roundingApplyOn = NET | TOTAL
- *     (estas se difieren y son neutralizadas por suppressListDeferredRounding
- *     en el motor — ver pricing-engine.sale.ts).
- */
-async function validateRoundingPolicy(jewelryId: string, d: ReturnType<typeof parsePriceListData>) {
-  const tenant = await prisma.jewelry.findUnique({
-    where: { id: jewelryId },
-    select: { documentRoundingEnabled: true, documentRoundingMode: true },
-  });
-  // Sin redondeo de documento → cualquier configuración de lista vale.
-  if (!tenant?.documentRoundingEnabled || tenant.documentRoundingMode === "NONE") {
-    return;
-  }
-
-  assert(
-    d.roundingTarget !== "METAL",
-    "El redondeo del documento está activo en este tenant. " +
-    "Las listas no pueden usar 'roundingTarget = METAL' porque produciría doble redondeo. " +
-    "Usá 'NONE' o 'FINAL_PRICE' con applyOn = NET o TOTAL.",
-  );
-
-  const priceLevelRounding = d.roundingApplyOn === "PRICE" && d.roundingMode !== "NONE";
-  assert(
-    !priceLevelRounding,
-    "El redondeo del documento está activo en este tenant. " +
-    "Las listas no pueden usar 'roundingApplyOn = PRICE' con un modo distinto de NONE " +
-    "porque produciría doble redondeo. Usá applyOn = NET o TOTAL (se difieren al documento).",
-  );
-}
+// ─── Prevención de doble redondeo (DECISIÓN ARQUITECTÓNICA) ─────────────────
+//
+// La prevención de doble redondeo (lista + documento) NO vive más en la
+// validación de creación/edición de listas. Vive en el RUNTIME del pipeline:
+//
+//   · `loadDocumentRoundingConfig` (`src/lib/document-rounding.ts:154`)
+//     emite `suppressListDeferredRounding = true` cuando el tenant tiene
+//     política de documento activa.
+//   · `pricing-engine.sale.ts:1620` consulta ese flag y NEUTRALIZA el
+//     redondeo diferido de la lista (`applyOn = NET | TOTAL`) cuando está
+//     activo. El documento es la única autoridad en ese caso.
+//   · Capa 16 (`applyDocumentPhysicalRounding`) lleva el redondeo físico
+//     de gramos por metal padre; suprime la capa 15.metal monetaria para
+//     evitar doble redondeo (ver `document-rounding.ts:108-111`).
+//
+// Por qué se removió de acá:
+//
+//   La lista de precios es una regla COMERCIAL REUSABLE. Su configuración
+//   no debe depender del estado vigente de `Jewelry.documentRounding*`:
+//   un tenant puede cambiar la política financiera mañana sin que sus
+//   listas comerciales queden bloqueadas (y viceversa). Acoplar las dos
+//   configuraciones impedía operativas legítimas como:
+//
+//     · Lista METAL_HECHURA con `roundingModeMetal=INTEGER` /
+//       `roundingModeHechura=HUNDRED` aunque el tenant también tenga
+//       documentRoundingScope=BREAKDOWN financiero — el runtime ya
+//       resuelve la colisión.
+//     · Editar la política financiera del tenant sin tener que migrar
+//       todas las listas existentes a configs "compatibles".
+//
+// Si en el futuro se necesita avisar al operador de un riesgo, debe ser
+// un WARNING visual en el frontend (no un assert que rechace el guardado).
+//
+// (Antes vivía acá una función `validateRoundingPolicy` que rechazaba
+// con HTTP 400 — eliminada en esta etapa. Test cobertura: ver
+// `tptech-backend/src/lib/pricing-engine/__tests__/double-rounding-trap.test.ts`,
+// que ahora cubre el contrato nuevo: lista pasa + runtime sigue activo.)
 
 export async function listPriceLists(jewelryId: string) {
   assert(jewelryId, "Tenant inválido.");
@@ -273,7 +299,9 @@ export async function createPriceList(jewelryId: string, data: any) {
   validateMargins(parsed.mode, parsed);
   validateDates(parsed);
   await validateScopeRelations(jewelryId, parsed);
-  await validateRoundingPolicy(jewelryId, parsed);
+  // Prevención de doble redondeo eliminada de la creación de la lista —
+  // vive en el runtime (`loadDocumentRoundingConfig` + `pricing-engine.sale`).
+  // Ver comentario arriba de `createPriceList` / `updatePriceList`.
 
   const code = parsed.code || (await generateCode(jewelryId, parsed.name));
   const isActive = data?.isActive === false ? false : true;
@@ -306,6 +334,11 @@ export async function createPriceList(jewelryId: string, data: any) {
       minimumPrice: parsed.minimumPrice ?? undefined,
       roundingValueMetal: parsed.roundingValueMetal ?? undefined,
       roundingValueHechura: parsed.roundingValueHechura ?? undefined,
+      // Etapa C-comercial — Prisma JSON nullable: `undefined` no setea,
+      // `null` guarda NULL (= sin config). Cast `as any` por el mismo
+      // motivo que `documentPhysicalRoundingConfig` en company.controller.
+      commercialPhysicalRoundingConfig:
+        parsed.commercialPhysicalRoundingConfig as any,
     },
     select: PL_SELECT,
   });
@@ -333,7 +366,8 @@ export async function updatePriceList(id: string, jewelryId: string, data: any) 
   validateMargins(parsed.mode, parsed);
   validateDates(parsed);
   await validateScopeRelations(jewelryId, parsed);
-  await validateRoundingPolicy(jewelryId, parsed);
+  // Prevención de doble redondeo eliminada de la edición de la lista —
+  // misma razón que en `createPriceList` (ver comentario allá).
 
   const isActive = data?.isActive === false ? false : true;
   const isFavorite = isActive ? data?.isFavorite === true : false;
@@ -361,6 +395,11 @@ export async function updatePriceList(id: string, jewelryId: string, data: any) 
       minimumPrice: parsed.minimumPrice ?? undefined,
       roundingValueMetal: parsed.roundingValueMetal ?? undefined,
       roundingValueHechura: parsed.roundingValueHechura ?? undefined,
+      // Etapa C-comercial — cuando el operador cambia de PHYSICAL a
+      // MONETARY, `parsed.commercialPhysicalRoundingConfig` viene `null`
+      // y Prisma lo persiste como NULL en DB (limpia la config huérfana).
+      commercialPhysicalRoundingConfig:
+        parsed.commercialPhysicalRoundingConfig as any,
     },
     select: PL_SELECT,
   });
@@ -403,6 +442,10 @@ export async function clonePriceList(id: string, jewelryId: string) {
       roundingDirectionHechura: original.roundingDirectionHechura,
       roundingValueMetal: original.roundingValueMetal ?? undefined,
       roundingValueHechura: original.roundingValueHechura ?? undefined,
+      // Etapa C-comercial — preservar config al clonar.
+      commercialRoundingMetalDomain: (original as any).commercialRoundingMetalDomain ?? "MONETARY",
+      commercialPhysicalRoundingConfig:
+        (original as any).commercialPhysicalRoundingConfig ?? undefined,
       validFrom: original.validFrom,
       validTo: original.validTo,
       isFavorite: false,

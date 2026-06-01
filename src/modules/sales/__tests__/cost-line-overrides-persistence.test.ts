@@ -71,6 +71,8 @@ vi.mock("../../../lib/pricing-engine/pricing-engine.js", () => ({
     costBase: null, costTaxAmount: null, costWithTax: null, costTaxBreakdown: [],
   }),
   deriveMetalHechuraBreakdown:    () => null,
+  // POLICY §Tax.3 — porción FIXED del impuesto (no escala con descuentos doc).
+  sumFixedTaxComponent:           () => 0,
   resolveShippingAmount:          () => 0,
 }));
 vi.mock("../../../lib/pricing-composition.js", () => ({

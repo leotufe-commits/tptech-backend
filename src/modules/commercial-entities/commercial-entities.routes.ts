@@ -2,6 +2,7 @@ import { Router } from "express";
 import { asyncHandler } from "../../middlewares/asyncHandlers.js";
 import * as controller from "./commercial-entities.controller.js";
 import * as statementCtrl from "./account-statement.controller.js";
+import * as balanceMovementsCtrl from "./balance-movements.controller.js";
 import { uploadEntityAvatarMiddleware } from "../../middlewares/uploadEntityAvatar.js";
 import { uploadEntityAttachmentMiddleware } from "../../middlewares/uploadEntityAttachments.js";
 
@@ -104,5 +105,11 @@ router.delete("/:id/relations/:relationId", asyncHandler(controller.removeRelati
 // ===========================================================================
 router.get( "/:id/account-statement",       asyncHandler(statementCtrl.getStatement));
 router.post("/:id/account-statement/email", asyncHandler(statementCtrl.emailStatement));
+
+// ===========================================================================
+// Balance Movements (Fase 3B.7) — lectura canónica con Balance Mode +
+// metalEntries. Coexiste con `/account-statement` (lectura legacy).
+// ===========================================================================
+router.get("/:id/balance-movements", asyncHandler(balanceMovementsCtrl.list));
 
 export default router;

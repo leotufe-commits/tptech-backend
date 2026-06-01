@@ -41,6 +41,7 @@ import type {
   SnapshotComposition,
 } from "./pricing-engine.types.js";
 import { PRICING_LINE_SNAPSHOT_VERSION } from "./pricing-engine.types.js";
+import { traceLine } from "./pricing-trace.js";
 
 // ---------------------------------------------------------------------------
 // Política de precios — configuración y fallbacks
@@ -249,17 +250,22 @@ function buildAlerts(
     });
   }
 
-  // LOSS_SALE — se vende por debajo del costo
+  // LOSS_SALE — se vende ESTRICTAMENTE por debajo del costo (margen < 0).
+  // Antes era `lte` (≤) e incluía margen 0% (precio === costo), lo que
+  // disparaba LOSS_SALE para ventas marginal-cero y absorbía el rango
+  // WARNING (margen bajo pero positivo) en el frontend. Con `lt` (<),
+  // margen 0% ahora cae naturalmente en LOW_MARGIN cuando el umbral
+  // recomendado del tenant es positivo.
   if (
     result.unitCost != null &&
     result.unitPrice != null &&
     result.unitPrice.gt(0) &&
-    result.unitPrice.lte(result.unitCost)
+    result.unitPrice.lt(result.unitCost)
   ) {
     alerts.push({
       code: "LOSS_SALE",
       level: "error",
-      message: `Venta a pérdida: el precio (${result.unitPrice.toFixed(2)}) es menor o igual al costo (${result.unitCost.toFixed(2)}).`,
+      message: `Venta a pérdida: el precio (${result.unitPrice.toFixed(2)}) es menor al costo (${result.unitCost.toFixed(2)}).`,
     });
   }
 
@@ -741,6 +747,43 @@ export async function computeLineTaxes(
   }
 
   return { taxBreakdown, taxAmount: totalTax };
+}
+
+/**
+ * POLICY §Tax.3 — separa la porción FIJA del taxBreakdown.
+ *
+ * Devuelve el monto total de impuestos que NO deben escalar con descuentos
+ * de cabecera (canal, cupón, global). Suma:
+ *   · Impuestos `FIXED_AMOUNT` completos (todo es fijo).
+ *   · La parte `fixedAmount` de impuestos `PERCENTAGE_PLUS_FIXED` (el
+ *     componente porcentual sí escala normalmente).
+ *
+ * El caller de `computeSaleDocumentTotals` pasa este valor como
+ * `lineTaxAmountFixed` por línea. Si la lista de breakdown viene per-unit,
+ * el caller multiplica por quantity antes de pasarlo. Si viene per-line
+ * (× qty ya aplicado), se pasa directo.
+ *
+ * Helper puro: no muta el breakdown ni recibe quantity (decisión explícita
+ * del caller para evitar ambigüedad de unidades).
+ */
+export function sumFixedTaxComponent(
+  taxBreakdown: ReadonlyArray<{
+    calculationType?: string | null;
+    taxAmount?:       number | null;
+    fixedAmount?:     number | null;
+  }> | null | undefined,
+): number {
+  if (!Array.isArray(taxBreakdown) || taxBreakdown.length === 0) return 0;
+  let fixed = 0;
+  for (const t of taxBreakdown) {
+    const type = t.calculationType;
+    if (type === "FIXED_AMOUNT") {
+      fixed += Number(t.taxAmount ?? 0);
+    } else if (type === "PERCENTAGE_PLUS_FIXED") {
+      fixed += Number(t.fixedAmount ?? 0);
+    }
+  }
+  return Math.max(0, Math.round(fixed * 100) / 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +1444,63 @@ export async function resolveFinalSalePrice(
   // "line" | "default".
   const saleCostInput: typeof costResult = costResult;
 
+  // ── Etapa C-comercial / C3 (POLICY §R-Rounding-14) ──────────────────────
+  // Consolidamos los steps `COST_LINES_METAL` post-enrich por METAL PADRE
+  // (`step.meta.metalId` = id del padre tras `enrichCostMetalSteps`).
+  // Resultado: `cost.metalsByParent[]` con gramos puros agregados al fino
+  // y el precio promedio por gramo PONDERADO. Habilitador del path PHYSICAL
+  // del redondeo comercial en `applyPriceList`.
+  //
+  // Nunca opera sobre variantes (Oro 18K / 14K / 10K) — siempre sobre el
+  // PADRE (Oro Fino, Plata, Platino). Si el motor de costo no expuso steps
+  // metálicos (artículo sin composición) `metalsByParent` queda `null` y la
+  // bifurcación PHYSICAL en `applyPriceList` cae al path MONETARY legacy.
+  {
+    const byParent = new Map<
+      string,
+      { name: string; grams: number; weightedPriceSum: number; gramsForPrice: number }
+    >();
+    for (const s of (saleCostInput.steps ?? [])) {
+      if (!s || s.key !== "COST_LINES_METAL" || s.status !== "ok") continue;
+      const meta = (s.meta ?? {}) as Record<string, unknown>;
+      const metalId    = typeof meta.metalId === "string" && meta.metalId.length > 0
+        ? meta.metalId : null;
+      if (!metalId) continue;
+      const grams =
+        typeof meta.gramsFineEquivalent === "number"
+          ? meta.gramsFineEquivalent
+          : (typeof meta.gramsOriginal === "number" ? meta.gramsOriginal : null);
+      if (grams == null || !Number.isFinite(grams) || grams <= 1e-9) continue;
+      const quote = typeof meta.quotePrice === "number" ? meta.quotePrice
+                  : (typeof meta.quotePrice === "string" ? parseFloat(meta.quotePrice) : null);
+      const name  = typeof meta.metalName === "string" && meta.metalName.length > 0
+                  ? meta.metalName : metalId;
+      const prev  = byParent.get(metalId) ?? {
+        name,
+        grams: 0,
+        weightedPriceSum: 0,
+        gramsForPrice: 0,
+      };
+      prev.grams += grams;
+      if (quote != null && Number.isFinite(quote) && quote > 0) {
+        prev.weightedPriceSum += quote * grams;
+        prev.gramsForPrice    += grams;
+      }
+      byParent.set(metalId, prev);
+    }
+    const metalsByParent = Array.from(byParent.entries()).map(([id, v]) => ({
+      metalParentId:     id,
+      metalParentName:   v.name,
+      gramsPure:         v.grams,
+      metalPricePerGram: v.gramsForPrice > 0 ? v.weightedPriceSum / v.gramsForPrice : 0,
+    }));
+    // Asignamos al `cost` que viaja al motor de lista. Cast `as any` porque
+    // `CostResult` (tipo de `pricing-engine.cost.ts`) no necesita conocer
+    // este campo — solo el motor de lista lo consume.
+    (saleCostInput as any).metalsByParent =
+      metalsByParent.length > 0 ? metalsByParent : null;
+  }
+
   // ── Cost breakdown unificado para resolveDiscountBase y tracker ─────────
   // `resolveDiscountBase` con applyOn=METAL|HECHURA lee el desglose de costo
   // para estimar la porción del precio cuando NO hay metalHechuraBreakdown.
@@ -1561,7 +1661,14 @@ export async function resolveFinalSalePrice(
     if (resolved) {
       // saleCostInput tiene metalCost ajustado con merma de entidad (si aplica).
       // costResult (puro) ya fue trackeado arriba como COSTO_REAL.
-      const priceResult = applyPriceList(resolved.priceList, saleCostInput);
+      // Etapa D' — Si el caller pasó `applyPriceListOptions` (PER_DOCUMENT),
+      // propagamos los flags de supresión al motor de lista. Sin flags el
+      // comportamiento PER_LINE legacy queda intacto.
+      const priceResult = applyPriceList(
+        resolved.priceList,
+        saleCostInput,
+        opts.applyPriceListOptions,
+      );
       if (priceResult.value != null) {
         basePrice = priceResult.value;
         priceSource = "PRICE_LIST";
@@ -1618,6 +1725,43 @@ export async function resolveFinalSalePrice(
             priceListId:   resolved.priceList.id,
             priceListName: resolved.priceList.name,
           };
+        }
+        // ── Etapa C-comercial — Redondeo PHYSICAL del comercial (POLICY §R-Rounding-14) ──
+        // Cuando el motor de lista bifurcó al path PHYSICAL y actuó (delta de
+        // gramos != 0), exponemos `appliedRounding` con `applyOn: "METAL"` +
+        // sub-objeto `physical` que el frontend renderiza sin sumar líneas.
+        //
+        // Sin esto, `appliedRounding` quedaba null incluso cuando el motor
+        // ajustó `metalSaleD` por el equivalente $ del Δgramos → el frontend
+        // no podía señalizar "se aplicó redondeo comercial" en esta línea.
+        //
+        // No pisa el bloque PRICE de arriba: ambos son excluyentes por modo de
+        // lista (PRICE = MARGIN_TOTAL/COST_PER_GRAM con applyOn=PRICE; METAL =
+        // METAL_HECHURA con target=METAL y commercialRoundingMetalDomain=PHYSICAL).
+        if (
+          appliedRounding == null &&
+          priceResult.metalHechuraDetail?.physical != null
+        ) {
+          const ph     = priceResult.metalHechuraDetail.physical;
+          const meq    = ph.metalMonetaryEquivalent;
+          const msFinal = priceResult.metalHechuraDetail.metalSale;
+          if (Number.isFinite(meq) && meq !== 0) {
+            const post = new Prisma.Decimal(String(msFinal));
+            const pre  = new Prisma.Decimal(String(msFinal - meq));
+            // mode/direction: tomamos del primer metal del snapshot (todos
+            // comparten config por línea — fallback resuelto por el resolver).
+            const first = ph.metals[0];
+            appliedRounding = {
+              applyOn:      "METAL",
+              mode:         (first?.mode      ?? "INTEGER")  as string,
+              direction:    (first?.direction ?? "NEAREST")  as string,
+              preRounding:  pre,
+              postRounding: post,
+              priceListId:   resolved.priceList.id,
+              priceListName: resolved.priceList.name,
+              physical:     ph,
+            };
+          }
         }
       } else {
         steps.push({
@@ -2128,7 +2272,24 @@ export async function resolveFinalSalePrice(
 
     const canApply = ruleType != null && valueType != null && rawValue != null && rawValue > 0;
 
-    if (canApply) {
+    // T22 — Cuando hay PRECIO MANUAL (`manualPriceOverride`), el operador
+    // fijó el precio FINAL NETO de la línea. Aplicar encima la condición
+    // comercial automática del cliente (DESCUENTO/BONUS/RECARGO) produce
+    // un comportamiento "fantasma" que el operador no espera: el precio
+    // manual deja de ser el efectivo y el total se mueve por la regla del
+    // cliente que el operador no ve.
+    //
+    // Misma semántica que ya aplica el motor a `qty discount` y `promotion`
+    // arriba (línea 1766+): manual price las SALTEA. Antes el bloque de
+    // EntityCommercialRule era el único que pasaba por encima — bug
+    // observado por el usuario:
+    //     "cliente recargo 15% + precio manual 400.000 → total con recargo
+    //      automático aplicado encima".
+    //
+    // POLICY R6 — el operador puede seguir aplicando un ajuste manual de
+    // Bonificación/Recargo via `manualDiscountOverride` para forzar un
+    // efectivo distinto del precio manual; eso permanece intacto.
+    if (canApply && !manualPriceApplied) {
       const ruleValue = new D(String(rawValue));
 
       if (ruleType === "DISCOUNT" || ruleType === "BONUS") {
@@ -2233,6 +2394,9 @@ export async function resolveFinalSalePrice(
     opts.manualDiscountOverride.value >= 0
   ) {
     const od = opts.manualDiscountOverride;
+    // Tipo de ajuste — default BONUS (back-compat con clientes que no
+    // mandan `kind`). SURCHARGE: misma fórmula pero sumando al precio.
+    const isSurcharge = od.kind === "SURCHARGE";
     // Precedencia de base (independiente de si hay cliente o no):
     //   1. `manualDiscountOverride.appliesTo` (base embebida en el override
     //      de valor que fijó el operador en la línea).
@@ -2240,59 +2404,72 @@ export async function resolveFinalSalePrice(
     //      operador cambió "Aplica a" sin re-tocar el valor).
     //   3. "TOTAL" (default — NO se requiere cliente/regla comercial).
     // La regla comercial del cliente (`commercialApplyOn`) NO interviene
-    // acá: gobierna solo su propia capa (más arriba). La bonificación
-    // MANUAL por línea manda y funciona con o sin cliente.
+    // acá: gobierna solo su propia capa (más arriba). El ajuste MANUAL por
+    // línea (bonif/recargo) manda y funciona con o sin cliente.
     const applyOn = od.appliesTo ?? opts.discountAppliesToOverride ?? "TOTAL";
     // Base de cálculo según haya o no manualPrice. Mantener back-compat
-    // del comportamiento legacy cuando NO hay manualPrice (descuento sobre
+    // del comportamiento legacy cuando NO hay manualPrice (ajuste sobre
     // lista, reemplaza qty/promo).
     const discountStartingBase: Prisma.Decimal = manualPriceApplied ? finalPrice : basePrice;
-    // FIX bonificación por base: METAL/HECHURA debe descontar sobre el
-    // VALOR DE VENTA del componente (`metalHechuraBreakdown.metalSale /
+    // FIX ajuste por base: METAL/HECHURA debe operar sobre el VALOR DE
+    // VENTA del componente (`metalHechuraBreakdown.metalSale /
     // hechuraSale`), igual que qty/promo/regla-cliente — vía el helper
-    // canónico `resolveDiscountBase`. Antes este bloque estimaba por
-    // PROPORCIÓN DE COSTO y solo si había `effectiveCostBreakdown`: sin
-    // breakdown de costo (costMode NONE) METAL/HECHURA colapsaban a TOTAL
-    // y "Aplica a" no cambiaba el descuento. Para TOTAL el helper
-    // devuelve `base = discountStartingBase` (comportamiento idéntico).
+    // canónico `resolveDiscountBase`. Para TOTAL el helper devuelve
+    // `base = discountStartingBase` (comportamiento idéntico).
     const { base: discBase } = resolveDiscountBase(
       applyOn,
       discountStartingBase,
       metalHechuraBreakdown ?? null,
       effectiveCostBreakdown,
     );
-    const discAmount = od.mode === "PERCENT"
+    const adjAmount = od.mode === "PERCENT"
       ? discBase.mul(od.value).div(100)
       : new D(od.value);
-    const newFinal = discountStartingBase.minus(discAmount);
+    // BONUS resta, SURCHARGE suma. Mismo cálculo de base/monto.
+    const newFinal = isSurcharge
+      ? discountStartingBase.plus(adjAmount)
+      : discountStartingBase.minus(adjAmount);
     finalPrice = newFinal.lessThan(0) ? new D(0) : newFinal;
-    qtyDiscountAmount   = discAmount;
+    // Tracker: convención = positivo cuando REDUCE el precio (bonif),
+    // negativo cuando lo aumenta (recargo). Coherente con la regla
+    // comercial del cliente (líneas 2179-2183 de este mismo archivo).
+    const trackerAmount = isSurcharge ? -adjAmount.toNumber() : adjAmount.toNumber();
+    // qtyDiscountAmount/promoDiscountAmount existen para BONUS (descuentos).
+    // Para SURCHARGE no hay "descuento" que reemplazar; los limpiamos.
+    qtyDiscountAmount   = isSurcharge ? new D(0) : adjAmount;
     promoDiscountAmount = null;
     appliedDiscountId   = null;
     appliedPromotionId  = null;
     appliedPromotionName = null;
     stackingMode = "NONE";
+    const adjLabel = isSurcharge ? "Recargo manual" : "Bonificación manual";
     trackComponentAdjustment(
       applyOn, "MANUAL_DISCOUNT",
-      "Bonificación manual", discAmount.toNumber(),
+      adjLabel, trackerAmount,
       {
         base:       parseFloat(discBase.toString()),
         percentage: od.mode === "PERCENT" ? od.value : null,
         valueType:  od.mode === "PERCENT" ? "PERCENTAGE" : "FIXED_AMOUNT",
+        // `kind` viaja en step.meta (abajo) — el meta del tracker tiene un
+        // shape acotado y no necesita el campo aquí (el signo del amount
+        // ya distingue BONUS de SURCHARGE: positivo = reduce; negativo = aumenta).
         source:     "GENERAL",
       },
     );
     priceSource = "MANUAL_OVERRIDE";
     steps.push({
+      // Step key estable para no romper consumidores del snapshot que ya
+      // miran `MANUAL_DISCOUNT_OVERRIDE`. El kind viaja en `meta`.
       key:    "MANUAL_DISCOUNT_OVERRIDE",
-      label:  "Bonificación manual",
+      label:  adjLabel,
       status: "ok",
       value:  newFinal,
       meta: {
         mode:           od.mode,
         value:          od.value,
         appliesTo:      applyOn,
-        discountAmount: discAmount.toString(),
+        kind:           isSurcharge ? "SURCHARGE" : "BONUS",
+        discountAmount: adjAmount.toString(),
         discountBase:   discBase.toString(),
       },
     });
@@ -2489,7 +2666,13 @@ export async function resolveFinalSalePrice(
   // Se popula cuando hay base por componente disponible (sea exacta desde
   // metalHechuraBreakdown, sea estimada por proporción de costo).
   // El `final` por componente = `base` − Σ ajustes (positivos = reducen).
-  // Se clampa a 0 para evitar finales negativos por redondeos acumulados.
+  //
+  // IMPORTANTE — Negativos válidos:
+  // `final` y `salePreManualDiscount` PUEDEN ser negativos cuando un
+  // descuento dirigido a este componente (ej. bonificación manual sobre
+  // "Solo metal") excede su base. Es información fiscal/contable real,
+  // no un redondeo: el frontend la renderiza tal cual (CLAUDE.md raíz,
+  // sección "Pricing-engine: componentes negativos son válidos").
   let componentSaleBreakdown: ComponentSaleDetail | null = null;
   if (componentBaseMetal != null && componentBaseHechura != null) {
     // F1.3 G4.3 — Decimal-safe end-to-end. Acumulamos los amounts en Decimal
@@ -2514,14 +2697,12 @@ export async function resolveFinalSalePrice(
       }
       const finalD = baseD.minus(allSum);
       const preD   = baseD.minus(nonManualSum);
-      // Clamp ≥ 0 en Decimal para evitar finales negativos por redondeos
-      // acumulados, sin coerción JS.
-      const zero = new D(0);
+      // Sin clamp: negativos son válidos y se emiten passthrough.
       return {
         base:                  baseValue,
         adjustments:           adjs,
-        final:                 (finalD.lessThan(zero) ? zero : finalD).toNumber(),
-        salePreManualDiscount: (preD.lessThan(zero)   ? zero : preD).toNumber(),
+        final:                 finalD.toNumber(),
+        salePreManualDiscount: preD.toNumber(),
       };
     };
     componentSaleBreakdown = {
@@ -2586,6 +2767,11 @@ export async function resolveFinalSalePrice(
           // de la lista al resultado del motor.
           pureGramsBase:     metalHechuraBreakdown.pureGramsBase     ?? null,
           pureGramsSale:     metalHechuraBreakdown.pureGramsSale     ?? null,
+          // B1 (Etapa C-comercial) — Propagar snapshot del redondeo PHYSICAL
+          // comercial. Sin esto, el helper reconstruye el shape exact pero
+          // pierde `physical` aunque la lista lo haya emitido, y el snapshot
+          // v6 termina con `metalHechuraBreakdown.physical = null`.
+          physical:          metalHechuraBreakdown.physical          ?? null,
         }
       : null,
   }) as typeof metalHechuraBreakdown;
@@ -2685,7 +2871,71 @@ export async function resolveFinalSalePrice(
     debugWarnings: costResult.debugWarnings,
   };
 
+  // ── pricing-trace (dev-only, gated por env PRICING_TRACE) ────────────────
+  // Captura por LÍNEA las capas L01..L05 al final del cálculo de la línea
+  // (cuando todos los valores ya están resueltos). No altera lógica.
+  {
+    const lineKey =
+      (opts.articleId ?? "MANUAL") +
+      (opts.variantId ? `/${opts.variantId}` : "");
+    const baseN  = toNum(basePrice);
+    const finalN = toNum(finalPrice);
+    const totWithTaxN = toNum(totalWithTax);
+    const taxN = toNum(taxAmount);
+    const ar = appliedRounding;
+    traceLine("L01_PRICE_LIST_BASE", lineKey, {
+      basePrice:    baseN,
+      priceSource,
+      priceListId:   appliedPriceListId,
+      priceListName: appliedPriceListName,
+      priceListMode: appliedPriceListMode,
+      quantity:      Number(opts.quantity ?? 1),
+    });
+    traceLine("L02_LINE_DISCOUNT", lineKey, {
+      quantityDiscount:   toNum(qtyDiscountAmount)         ?? 0,
+      promotionDiscount:  toNum(promoDiscountAmount)       ?? 0,
+      customerDiscount:   toNum(customerDiscountAccumulator) ?? 0,
+      totalDiscount:      toNum(totalDiscount)             ?? 0,
+      finalPricePostDisc: finalN,
+    });
+    traceLine("L03_LINE_TAX", lineKey, {
+      taxAmount:    taxN          ?? 0,
+      taxItems:     taxBreakdown.length,
+      totalWithTax: totWithTaxN,
+      exemptByEntity: effectiveTaxExempt,
+    });
+    traceLine("L04_LINE_TOTAL_BEFORE_COMM_ROUND", lineKey, {
+      // Si hubo redondeo comercial diferido (NET/TOTAL), `preRounding` es el
+      // total ANTES del redondeo; si no hubo, `totalWithTax` ya es el total
+      // final de línea.
+      lineTotalPreCommRounding:
+        ar && ar.preRounding != null ? toNum(ar.preRounding as any) : totWithTaxN,
+    });
+    traceLine("L05_COMMERCIAL_ROUNDING", lineKey, {
+      applied: !!ar,
+      pre:     ar ? toNum(ar.preRounding  as any) : null,
+      post:    ar ? toNum(ar.postRounding as any) : null,
+      delta:
+        ar
+          ? round2OrNull(
+              (toNum(ar.postRounding as any) ?? 0) -
+              (toNum(ar.preRounding  as any) ?? 0),
+            )
+          : 0,
+      mode:      ar?.mode      ?? null,
+      direction: ar?.direction ?? null,
+      applyOn:   ar?.applyOn   ?? null,  // "PRICE" (legacy) | "NET" | "TOTAL"
+      source:    ar ? (ar.applyOn === "PRICE" ? "LIST_EARLY" : "LIST_DEFERRED") : null,
+    });
+  }
+
   return finalize(base, policyConfig);
+}
+
+// Helper local — round a 2 decimales, null-safe.
+function round2OrNull(n: number | null): number | null {
+  if (n == null || !Number.isFinite(n)) return null;
+  return Math.round(n * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -2727,6 +2977,10 @@ export type MetalHechuraExactDetail = {
   /** Sprint 3 — Gramos puros (post purity) base y de venta. POLICY.md §8. */
   pureGramsBase?:     number | null;
   pureGramsSale?:     number | null;
+  /** B3 — Snapshot del redondeo COMERCIAL PHYSICAL. Passthrough para que
+   *  deriveMetalHechuraBreakdown no pierda el campo en su reconstrucción
+   *  (POLICY §R-Rounding-14 / Etapa C-comercial). */
+  physical?: import("../commercial-physical-rounding-apply.js").CommercialPhysicalRoundingSnapshot | null;
 };
 
 export interface DeriveMetalHechuraInput {
@@ -2816,6 +3070,10 @@ export function deriveMetalHechuraBreakdown(
       metalSaleEstimated:   false,
       hechuraSaleEstimated: false,
       source:               "METAL_HECHURA",
+      // B2 (Etapa C-comercial) — Passthrough del snapshot PHYSICAL comercial.
+      // Sin esto, aunque B1 le pase `physical` al helper, este return lo
+      // descartaba y el snapshot v6 quedaba con `metalHechuraBreakdown.physical = null`.
+      ...(exactBreakdown.physical != null ? { physical: exactBreakdown.physical } : {}),
     };
   }
 
@@ -3114,6 +3372,14 @@ export function buildPricingSnapshot(
           // FASE F3 — costo del metal sin merma comercial (passthrough).
           metalCostBase:  (mhb as any).metalCostBase ?? null,
           source:         mhb.source,
+          // Etapa C-comercial — Snapshot del redondeo PHYSICAL comercial.
+          // Passthrough del `physical` que el motor de lista emite cuando
+          // `commercialRoundingMetalDomain="PHYSICAL"`. El frontend lo lee
+          // vía MetalsSummary / MonetarySummary para mostrar el detalle por
+          // metal padre (preGrams → postGrams · $/g · equivalente).
+          // Antes esta línea NO existía y el snapshot v6 perdía el detalle
+          // físico aunque el motor lo calculara correctamente.
+          ...(mhb.physical != null ? { physical: mhb.physical } : {}),
         }
       : null,
 

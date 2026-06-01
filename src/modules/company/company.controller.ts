@@ -177,9 +177,12 @@ export async function updateMyJewelry(req: Request, res: Response) {
       pricingBlockPartialData:         typeof data.pricingBlockPartialData         === "boolean" ? data.pricingBlockPartialData         : undefined,
       // ────────────────────────────────────────────────────────────────────
 
-      // ── Redondeo por comprobante (modo UNIFIED) ─────────────────────────
+      // ── Redondeo por comprobante (Etapa 1B — UNIFIED/BREAKDOWN/BOTH) ────
       documentRoundingEnabled:   typeof data.documentRoundingEnabled === "boolean"
         ? data.documentRoundingEnabled
+        : undefined,
+      documentRoundingScope:     typeof data.documentRoundingScope === "string"
+        ? (data.documentRoundingScope as any)
         : undefined,
       documentRoundingMode:      typeof data.documentRoundingMode === "string"
         ? (data.documentRoundingMode as any)
@@ -187,6 +190,37 @@ export async function updateMyJewelry(req: Request, res: Response) {
       documentRoundingDirection: typeof data.documentRoundingDirection === "string"
         ? (data.documentRoundingDirection as any)
         : undefined,
+      documentRoundingModeMetal:        typeof data.documentRoundingModeMetal === "string"
+        ? (data.documentRoundingModeMetal as any)
+        : undefined,
+      documentRoundingDirectionMetal:   typeof data.documentRoundingDirectionMetal === "string"
+        ? (data.documentRoundingDirectionMetal as any)
+        : undefined,
+      documentRoundingModeHechura:      typeof data.documentRoundingModeHechura === "string"
+        ? (data.documentRoundingModeHechura as any)
+        : undefined,
+      documentRoundingDirectionHechura: typeof data.documentRoundingDirectionHechura === "string"
+        ? (data.documentRoundingDirectionHechura as any)
+        : undefined,
+
+      // ── Etapa D2 — dominio del metal en BREAKDOWN + config física ───────
+      // `documentRoundingMetalDomain` = MONETARY (default) | PHYSICAL.
+      //   · MONETARY: el motor redondea $ del metal en capa 15 (comportamiento histórico).
+      //   · PHYSICAL: el orquestador D3 (`applyDocumentPhysicalRounding`) corre
+      //     capa 16 y redondea GRAMOS por metal padre; el motor NO toca metal $.
+      // `documentPhysicalRoundingConfig` (Json?) = config canónica:
+      //   { byMetalParentId: { <id>: { mode, direction } }, fallback: { mode, direction } }
+      // Validado y normalizado en runtime por `resolveDocumentPhysicalRoundingConfig`
+      // — acá solo aceptamos los valores sin parse profundo (la persistencia
+      // es Json libre; cualquier garbage se degrada en runtime con fallback seguro).
+      documentRoundingMetalDomain: data.documentRoundingMetalDomain === "PHYSICAL" || data.documentRoundingMetalDomain === "MONETARY"
+        ? data.documentRoundingMetalDomain
+        : undefined,
+      documentPhysicalRoundingConfig: data.documentPhysicalRoundingConfig === null
+        ? null
+        : (data.documentPhysicalRoundingConfig && typeof data.documentPhysicalRoundingConfig === "object"
+            ? (data.documentPhysicalRoundingConfig as any)
+            : undefined),
       // ────────────────────────────────────────────────────────────────────
     },
   });

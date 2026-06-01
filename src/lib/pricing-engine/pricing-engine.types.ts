@@ -403,6 +403,11 @@ export interface SalePriceResult {
     /** FASE 1 — trazabilidad de cómo se llegó al breakdown. La UI puede
      *  ramificar el render según este valor. */
     source?: MetalHechuraBreakdownSource;
+    /** Etapa C-comercial — Snapshot del redondeo PHYSICAL del comercial.
+     *  Solo presente cuando la lista operó con
+     *  `commercialRoundingMetalDomain="PHYSICAL"` y el redondeo de gramos
+     *  actuó (deltaGrams ≠ 0 en al menos un metal). Aditivo y opcional. */
+    physical?: import("../commercial-physical-rounding-apply.js").CommercialPhysicalRoundingSnapshot | null;
   } | null;
 
   /**
@@ -446,13 +451,23 @@ export interface SalePriceResult {
    *  - applyOn=TOTAL: rondea el `totalWithTax` por unidad.
    */
   appliedRounding: {
-    applyOn:      "PRICE" | "NET" | "TOTAL";
+    /** Dominio del redondeo aplicado:
+     *   · "PRICE" / "NET" / "TOTAL" — monetario (legacy y deferred).
+     *   · "METAL" — comercial PHYSICAL (Etapa C-comercial / POLICY §R-Rounding-14).
+     *     Cuando applyOn === "METAL", `physical` lleva el detalle canónico por
+     *     metal padre (preGrams / postGrams / deltaGrams / monetaryEquivalent).
+     */
+    applyOn:      "PRICE" | "NET" | "TOTAL" | "METAL";
     mode:         string;
     direction:    string;
     preRounding:  Prisma.Decimal;
     postRounding: Prisma.Decimal;
     priceListId:   string | null;
     priceListName: string | null;
+    /** Snapshot del redondeo comercial PHYSICAL — solo cuando `applyOn === "METAL"`.
+     *  Passthrough EXACTO del helper `applyCommercialPhysicalRoundingForMetals`.
+     *  El frontend lo renderiza vía MetalsSummary / MonetarySummary sin sumar líneas. */
+    physical?: import("../commercial-physical-rounding-apply.js").CommercialPhysicalRoundingSnapshot | null;
   } | null;
 
   /**
@@ -820,10 +835,13 @@ export interface SalePriceOpts {
    */
   manualPriceOverride?: number | null;
   /**
-   * Override manual del descuento aplicado sobre el precio de lista.
-   * Reemplaza qty discount + promotion con un único monto manual.
+   * Override manual del ajuste comercial aplicado sobre el precio de lista
+   * (bonificación o recargo). Reemplaza qty discount + promotion con un único
+   * monto manual.
    *   - mode "PERCENT" + value 15 → 15% sobre `basePrice`.
    *   - mode "AMOUNT"  + value 100 → 100 unitario sobre `basePrice`.
+   *   - kind  "BONUS"     (default) → reduce el precio (bonificación).
+   *   - kind  "SURCHARGE"           → aumenta el precio (recargo).
    *
    * Si convive con `manualPriceOverride`, gana el manualPrice (porque ese
    * ya define el unitPrice final, no hace falta un descuento separado).
@@ -832,9 +850,15 @@ export interface SalePriceOpts {
     mode: "PERCENT" | "AMOUNT";
     value: number;
     /**
-     * Define sobre qué porción del basePrice se aplica el descuento. Default
-     * "TOTAL" (descuento sobre el precio completo). METAL / HECHURA /
-     * PRODUCT / SERVICE descuentan solo de la porción correspondiente.
+     * Tipo de ajuste manual por línea. `"BONUS"` (default) descuenta;
+     * `"SURCHARGE"` recarga. El campo es opcional y back-compat: si no se
+     * envía, el motor lo trata como `"BONUS"` (comportamiento histórico).
+     */
+    kind?: "BONUS" | "SURCHARGE";
+    /**
+     * Define sobre qué porción del basePrice se aplica el ajuste. Default
+     * "TOTAL" (sobre el precio completo). METAL / HECHURA / PRODUCT /
+     * SERVICE actúan solo sobre la porción correspondiente.
      */
     appliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE";
   } | null;
@@ -949,6 +973,21 @@ export interface SalePriceOpts {
    * redondeo doc.
    */
   suppressListDeferredRounding?: boolean;
+
+  /**
+   * Etapa D' — Opciones de supresión del redondeo PER_LINE en `applyPriceList`.
+   * Cuando el documento opera con `commercialRoundingScope = "PER_DOCUMENT"`,
+   * el caller (sales.service) pasa los flags activos para que el motor de
+   * lista NO ejecute el redondeo per-línea de hechura y/o metal físico — el
+   * redondeo se aplica a nivel documento por la capa nueva en
+   * `computeSaleDocumentTotals`. Ver `ApplyPriceListOptions`.
+   *
+   * `undefined` = comportamiento legacy PER_LINE intacto.
+   */
+  applyPriceListOptions?: {
+    suppressLineHechuraRounding?:      boolean;
+    suppressLineMetalPhysicalRounding?: boolean;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +1049,33 @@ export interface PricingLineSnapshot {
   discountAmount: number;
   taxAmount:      number;
   totalWithTax:   number | null;
+  /** Opción A — TOTAL LÍNEA C/ IMP. POST-redondeo comercial PER_DOCUMENT +
+   *  impactos $ del redondeo por dominio, congelados al confirmar. Display/audit
+   *  — NO autoridad del total del documento. Optional para back-compat con
+   *  snapshots viejos (sin redondeo comercial o pre-Opción A). */
+  lineTotalWithTaxPostCommercialRounding?: number | null;
+  metalRoundingMonetaryImpact?:            number | null;
+  hechuraRoundingMonetaryImpact?:          number | null;
+  /** Opción A (descomposición FÍSICA) — saldo monetario POST por línea. */
+  lineMonetarySaldoPostCommercialRounding?: number | null;
+  /** Saldo monetario PRE redondeo comercial por línea (= lineTotalWithTax −
+   *  Σ metalSale). Línea-autónomo. */
+  lineMonetarySaldoPreCommercialRounding?: number | null;
+  /** Gramos comerciales POST-redondeo POR LÍNEA y metal padre + su monetización.
+   *  Calculados con el gramsPure + margen de ESTA línea — el Resumen Comercial
+   *  del Artículo los usa en vez del agregado del documento (que acumulaba al
+   *  sumar varias líneas del mismo metal). Optional para back-compat con
+   *  snapshots viejos. `metalReferenceValue`/`monetaryImpact` opcionales para
+   *  snapshots pre-monetización. */
+  lineCommercialRoundingMetals?: Array<{
+    metalParentId:   string;
+    metalParentName: string;
+    preGrams:        number;
+    postGrams:       number;
+    deltaGrams:      number;
+    metalReferenceValue?: number;
+    monetaryImpact?:      number;
+  }> | null;
   /** Base ("Aplica a") del impuesto elegida por el operador en la línea,
    *  congelada en DRAFT. confirmSale la reusa para recomputar el impuesto
    *  sobre la MISMA base (paridad preview↔confirm). null = sin override. */
@@ -1055,6 +1121,11 @@ export interface PricingLineSnapshot {
     /** FASE F3 — costo del metal sin merma comercial. Aditivo y opcional. */
     metalCostBase?:  number | null;
     source?:         string;
+    /** Etapa C-comercial — Snapshot del redondeo PHYSICAL comercial.
+     *  Solo presente cuando la lista operó en `commercialRoundingMetalDomain="PHYSICAL"`
+     *  y el redondeo de gramos actuó. Aditivo y opcional — snapshots viejos
+     *  (sin este campo) siguen compilando y se leen sin él. */
+    physical?: import("../commercial-physical-rounding-apply.js").CommercialPhysicalRoundingSnapshot | null;
   } | null;
 
   // ── Overrides de composición de costo aplicados ───────────────────────────
@@ -1340,3 +1411,211 @@ export interface SnapshotComposition {
  *                  los trata como `null` (no muestra "Costo con
  *                  impuestos"). Aditivo, sin cambio en totales/precio. */
 export const PRICING_LINE_SNAPSHOT_VERSION = 7;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Balance Mode — tipos canónicos del Snapshot v6 Balance Mode (técnico: bump
+// `DOCUMENT_SNAPSHOT_VERSION` de 2 → 3 en Fase 3B.3).
+//
+// Estos tipos NO se usan todavía en runtime — sólo type-safety para Fase 3B.1.
+// La integración real al snapshot ocurre en sub-fase 3B.3; el hook que persiste
+// `AccountMovementMetalEntry[]` ocurre en sub-fase 3B.6.
+//
+// Reglas vinculantes:
+//   · POLICY.md §11 R11.1–R11.10
+//   · docs/balance-mode-architecture.md (modelo canónico completo)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Modo de saldo del documento/movimiento.
+ *  · UNIFIED   = un único saldo monetario en la moneda activa.
+ *  · BREAKDOWN = N saldos en gramos puros por metal padre + 1 saldo monetario
+ *                consolidado (todo lo no-metal: hechura, impuestos, ajustes,
+ *                redondeos, etc.). Ver R11.2/R11.3. */
+export type BalanceMode = "UNIFIED" | "BREAKDOWN";
+
+/** De dónde salió el `BalanceMode` resuelto. Auditoría/trazabilidad. Refleja la
+ *  prioridad R11.4: documento → cliente → lista → tenant → fallback. */
+export type BalanceModeSource =
+  | "DOCUMENT_OVERRIDE"
+  | "ENTITY_DEFAULT"
+  | "PRICELIST_DEFAULT"
+  | "TENANT_DEFAULT"
+  | "FALLBACK_UNIFIED";
+
+/** Resolución del modo: el modo elegido y la fuente que lo determinó. */
+export interface BalanceModeResolution {
+  mode:   BalanceMode;
+  source: BalanceModeSource;
+}
+
+/** Input del resolver `resolveBalanceMode`. Acepta `null`/`undefined` en cada
+ *  nivel — la función itera por prioridad y devuelve el primer match. */
+export interface BalanceModeResolverInput {
+  /** Override manual del documento (header). Sólo permitido antes de confirmar. */
+  documentOverride?: BalanceMode | null;
+  /** Default del cliente / proveedor (`CommercialEntity.balanceMode`). */
+  entityDefault?:    BalanceMode | null;
+  /** Default de la lista de precios. Listas METAL_HECHURA típicamente BREAKDOWN. */
+  priceListDefault?: BalanceMode | null;
+  /** Default del tenant (`Jewelry.defaultBalanceMode`). Última red. */
+  tenantDefault?:    BalanceMode | null;
+}
+
+// ── Sub-tipos del breakdown de documento (Snapshot v3) ─────────────────────
+
+/** Variante de metal de origen que aportó gramos a un padre. Display-only:
+ *  alimenta "Ver origen" en cuenta corriente. NO se persiste en tabla relacional
+ *  (vive sólo en el JSON del snapshot). */
+export interface DocumentBalanceMetalVariant {
+  variantId:     string;
+  variantName:   string;
+  gramsOriginal: number;
+  purity:        number;
+  /** = gramsOriginal × purity. */
+  gramsPure:     number;
+  /** Línea de venta que aportó esta variante. */
+  sourceLineId:  string;
+}
+
+/** Entrada de metal por METAL PADRE en el breakdown del documento. Es el shape
+ *  canónico que el hook `onSaleConfirmed` proyecta a `AccountMovementMetalEntry`
+ *  cuando el modo es BREAKDOWN. */
+export interface DocumentBalanceMetalEntry {
+  // ── Canónico / persistido en AccountMovementMetalEntry ────────────────────
+  metalParentId:    string;
+  metalParentName:  string;
+  gramsOriginal:    number;
+  /** Pureza PONDERADA del padre cuando hay multi-variante:
+   *    Σ(g_i × p_i) / Σ g_i
+   *  `null` cuando `Σ g_i = 0` (caso edge / línea solo hechura). */
+  purity:           number | null;
+  /** Unidad canónica de acumulación = Σ(g_i × p_i). */
+  gramsPure:        number;
+
+  // ── Display-only (valorización referencial) ───────────────────────────────
+  /** Cotización del metal padre al momento de confirmar el documento. NO
+   *  cambia el saldo en cuenta corriente (que son gramos), pero permite
+   *  mostrar "≈ ARS X" como referencia histórica. */
+  quotePriceSnapshot:    number | null;
+  /** = gramsPure × quotePriceSnapshot. Referencial. */
+  valuationMonetary:     number | null;
+  /** Code de la moneda en la que se valorizó. */
+  valuationCurrencyCode: string;
+
+  // ── Trazabilidad ──────────────────────────────────────────────────────────
+  /** Variantes que aportaron a este padre. Vive en JSON snapshot, no en tabla. */
+  variants?: DocumentBalanceMetalVariant[];
+  /** Líneas que aportaron gramos a este padre. */
+  sourceLineIds: string[];
+}
+
+/** Grupo visual del componente monetario. Permite al frontend agrupar sin
+ *  derivar la categoría desde el `type`. Cero matemática nueva: es un lookup
+ *  string→string. */
+export type BalanceMonetaryComponentGroup =
+  | "HECHURA"
+  | "PRODUCT"
+  | "TAX"
+  | "DISCOUNT"
+  | "BONUS"
+  | "SURCHARGE"
+  | "ADJUSTMENT"
+  | "ROUNDING"
+  | "SHIPPING"
+  | "COUPON"
+  | "CHANNEL"
+  | "PAYMENT"
+  /** Etapa UX-Auditable (2026-05-29) — bucket "metal margen" para cerrar
+   *  la auditabilidad del saldo monetario en BREAKDOWN. Cubre la diferencia
+   *  entre `metalCostSubtotal` (= qty × purity × (1+merma) × unitValue del
+   *  cost-line) y `Σ valuationMonetary` (= gramsPure × quotePriceSnapshot
+   *  del balance). Esa diferencia es la parte del precio "metal lado venta"
+   *  que NO viene del valor físico puro — necesaria para que
+   *  Σ components == (total − Σ valuationMonetary). */
+  | "MARGIN";
+
+/** Componente del saldo monetario. DISPLAY-ONLY para "Ver composición": no
+ *  participa en la acumulación (eso lo hace `monetary.amount` directo). El
+ *  motor lo emite como auditoría / trazabilidad. */
+export interface DocumentBalanceMonetaryComponent {
+  /** Kind canónico — granularidad fina para auditoría / drill-down. */
+  type:
+    | "HECHURA"
+    | "PRODUCT"
+    | "SERVICE"
+    | "TAX"
+    | "BONUS"
+    | "SURCHARGE"
+    | "DISCOUNT_QTY"
+    | "DISCOUNT_PROMO"
+    | "DISCOUNT_CLIENT"
+    | "DISCOUNT_MANUAL"
+    | "COUPON"
+    | "CHANNEL"
+    | "PAYMENT"
+    | "SHIPPING"
+    | "ROUNDING_MONETARY"
+    | "MANUAL_ADJUSTMENT"
+    /** Etapa UX-Auditable (2026-05-29) — diferencia entre el costo del
+     *  metal del cost-line (`metalCostSubtotal`) y el valor físico puro del
+     *  balance (`Σ valuationMonetary`). Display-only — cubre el gap
+     *  contable que permite cuadrar Σ components == saldo monetario. */
+    | "METAL_MARGIN";
+  /** Grupo visual para que el frontend renderice en bloques (Hechura / IVA /
+   *  Descuentos / Recargos / Envío / Cupones / Canal / Forma de pago /
+   *  Redondeos / Ajustes). Opcional para back-compat con snapshots históricos
+   *  que no lo emitían. */
+  group?:        BalanceMonetaryComponentGroup;
+  /** Texto humano para UI ("IVA 21%", "Promo Verano"). */
+  label:         string;
+  /** Signed: + suma a saldo, − resta. Σ components ≈ monetary.amount
+   *  (módulo redondeos menores; la fuente de verdad es `monetary.amount`). */
+  amount:        number;
+  /** Si proviene de una línea específica del documento. */
+  sourceLineId?: string;
+  /** ID externo (promoId / taxId / couponId / etc.) para drill-down futuro. */
+  source?:       string;
+}
+
+/** Saldo monetario consolidado del documento. */
+export interface DocumentBalanceMonetary {
+  // ── Canónico / persistido en CurrentAccountMovement ───────────────────────
+  /** Saldo monetario en la moneda activa del documento. */
+  amount:        number;
+  currencyCode:  string;
+  /** Tasa BASE↔doc al momento de confirmar (snapshot histórico). */
+  currencyRate:  number;
+  /** = amount × currencyRate. Cache para queries en moneda base del tenant. */
+  amountBase:    number;
+
+  // ── Display-only ──────────────────────────────────────────────────────────
+  /** Desglose por concepto. NO se persiste en tabla relacional; vive en el
+   *  JSON del snapshot. Sirve para "Ver composición" en cuenta corriente. */
+  components?:   DocumentBalanceMonetaryComponent[];
+}
+
+/** Breakdown canónico del balance del documento. Se persiste íntegramente en
+ *  `DocumentPricingSnapshot.balanceBreakdown` (snapshot v3) y se proyecta al
+ *  hook `onSaleConfirmed` para alimentar `CurrentAccountMovement` +
+ *  `AccountMovementMetalEntry[]`. */
+export interface DocumentBalanceBreakdown {
+  /** En UNIFIED: []. En BREAKDOWN: una entrada por metal padre presente. */
+  metals:           DocumentBalanceMetalEntry[];
+  /** Saldo monetario consolidado. */
+  monetaryBalance:  DocumentBalanceMonetary;
+}
+
+/** Contribución de UNA línea al balance del documento. Para uso de la línea
+ *  en el `DocumentLineSnapshot` (sub-fase 3B.3). Permite agregar a nivel
+ *  documento sin recomputar desde scratch. */
+export interface LineBalanceContribution {
+  /** Aporte metal de esta línea (vacío en UNIFIED). */
+  metals: Array<{
+    metalParentId:   string;
+    metalParentName: string;
+    gramsOriginal:   number;
+    purity:          number | null;
+    gramsPure:       number;
+  }>;
+  /** Aporte monetario en moneda del documento. */
+  monetaryContribution: number;
+}

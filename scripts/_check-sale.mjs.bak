@@ -1,0 +1,12 @@
+import 'dotenv/config';
+import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const p = new PrismaClient({ adapter });
+const rows = await p.$queryRawUnsafe(
+  "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
+  "Sale"
+);
+console.log("--- Sale columns ---");
+console.log(rows.map(r => r.column_name + " :: " + r.data_type).join("\n"));
+await p.$disconnect();

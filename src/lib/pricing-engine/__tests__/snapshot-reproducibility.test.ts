@@ -382,7 +382,7 @@ describe("DocumentPricingSnapshot — currencyRate persistida (POLICY.md §9.6)"
     expect(snap.version).toBe(DOCUMENT_SNAPSHOT_VERSION);
   });
 
-  it("DOCUMENT_SNAPSHOT_VERSION está en v2 (Sprint 1)", () => {
-    expect(DOCUMENT_SNAPSHOT_VERSION).toBe(2);
+  it("DOCUMENT_SNAPSHOT_VERSION está en v3 (Balance Mode — Fase 3B.3)", () => {
+    expect(DOCUMENT_SNAPSHOT_VERSION).toBe(3);
   });
 });

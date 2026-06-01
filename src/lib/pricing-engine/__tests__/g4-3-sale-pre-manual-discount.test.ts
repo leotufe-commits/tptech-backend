@@ -306,11 +306,16 @@ describe("salePreManualDiscount — Decimal safety end-to-end", () => {
 });
 
 // ============================================================================
-// 5. CLAMP ≥ 0 — coherente con final
+// 5. COMPONENTES NEGATIVOS — pre y final NO se clampean a 0
+//
+// Regla canónica (ver CLAUDE.md raíz, "Pricing-engine: componentes negativos
+// son válidos"): si un descuento dirigido a un componente excede su base, el
+// componente queda NEGATIVO. El motor emite el valor real; el frontend lo
+// renderiza con signo y color (no `Math.max(0, …)`).
 // ============================================================================
 
-describe("salePreManualDiscount — clamp a 0", () => {
-  it("baseline correct: si Σ non-manual ≥ base → pre = 0 (clampado)", async () => {
+describe("componentSaleBreakdown — componentes negativos válidos (sin clamp)", () => {
+  it("HECHURA: descuento (ENTITY) > base → hechura.final y .salePreManualDiscount NEGATIVOS", async () => {
     setupMetalHechuraList(0, 100);
     // Customer rule 200% sobre HECHURA → adj.amount = 200 > base 100.
     mockPrisma.commercialEntity.findFirst.mockResolvedValue({
@@ -323,10 +328,85 @@ describe("salePreManualDiscount — clamp a 0", () => {
     });
     const r = await resolveFinalSalePrice("j1", { articleId: "a1", clientId: "c1" });
     const h = r.componentSaleBreakdown!.hechura;
-    // Pre clampado a 0 (mismo clamp que final).
-    expect(h.salePreManualDiscount).toBeGreaterThanOrEqual(0);
-    expect(h.salePreManualDiscount).toBe(0);
-    expect(h.final).toBe(0);
+    // SIN clamp: pre y final reflejan el negativo real (base 100 − adj 200 = −100).
+    expect(h.salePreManualDiscount).toBeLessThan(0);
+    expect(h.salePreManualDiscount).toBeCloseTo(-100, 4);
+    expect(h.final).toBeLessThan(0);
+    expect(h.final).toBeCloseTo(-100, 4);
+  });
+
+  it("HECHURA: bonificación MANUAL > base → hechura.final NEGATIVO (caso del bug original)", async () => {
+    // Caso reportado: hechura=100, descuento manual sobre HECHURA = 150 → final −50.
+    setupMetalHechuraList(0, 100);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "AMOUNT", value: 150, appliesTo: "HECHURA" },
+    });
+    const h = r.componentSaleBreakdown!.hechura;
+    // pre === base (no hay capa previa al manual).
+    expect(h.salePreManualDiscount).toBeCloseTo(100, 4);
+    // final = base − manual = 100 − 150 = −50, SIN clamp.
+    expect(h.final).toBeLessThan(0);
+    expect(h.final).toBeCloseTo(-50, 4);
+  });
+
+  it("METAL: bonificación MANUAL 50% sobre 'Solo metal' con descuento > base → metal.final NEGATIVO", async () => {
+    // Caso reportado por el usuario: bonificación manual con applyOn=METAL cuya
+    // resolución da un amount mayor a la base del metal. Para forzar el caso
+    // con un manual % "normal", combinamos entity rule + manual sobre METAL.
+    setupMetalHechuraList(100, 400);
+    mockPrisma.commercialEntity.findFirst.mockResolvedValue({
+      taxExempt: false, taxApplyOnOverride: null,
+      commercialRuleType:  "DISCOUNT",
+      commercialValueType: "PERCENTAGE",
+      commercialValue:     new D("80"),         // entity quita 80 sobre metal 100
+      commercialApplyOn:   "METAL",
+      taxOverrides:        [],
+    });
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1", clientId: "c1",
+      // manual 50% sobre METAL (base ya post-entity = 20 visible, pero el
+      // amount manual se calcula sobre el VALOR DE VENTA del componente
+      // — ver bloque "manualDiscountOverride — base por componente (venta)").
+      manualDiscountOverride: { mode: "PERCENT", value: 50, appliesTo: "METAL" },
+    });
+    const m = r.componentSaleBreakdown!.metal;
+    // Σ ajustes (80 entity + 50 manual = 130) > base (100) ⇒ final NEGATIVO.
+    const sumAdj = m.adjustments.reduce((s, a) => s + a.amount, 0);
+    expect(sumAdj).toBeGreaterThan(m.base);
+    expect(m.final).toBeLessThan(0);
+    expect(m.final).toBeCloseTo(m.base - sumAdj, 4);
+  });
+
+  it("METAL: descuento ENTITY > base → metal.final NEGATIVO", async () => {
+    setupMetalHechuraList(100, 0);
+    mockPrisma.commercialEntity.findFirst.mockResolvedValue({
+      taxExempt: false, taxApplyOnOverride: null,
+      commercialRuleType:  "DISCOUNT",
+      commercialValueType: "PERCENTAGE",
+      commercialValue:     new D("200"),
+      commercialApplyOn:   "METAL",
+      taxOverrides:        [],
+    });
+    const r = await resolveFinalSalePrice("j1", { articleId: "a1", clientId: "c1" });
+    const m = r.componentSaleBreakdown!.metal;
+    expect(m.final).toBeLessThan(0);
+    expect(m.final).toBeCloseTo(-100, 4);
+  });
+
+  it("descuento sobre TOTAL no inyecta ajustes por componente → ningún componente queda negativo por TOTAL", async () => {
+    // Salvaguarda: la regla "no redistribuir silenciosamente" se respeta —
+    // descuentos sobre TOTAL no rompen los componentes individuales.
+    setupMetalHechuraList(100, 100);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 50, appliesTo: "TOTAL" },
+    });
+    const m = r.componentSaleBreakdown!.metal;
+    const h = r.componentSaleBreakdown!.hechura;
+    // Componentes intactos en su base (manual TOTAL no se proyecta sobre METAL/HECHURA).
+    expect(m.final).toBeGreaterThanOrEqual(0);
+    expect(h.final).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -457,5 +537,108 @@ describe("manualDiscountOverride — sin cliente + precedencia de base", () => {
     // Cliente sin regla activa (ruleType null) → no aporta descuento; el
     // manual METAL manda igual: 1000 − 10%·600 = 940.
     expect(r.unitPrice!.toNumber()).toBeCloseTo(940, 4);
+  });
+});
+
+// ============================================================================
+// kind=SURCHARGE — recargo manual por línea.
+// El motor SUMA en lugar de restar; misma matemática de base.
+// ============================================================================
+describe("manualDiscountOverride — kind=SURCHARGE (recargo manual por línea)", () => {
+  it("PERCENT 10% SURCHARGE TOTAL: 1000 → 1100 (suma 10%)", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL", kind: "SURCHARGE" },
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(1100, 4);
+    // SURCHARGE no es descuento → discountAmount clampea a 0 a nivel línea.
+    expect(r.discountAmount!.toNumber()).toBe(0);
+    expect(r.priceSource).toBe("MANUAL_OVERRIDE");
+  });
+
+  it("PERCENT 10% SURCHARGE METAL: 1000 + 10%·600 = 1060", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "METAL", kind: "SURCHARGE" },
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(1060, 4);
+  });
+
+  it("PERCENT 10% SURCHARGE HECHURA: 1000 + 10%·400 = 1040", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "HECHURA", kind: "SURCHARGE" },
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(1040, 4);
+  });
+
+  it("AMOUNT (FIXED) SURCHARGE: 1000 + 250 = 1250", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "AMOUNT", value: 250, appliesTo: "TOTAL", kind: "SURCHARGE" },
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(1250, 4);
+  });
+
+  it("simetría: BONUS 10% TOTAL y SURCHARGE 10% TOTAL aplican opuestos", async () => {
+    setupMetalHechuraList(600, 400);
+    const bonus = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL", kind: "BONUS" },
+    })).unitPrice!.toNumber();
+    setupMetalHechuraList(600, 400);
+    const surcharge = (await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL", kind: "SURCHARGE" },
+    })).unitPrice!.toNumber();
+    expect(bonus).toBeCloseTo(900, 4);
+    expect(surcharge).toBeCloseTo(1100, 4);
+  });
+
+  it("limpiar (value=0) deja el precio en lista (1000), tanto BONUS como SURCHARGE", async () => {
+    setupMetalHechuraList(600, 400);
+    const cleanedBonus = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 0, appliesTo: "TOTAL", kind: "BONUS" },
+    });
+    setupMetalHechuraList(600, 400);
+    const cleanedSurcharge = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 0, appliesTo: "TOTAL", kind: "SURCHARGE" },
+    });
+    expect(cleanedBonus.unitPrice!.toNumber()).toBeCloseTo(1000, 4);
+    expect(cleanedSurcharge.unitPrice!.toNumber()).toBeCloseTo(1000, 4);
+  });
+
+  it("back-compat: sin `kind` se comporta como BONUS (resta) — contrato histórico intacto", async () => {
+    setupMetalHechuraList(600, 400);
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL" }, // sin kind
+    });
+    expect(r.unitPrice!.toNumber()).toBeCloseTo(900, 4); // restó: BONUS implícito
+  });
+
+  it("convive con cliente con bonificación heredada: el manual recargo manda sobre su base", async () => {
+    setupMetalHechuraList(600, 400);
+    mockPrisma.commercialEntity.findFirst.mockResolvedValue({
+      taxExempt: false, taxApplyOnOverride: null,
+      commercialRuleType: "DISCOUNT", commercialValueType: "PERCENTAGE",
+      commercialValue: new D("5"), commercialApplyOn: "TOTAL", taxOverrides: [],
+    });
+    const r = await resolveFinalSalePrice("j1", {
+      articleId: "a1", clientId: "c1",
+      manualDiscountOverride: { mode: "PERCENT", value: 10, appliesTo: "TOTAL", kind: "SURCHARGE" },
+    });
+    // Cliente aplica 5% sobre TOTAL primero (1000 → 950), después el manual
+    // recargo 10% sobre TOTAL (= 950 + 10%·950 = 1045). El manual usa
+    // `finalPrice` como base (no `basePrice`) cuando ya hubo capas previas.
+    // Validamos que el precio final REFLEJA el recargo (es mayor a base
+    // post-cliente).
+    expect(r.unitPrice!.toNumber()).toBeGreaterThan(950);
   });
 });

@@ -90,6 +90,8 @@ function buildMockTx(opts: {
     createdReceipts:    [] as any[],
     createdLines:       [] as any[],
     createdMovements:   [] as any[],
+    // T56 (Fase 3B.6) — registro de las metalEntries que el hook crea.
+    createdMetalEntries: [] as any[],
     createdSeries:      null as any,
   };
 
@@ -155,9 +157,43 @@ function buildMockTx(opts: {
         };
       }),
     },
+    // T56 (Fase 3B.6) — tabla AccountMovementMetalEntry. Mock minimal:
+    // sólo expone `createMany` que es lo único que el hook necesita.
+    accountMovementMetalEntry: {
+      createMany: vi.fn(async (args: any) => {
+        for (const row of args.data) state.createdMetalEntries.push(row);
+        return { count: args.data.length };
+      }),
+    },
   };
 
   return { tx, state };
+}
+
+// Fixture de breakdown BREAKDOWN reusable.
+function makeBreakdown(over: Partial<any> = {}): any {
+  return {
+    metals: [
+      {
+        metalParentId:    "oro-fino",
+        metalParentName:  "Oro Fino",
+        gramsOriginal:    2,
+        purity:           0.75,
+        gramsPure:        1.5,
+        quotePriceSnapshot:    100000,
+        valuationMonetary:     150000,
+        valuationCurrencyCode: "ARS",
+        sourceLineIds:    ["line-1"],
+      },
+    ],
+    monetaryBalance: {
+      amount:       50000,
+      currencyCode: "ARS",
+      currencyRate: 1,
+      amountBase:   50000,
+    },
+    ...over,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,5 +337,251 @@ describe("onSaleConfirmed — detección de itemKind", () => {
     await onSaleConfirmed(tx as any, "sale-1", {});
     expect(state.createdLines[0].itemKind).toBe("ARTICLE_VARIANT");
     expect(state.createdLines[0].variantId).toBe("var-9");
+  });
+});
+
+// =============================================================================
+// T49 → T56 (Fase 3B.6) — Balance Mode persiste en cuenta corriente.
+//
+// Antes (T49, Fase 2): el hook NO seteaba `balanceMode`, `sourceDocumentType`
+// ni `sourceDocumentId` (la DB caía a `UNIFIED` por default del schema).
+// Tampoco creaba `AccountMovementMetalEntry`.
+//
+// Ahora (T56, Fase 3B.6, POLICY.md §11 R11.7):
+//   · `balanceMode` SIEMPRE se setea explícito (UNIFIED por default).
+//   · `sourceDocumentType = "SALE"` / `sourceDocumentId = sale.id` siempre.
+//   · BREAKDOWN crea una `AccountMovementMetalEntry` por metal padre.
+//   · UNIFIED preserva back-compat: no se crean metalEntries.
+// =============================================================================
+
+describe("T56 — Fase 3B.6: balanceMode + trazabilidad en cuenta corriente", () => {
+  it("UNIFIED implícito (sin opts.balanceMode): mov.balanceMode=UNIFIED + sourceDocument SALE + sin metalEntries", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    await onSaleConfirmed(tx as any, "sale-1", {});
+
+    expect(state.createdMovements).toHaveLength(1);
+    const mov = state.createdMovements[0];
+    expect(mov.balanceMode).toBe("UNIFIED");
+    expect(mov.sourceDocumentType).toBe("SALE");
+    expect(mov.sourceDocumentId).toBe("sale-1");
+    // amountBase desde el snapshot (back-compat exacta) — el snapshot tiene
+    // total=242 + totalBase=242 según `computeTotalsFromLines` del hook.
+    expect(mov.amountBase.toString()).toBe("242");
+    // NO se crearon filas en la tabla nueva.
+    expect(state.createdMetalEntries).toHaveLength(0);
+  });
+
+  it("UNIFIED explícito (opts.balanceMode='UNIFIED'): mismo comportamiento", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode:       "UNIFIED",
+      balanceModeSource: "TENANT_DEFAULT",
+      balanceBreakdown:  {
+        metals: [],
+        monetaryBalance: { amount: 242, currencyCode: "ARS", currencyRate: 1, amountBase: 242 },
+      },
+    });
+
+    const mov = state.createdMovements[0];
+    expect(mov.balanceMode).toBe("UNIFIED");
+    expect(state.createdMetalEntries).toHaveLength(0);
+  });
+});
+
+describe("T56 — Fase 3B.6: BREAKDOWN crea metalEntries", () => {
+  it("BREAKDOWN con un metal: mov.balanceMode=BREAKDOWN + amountBase desde monetaryBalance + 1 metalEntry", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    const bd = makeBreakdown();  // 1 metal Oro Fino, monetary.amount=50000
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode:       "BREAKDOWN",
+      balanceModeSource: "ENTITY_DEFAULT",
+      balanceBreakdown:  bd,
+    });
+
+    expect(state.createdMovements).toHaveLength(1);
+    const mov = state.createdMovements[0];
+    expect(mov.balanceMode).toBe("BREAKDOWN");
+    expect(mov.sourceDocumentType).toBe("SALE");
+    expect(mov.sourceDocumentId).toBe("sale-1");
+    // amountBase y amountOriginal vienen del breakdown, no del snapshot total.
+    expect(mov.amountBase.toString()).toBe("50000");
+    expect(mov.amountOriginal.toString()).toBe("50000");
+    expect(mov.currencyCode).toBe("ARS");
+
+    expect(state.createdMetalEntries).toHaveLength(1);
+    const entry = state.createdMetalEntries[0];
+    expect(entry.movementId).toBe(mov.id);
+    expect(entry.jewelryId).toBe("jw-1");
+    expect(entry.metalParentId).toBe("oro-fino");
+    expect(entry.metalParentName).toBe("Oro Fino");
+    expect(entry.gramsOriginal.toString()).toBe("2");
+    expect(entry.purity.toString()).toBe("0.75");
+    expect(entry.gramsPure.toString()).toBe("1.5");
+    expect(entry.sourceLineId).toBe("line-1");
+  });
+
+  it("BREAKDOWN multi-metal (Oro + Plata) → 2 metalEntries", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    const bd = makeBreakdown({
+      metals: [
+        {
+          metalParentId: "oro-fino", metalParentName: "Oro Fino",
+          gramsOriginal: 1, purity: 0.75, gramsPure: 0.75,
+          quotePriceSnapshot: 100000, valuationMonetary: 75000,
+          valuationCurrencyCode: "ARS",
+          sourceLineIds: ["line-1"],
+        },
+        {
+          metalParentId: "plata-925", metalParentName: "Plata 925",
+          gramsOriginal: 10, purity: 0.925, gramsPure: 9.25,
+          quotePriceSnapshot: 5000, valuationMonetary: 46250,
+          valuationCurrencyCode: "ARS",
+          sourceLineIds: ["line-2"],
+        },
+      ],
+    });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN", balanceBreakdown: bd,
+    });
+
+    expect(state.createdMetalEntries).toHaveLength(2);
+    const oro   = state.createdMetalEntries.find((e: any) => e.metalParentId === "oro-fino");
+    const plata = state.createdMetalEntries.find((e: any) => e.metalParentId === "plata-925");
+    expect(oro.gramsPure.toString()).toBe("0.75");
+    expect(plata.gramsPure.toString()).toBe("9.25");
+    expect(plata.metalParentName).toBe("Plata 925");
+  });
+
+  it("BREAKDOWN sin metales (línea solo hechura) → movimiento sin metalEntries", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    const bd = makeBreakdown({ metals: [] });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN", balanceBreakdown: bd,
+    });
+    expect(state.createdMovements).toHaveLength(1);
+    expect(state.createdMovements[0].balanceMode).toBe("BREAKDOWN");
+    expect(state.createdMetalEntries).toHaveLength(0);
+    // El createMany NO debe invocarse cuando no hay filas que crear.
+    expect((tx as any).accountMovementMetalEntry.createMany).not.toHaveBeenCalled();
+  });
+
+  it("BREAKDOWN con metal de gramsPure=0 → fila descartada defensivamente", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    const bd = makeBreakdown({
+      metals: [
+        {
+          metalParentId: "oro-fino", metalParentName: "Oro Fino",
+          gramsOriginal: 0, purity: null, gramsPure: 0,
+          quotePriceSnapshot: null, valuationMonetary: null,
+          valuationCurrencyCode: "ARS",
+          sourceLineIds: [],
+        },
+      ],
+    });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN", balanceBreakdown: bd,
+    });
+    // Fila descartada → tabla vacía. El movimiento monetario sigue siendo válido.
+    expect(state.createdMovements).toHaveLength(1);
+    expect(state.createdMetalEntries).toHaveLength(0);
+  });
+
+  it("sourceLineId persiste cuando una sola línea aportó al padre", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    const bd = makeBreakdown({
+      metals: [{
+        metalParentId: "oro-fino", metalParentName: "Oro Fino",
+        gramsOriginal: 1, purity: 0.75, gramsPure: 0.75,
+        quotePriceSnapshot: null, valuationMonetary: null,
+        valuationCurrencyCode: "ARS",
+        sourceLineIds: ["line-42"],
+      }],
+    });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN", balanceBreakdown: bd,
+    });
+    expect(state.createdMetalEntries[0].sourceLineId).toBe("line-42");
+  });
+
+  it("sourceLineId queda null cuando >1 línea aportó al mismo padre", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    const bd = makeBreakdown({
+      metals: [{
+        metalParentId: "oro-fino", metalParentName: "Oro Fino",
+        gramsOriginal: 3, purity: 0.75, gramsPure: 2.25,
+        quotePriceSnapshot: null, valuationMonetary: null,
+        valuationCurrencyCode: "ARS",
+        sourceLineIds: ["line-1", "line-2"],   // dos líneas
+      }],
+    });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN", balanceBreakdown: bd,
+    });
+    expect(state.createdMetalEntries[0].sourceLineId).toBeNull();
+  });
+});
+
+describe("T56 — Fase 3B.6: validación BREAKDOWN", () => {
+  it("BREAKDOWN sin balanceBreakdown → throw controlado (no escribe nada)", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    await expect(
+      onSaleConfirmed(tx as any, "sale-1", {
+        balanceMode: "BREAKDOWN",
+        // ¡falta balanceBreakdown!
+      }),
+    ).rejects.toThrow(/BREAKDOWN.*balanceBreakdown/i);
+    // No se llegó a crear el movement (la validación es ANTES del create).
+    expect(state.createdMovements).toHaveLength(0);
+    expect(state.createdMetalEntries).toHaveLength(0);
+  });
+
+  it("BREAKDOWN con balanceBreakdown corrupto (sin monetaryBalance) → throw controlado", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    await expect(
+      onSaleConfirmed(tx as any, "sale-1", {
+        balanceMode:      "BREAKDOWN",
+        balanceBreakdown: { metals: [] } as any,  // sin monetaryBalance
+      }),
+    ).rejects.toThrow(/BREAKDOWN/);
+    expect(state.createdMovements).toHaveLength(0);
+  });
+
+  it("BREAKDOWN con metals no-array → throw", async () => {
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    await expect(
+      onSaleConfirmed(tx as any, "sale-1", {
+        balanceMode:      "BREAKDOWN",
+        balanceBreakdown: { metals: "oops", monetaryBalance: { amount: 1, currencyCode: "ARS", currencyRate: 1, amountBase: 1 } } as any,
+      }),
+    ).rejects.toThrow(/BREAKDOWN/);
+    expect(state.createdMovements).toHaveLength(0);
+  });
+});
+
+describe("T56 — Fase 3B.6: consumidor final (sin cliente)", () => {
+  it("BREAKDOWN sin clientId → no se crea movimiento ni metalEntries (consumidor final)", async () => {
+    const sale = makeSaleRecord({ clientId: null, client: null });
+    const { tx, state } = buildMockTx({ sale });
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN",
+      balanceBreakdown: makeBreakdown(),
+    });
+    // Receipt sí se emite, pero sin cuenta corriente.
+    expect(state.createdReceipts).toHaveLength(1);
+    expect(state.createdMovements).toHaveLength(0);
+    expect(state.createdMetalEntries).toHaveLength(0);
+  });
+});
+
+describe("T56 — Fase 3B.6: históricos pre-3B.5 (callers sin opts.balanceMode)", () => {
+  it("caller que NO pasa balanceMode → UNIFIED implícito, snapshot legacy intacto, sin metalEntries", async () => {
+    // Reproduce el caso de un caller (ej. legacy) que llama al hook sin
+    // pasar Balance Mode. Comportamiento debe ser idéntico a pre-3B.5:
+    // UNIFIED, sin metalEntries, amount desde snapshot.totals.
+    const { tx, state } = buildMockTx({ sale: makeSaleRecord() });
+    await onSaleConfirmed(tx as any, "sale-1", { issueInvoice: true });
+    expect(state.createdMovements).toHaveLength(1);
+    expect(state.createdMovements[0].balanceMode).toBe("UNIFIED");
+    expect(state.createdMetalEntries).toHaveLength(0);
   });
 });

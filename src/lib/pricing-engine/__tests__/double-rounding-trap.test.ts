@@ -1,23 +1,30 @@
 // src/lib/pricing-engine/__tests__/double-rounding-trap.test.ts
 // =============================================================================
-// SPRINT 1 — Detección de doble redondeo (POLICY.md §1)
+// CONTRATO ACTUALIZADO — la prevención de doble redondeo vive en el RUNTIME,
+// no en la validación de creación/edición de PriceList.
 //
-// Riesgo:
-//   Si el tenant tiene `documentRoundingEnabled = true` y al mismo tiempo una
-//   PriceList se guarda con redondeo comercial propio (roundingTarget=METAL o
-//   roundingApplyOn=PRICE con mode≠NONE), el sistema aplica DOBLE redondeo:
-//   primero la lista, después el documento. Esto rompe paridad simulador↔factura.
+// Decisión arquitectónica (ver `src/modules/price-lists/price-lists.service.ts`,
+// bloque "Prevención de doble redondeo (DECISIÓN ARQUITECTÓNICA)"):
 //
-// Mitigación testeada:
-//   `validateRoundingPolicy` en `src/modules/price-lists/price-lists.service.ts`
-//   debe rechazar al guardar/actualizar una lista con configuración incompatible.
+//   La lista de precios es una regla COMERCIAL REUSABLE. Su configuración no
+//   debe depender del estado vigente de `Jewelry.documentRounding*`. La
+//   colisión de redondeos se resuelve en el motor:
 //
-// Casos:
-//   1. Rechaza roundingTarget=METAL si tenant tiene redondeo doc activo.
-//   2. Rechaza roundingApplyOn=PRICE + mode≠NONE si tenant tiene redondeo doc.
-//   3. Acepta roundingApplyOn=NET / TOTAL (se difieren al doc).
-//   4. Acepta cualquier configuración si el tenant NO tiene redondeo doc.
-//   5. Mismas reglas en updatePriceList.
+//     · `loadDocumentRoundingConfig` (src/lib/document-rounding.ts:154)
+//       emite `suppressListDeferredRounding = true` cuando la política del
+//       documento está activa.
+//     · `pricing-engine.sale.ts:1620` neutraliza el rounding diferido de la
+//       lista (`applyOn = NET | TOTAL`) cuando ese flag llega `true`.
+//
+// Estos tests cubren los puntos obligatorios pedidos en la auditoría:
+//   1. create/update PriceList con `mode=METAL_HECHURA` + roundingMetal/Hechura
+//      debe permitirse aunque `Jewelry.documentRoundingScope = "BREAKDOWN"`.
+//   2. El guard de doble redondeo NO vive en la validación del modal de
+//      creación — se permite cualquier combinación que antes rechazaba.
+//   3. El runtime del documento sigue evitando doble redondeo
+//      (`loadDocumentRoundingConfig` emite `suppressListDeferredRounding=true`).
+//   4. Crear/editar listas desglosadas NO modifica la config del documento.
+//   5. La config del documento NO impide guardar la PriceList.
 // =============================================================================
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -34,27 +41,37 @@ const mockPrisma = vi.hoisted(() => ({
     updateMany: vi.fn(),
   },
   articleCategory: { findFirst: vi.fn() },
-  jewelry:         { findUnique: vi.fn() },
+  jewelry:         { findUnique: vi.fn(), update: vi.fn() },
 }));
 
 vi.mock("../../prisma.js", () => ({ prisma: mockPrisma }));
 
 import { createPriceList, updatePriceList } from "../../../modules/price-lists/price-lists.service.js";
+import { loadDocumentRoundingConfig } from "../../document-rounding.js";
 
 const TENANT_ID = "j1";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // Defaults: sin duplicados, sin listas existentes, create echo-back
+  // Defaults: sin duplicados, sin listas existentes, create echo-back.
   mockPrisma.priceList.findFirst.mockResolvedValue(null);
   mockPrisma.priceList.count.mockResolvedValue(0);
   mockPrisma.priceList.create.mockImplementation(async (args: any) => ({ id: "pl-new", ...args.data }));
   mockPrisma.priceList.update.mockImplementation(async (args: any) => ({ id: args.where.id, ...args.data }));
   mockPrisma.priceList.updateMany.mockResolvedValue({ count: 0 });
   mockPrisma.articleCategory.findFirst.mockResolvedValue({ id: "cat1" });
+  // Default jewelry mock — política del documento activa pero el test puede
+  // sobrescribirla.
+  mockPrisma.jewelry.findUnique.mockResolvedValue({
+    documentRoundingEnabled: true,
+    documentRoundingMode:    "INTEGER",
+    documentRoundingScope:   "BREAKDOWN",
+    documentRoundingModeMetal:   "INTEGER",
+    documentRoundingModeHechura: "INTEGER",
+  });
 });
 
-// Datos base de una lista válida (margen, scope GENERAL, mode MARGIN_TOTAL)
+// Datos base de una lista válida.
 function basePriceListData(overrides: Record<string, any> = {}) {
   return {
     name: "Lista Test",
@@ -70,187 +87,60 @@ function basePriceListData(overrides: Record<string, any> = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Rechazos cuando tenant tiene redondeo de documento activo
+// (1) PriceList con BREAKDOWN debe permitirse aunque el tenant tenga
+//     documentRoundingScope = BREAKDOWN.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("validateRoundingPolicy — rechazos con tenant.documentRoundingEnabled=true", () => {
-  beforeEach(() => {
-    // Tenant con redondeo de documento activo (INTEGER)
+describe("PriceList — BREAKDOWN permitido aunque tenant tenga documentRoundingScope=BREAKDOWN", () => {
+  it("createPriceList con mode=METAL_HECHURA + roundingMetal/Hechura PASA", async () => {
     mockPrisma.jewelry.findUnique.mockResolvedValue({
-      documentRoundingEnabled: true,
-      documentRoundingMode:    "INTEGER",
+      documentRoundingEnabled:     true,
+      documentRoundingScope:       "BREAKDOWN",
+      documentRoundingModeMetal:   "INTEGER",
+      documentRoundingModeHechura: "INTEGER",
     });
+
+    const data = basePriceListData({
+      mode:                    "METAL_HECHURA",
+      marginTotal:             null,
+      marginMetal:             "120",
+      marginHechura:           "200",
+      roundingTarget:          "METAL",
+      roundingModeMetal:       "INTEGER",
+      roundingDirectionMetal:  "NEAREST",
+      roundingModeHechura:     "HUNDRED",
+      roundingDirectionHechura:"NEAREST",
+    });
+
+    const out = await createPriceList(TENANT_ID, data);
+    expect(out).toBeDefined();
+    expect(mockPrisma.priceList.create).toHaveBeenCalledTimes(1);
   });
 
-  it("rechaza roundingTarget=METAL", async () => {
+  it("createPriceList con roundingTarget=METAL + roundingApplyOn=PRICE + mode=NONE config NO bloquea", async () => {
+    // Caso que el guard antiguo rechazaba con HTTP 400.
     const data = basePriceListData({
       roundingTarget:    "METAL",
       roundingMode:      "TEN",
       roundingDirection: "NEAREST",
       roundingApplyOn:   "PRICE",
     });
-
-    await expect(createPriceList(TENANT_ID, data)).rejects.toMatchObject({
-      status:  400,
-      message: expect.stringMatching(/doble redondeo/i),
-    });
-
-    // No se llegó a crear nada
-    expect(mockPrisma.priceList.create).not.toHaveBeenCalled();
-  });
-
-  it("rechaza roundingApplyOn=PRICE con roundingMode≠NONE", async () => {
-    const data = basePriceListData({
-      roundingTarget:    "FINAL_PRICE",
-      roundingMode:      "DECIMAL_2",
-      roundingDirection: "NEAREST",
-      roundingApplyOn:   "PRICE",
-    });
-
-    await expect(createPriceList(TENANT_ID, data)).rejects.toMatchObject({
-      status:  400,
-      message: expect.stringMatching(/doble redondeo/i),
-    });
-    expect(mockPrisma.priceList.create).not.toHaveBeenCalled();
-  });
-
-  it("acepta roundingApplyOn=NET (se difiere y el doc lo neutraliza)", async () => {
-    const data = basePriceListData({
-      roundingTarget:    "FINAL_PRICE",
-      roundingMode:      "TEN",
-      roundingDirection: "NEAREST",
-      roundingApplyOn:   "NET",
-    });
-
     await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
     expect(mockPrisma.priceList.create).toHaveBeenCalledTimes(1);
   });
 
-  it("acepta roundingApplyOn=TOTAL (se difiere y el doc lo neutraliza)", async () => {
+  it("createPriceList con roundingApplyOn=PRICE + roundingMode=INTEGER NO bloquea (antes 400)", async () => {
     const data = basePriceListData({
       roundingTarget:    "FINAL_PRICE",
       roundingMode:      "INTEGER",
-      roundingDirection: "UP",
-      roundingApplyOn:   "TOTAL",
+      roundingDirection: "NEAREST",
+      roundingApplyOn:   "PRICE",
     });
-
     await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
     expect(mockPrisma.priceList.create).toHaveBeenCalledTimes(1);
   });
 
-  it("acepta roundingTarget=NONE (sin redondeo de lista)", async () => {
-    const data = basePriceListData({
-      roundingTarget:    "NONE",
-      roundingMode:      "NONE",
-      roundingDirection: "NEAREST",
-      roundingApplyOn:   "PRICE",
-    });
-
-    await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
-    expect(mockPrisma.priceList.create).toHaveBeenCalledTimes(1);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. Tenant sin redondeo de documento → cualquier configuración vale
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("validateRoundingPolicy — tenant.documentRoundingEnabled=false → libre", () => {
-  it("acepta roundingTarget=METAL si tenant.documentRoundingEnabled=false", async () => {
-    mockPrisma.jewelry.findUnique.mockResolvedValue({
-      documentRoundingEnabled: false,
-      documentRoundingMode:    "INTEGER", // mode != NONE pero enabled=false
-    });
-
-    const data = basePriceListData({
-      roundingTarget:    "METAL",
-      roundingMode:      "TEN",
-      roundingDirection: "NEAREST",
-      roundingApplyOn:   "PRICE",
-    });
-
-    await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
-    expect(mockPrisma.priceList.create).toHaveBeenCalledTimes(1);
-  });
-
-  it("acepta roundingApplyOn=PRICE+mode si tenant.documentRoundingMode=NONE", async () => {
-    mockPrisma.jewelry.findUnique.mockResolvedValue({
-      documentRoundingEnabled: true,   // enabled pero modo NONE → no aplica
-      documentRoundingMode:    "NONE",
-    });
-
-    const data = basePriceListData({
-      roundingTarget:    "FINAL_PRICE",
-      roundingMode:      "DECIMAL_2",
-      roundingDirection: "NEAREST",
-      roundingApplyOn:   "PRICE",
-    });
-
-    await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
-    expect(mockPrisma.priceList.create).toHaveBeenCalledTimes(1);
-  });
-
-  it("acepta cualquier configuración si el tenant no existe (defensivo)", async () => {
-    mockPrisma.jewelry.findUnique.mockResolvedValue(null);
-
-    const data = basePriceListData({
-      roundingTarget:    "METAL",
-      roundingMode:      "HUNDRED",
-      roundingDirection: "DOWN",
-      roundingApplyOn:   "PRICE",
-    });
-
-    // Si no hay tenant, la validación no aplica → la lista pasa
-    await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. updatePriceList — mismas reglas
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("validateRoundingPolicy — aplica también en updatePriceList", () => {
-  it("rechaza updatePriceList si la nueva configuración produciría doble redondeo", async () => {
-    mockPrisma.jewelry.findUnique.mockResolvedValue({
-      documentRoundingEnabled: true,
-      documentRoundingMode:    "INTEGER",
-    });
-
-    // Lista existente (mock devuelve la lista que se va a actualizar)
-    mockPrisma.priceList.findFirst.mockImplementation(async (args: any) => {
-      // El service llama findFirst dos veces:
-      //  1. Para chequear que la lista existe (id + jewelryId)
-      //  2. Para chequear duplicados de nombre (excluyendo este id)
-      const where = args.where ?? {};
-      if (where.id && !where.id.not) {
-        return { id: "pl-existing", code: "EXIST", isActive: true, isFavorite: false };
-      }
-      return null; // sin duplicados
-    });
-
-    const data = basePriceListData({
-      roundingTarget:    "METAL",
-      roundingMode:      "TEN",
-      roundingDirection: "NEAREST",
-      roundingApplyOn:   "PRICE",
-    });
-
-    await expect(
-      updatePriceList("pl-existing", TENANT_ID, data),
-    ).rejects.toMatchObject({
-      status:  400,
-      message: expect.stringMatching(/doble redondeo/i),
-    });
-
-    expect(mockPrisma.priceList.update).not.toHaveBeenCalled();
-  });
-
-  it("acepta updatePriceList con applyOn=TOTAL aunque tenant tenga redondeo doc", async () => {
-    mockPrisma.jewelry.findUnique.mockResolvedValue({
-      documentRoundingEnabled: true,
-      documentRoundingMode:    "INTEGER",
-    });
-
+  it("updatePriceList con la misma config peligrosa de antes tampoco bloquea", async () => {
     mockPrisma.priceList.findFirst.mockImplementation(async (args: any) => {
       const where = args.where ?? {};
       if (where.id && !where.id.not) {
@@ -260,10 +150,10 @@ describe("validateRoundingPolicy — aplica también en updatePriceList", () => 
     });
 
     const data = basePriceListData({
-      roundingTarget:    "FINAL_PRICE",
-      roundingMode:      "INTEGER",
+      roundingTarget:    "METAL",
+      roundingMode:      "TEN",
       roundingDirection: "NEAREST",
-      roundingApplyOn:   "TOTAL",
+      roundingApplyOn:   "PRICE",
     });
 
     await expect(
@@ -271,4 +161,175 @@ describe("validateRoundingPolicy — aplica también en updatePriceList", () => 
     ).resolves.toBeDefined();
     expect(mockPrisma.priceList.update).toHaveBeenCalledTimes(1);
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (2) El guard ya NO vive en la validación de la lista.
+//     Verificamos que el service no rechaza con HTTP 400 por config de
+//     redondeo "incompatible" — ni siquiera con todos los combos peligrosos.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PriceList — el guard de doble redondeo NO vive en el modal", () => {
+  const dangerousConfigs = [
+    { roundingTarget: "METAL",       roundingMode: "TEN",     roundingDirection: "NEAREST", roundingApplyOn: "PRICE" },
+    { roundingTarget: "FINAL_PRICE", roundingMode: "INTEGER", roundingDirection: "NEAREST", roundingApplyOn: "PRICE" },
+    { roundingTarget: "METAL",       roundingMode: "HUNDRED", roundingDirection: "DOWN",    roundingApplyOn: "NET"   },
+  ];
+
+  for (const cfg of dangerousConfigs) {
+    it(`createPriceList(${JSON.stringify(cfg)}) NO falla con HTTP 400 por redondeo`, async () => {
+      const data = basePriceListData(cfg);
+      // No esperamos rejects con status:400 + message /doble redondeo/i.
+      const fn = () => createPriceList(TENANT_ID, data);
+      await expect(fn()).resolves.toBeDefined();
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (3) El RUNTIME del documento sigue evitando el doble redondeo.
+//     `loadDocumentRoundingConfig` emite `suppressListDeferredRounding=true`
+//     cuando la política del tenant está activa — eso es lo que el motor
+//     consulta para neutralizar el rounding diferido de la lista.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Runtime — loadDocumentRoundingConfig sigue suprimiendo el rounding diferido", () => {
+  it("tenant con BREAKDOWN activo (metal+hechura) → suppressListDeferredRounding=true", async () => {
+    mockPrisma.jewelry.findUnique.mockResolvedValue({
+      documentRoundingEnabled:          true,
+      documentRoundingMode:             "NONE",
+      documentRoundingDirection:        "NEAREST",
+      documentRoundingScope:            "BREAKDOWN",
+      documentRoundingModeMetal:        "INTEGER",
+      documentRoundingDirectionMetal:   "NEAREST",
+      documentRoundingModeHechura:      "INTEGER",
+      documentRoundingDirectionHechura: "NEAREST",
+      documentRoundingMetalDomain:      "MONETARY",
+      documentPhysicalRoundingConfig:   null,
+    });
+    const policy = await loadDocumentRoundingConfig(TENANT_ID);
+    expect(policy.suppressListDeferredRounding).toBe(true);
+    expect(policy.scope).toBe("BREAKDOWN");
+    expect(policy.documentRounding).not.toBeNull();
+  });
+
+  it("tenant con UNIFIED activo → suppressListDeferredRounding=true", async () => {
+    mockPrisma.jewelry.findUnique.mockResolvedValue({
+      documentRoundingEnabled:          true,
+      documentRoundingMode:             "INTEGER",
+      documentRoundingDirection:        "NEAREST",
+      documentRoundingScope:            "UNIFIED",
+      documentRoundingModeMetal:        "NONE",
+      documentRoundingDirectionMetal:   "NEAREST",
+      documentRoundingModeHechura:      "NONE",
+      documentRoundingDirectionHechura: "NEAREST",
+      documentRoundingMetalDomain:      "MONETARY",
+      documentPhysicalRoundingConfig:   null,
+    });
+    const policy = await loadDocumentRoundingConfig(TENANT_ID);
+    expect(policy.suppressListDeferredRounding).toBe(true);
+    expect(policy.scope).toBe("UNIFIED");
+  });
+
+  it("tenant SIN política activa → suppressListDeferredRounding=false (lista actúa libre)", async () => {
+    mockPrisma.jewelry.findUnique.mockResolvedValue({
+      documentRoundingEnabled:          false,
+      documentRoundingMode:             "NONE",
+      documentRoundingDirection:        "NEAREST",
+      documentRoundingScope:            "UNIFIED",
+      documentRoundingModeMetal:        "NONE",
+      documentRoundingDirectionMetal:   "NEAREST",
+      documentRoundingModeHechura:      "NONE",
+      documentRoundingDirectionHechura: "NEAREST",
+      documentRoundingMetalDomain:      "MONETARY",
+      documentPhysicalRoundingConfig:   null,
+    });
+    const policy = await loadDocumentRoundingConfig(TENANT_ID);
+    expect(policy.suppressListDeferredRounding).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (4) Crear/editar listas NO modifica la config del documento.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PriceList — create/update NO toca documentRounding del tenant", () => {
+  it("createPriceList no llama prisma.jewelry.update", async () => {
+    const data = basePriceListData({
+      mode:                    "METAL_HECHURA",
+      marginTotal:             null,
+      marginMetal:             "120",
+      marginHechura:           "200",
+      roundingTarget:          "METAL",
+      roundingModeMetal:       "INTEGER",
+      roundingDirectionMetal:  "NEAREST",
+      roundingModeHechura:     "HUNDRED",
+      roundingDirectionHechura:"NEAREST",
+    });
+    await createPriceList(TENANT_ID, data);
+    expect(mockPrisma.jewelry.update).not.toHaveBeenCalled();
+    // El select del create tampoco incluye campos documentRounding* del tenant
+    // (es priceList.create — no toca Jewelry).
+    const createArgs = mockPrisma.priceList.create.mock.calls[0]![0];
+    for (const key of Object.keys(createArgs.data)) {
+      expect(key).not.toMatch(/^documentRounding/i);
+    }
+  });
+
+  it("updatePriceList tampoco llama prisma.jewelry.update", async () => {
+    mockPrisma.priceList.findFirst.mockImplementation(async (args: any) => {
+      const where = args.where ?? {};
+      if (where.id && !where.id.not) {
+        return { id: "pl-existing", code: "EXIST", isActive: true, isFavorite: false };
+      }
+      return null;
+    });
+    const data = basePriceListData({ roundingTarget: "METAL", roundingApplyOn: "PRICE" });
+    await updatePriceList("pl-existing", TENANT_ID, data);
+    expect(mockPrisma.jewelry.update).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (5) `documentRounding` config NO impide guardar PriceList — explícito:
+//     ningún combo de Jewelry rounding fuerza un 400 al crear/editar lista.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PriceList — documentRounding NO bloquea guardar", () => {
+  const tenantStates = [
+    { name: "BREAKDOWN metal+hechura activos",
+      mock: {
+        documentRoundingEnabled:     true,
+        documentRoundingScope:       "BREAKDOWN",
+        documentRoundingModeMetal:   "INTEGER",
+        documentRoundingModeHechura: "HUNDRED",
+      },
+    },
+    { name: "UNIFIED activo (INTEGER)",
+      mock: { documentRoundingEnabled: true, documentRoundingScope: "UNIFIED", documentRoundingMode: "INTEGER" } },
+    { name: "BOTH activos",
+      mock: {
+        documentRoundingEnabled:     true,
+        documentRoundingScope:       "BOTH",
+        documentRoundingMode:        "INTEGER",
+        documentRoundingModeMetal:   "INTEGER",
+        documentRoundingModeHechura: "INTEGER",
+      },
+    },
+    { name: "sin política (inerte)",
+      mock: { documentRoundingEnabled: false } },
+  ];
+
+  for (const { name, mock } of tenantStates) {
+    it(`createPriceList pasa con tenant: ${name}`, async () => {
+      mockPrisma.jewelry.findUnique.mockResolvedValue(mock);
+      const data = basePriceListData({
+        roundingTarget: "METAL",
+        roundingMode:   "TEN",
+        roundingDirection: "NEAREST",
+        roundingApplyOn: "PRICE",
+      });
+      await expect(createPriceList(TENANT_ID, data)).resolves.toBeDefined();
+    });
+  }
 });

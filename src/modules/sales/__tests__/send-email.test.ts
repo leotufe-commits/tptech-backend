@@ -171,12 +171,87 @@ describe("sendSaleByEmail — pivot funcional (sellos, no bloqueos)", () => {
       .mockReset()
       // Primera llamada: la hace generateSalePdf (para componer el emisor).
       .mockResolvedValueOnce(makeJewelry({ email: "" }))
-      // Segunda llamada: la hace sendSaleByEmail para resolver replyTo.
-      .mockResolvedValueOnce({ email: "" });
+      // Segunda llamada: la hace resolveTenantMailContext (sendSaleByEmail
+      // para componer el header de mail).
+      .mockResolvedValueOnce({
+        emailEnabled: true, emailSenderName: "", emailReplyTo: "", email: "",
+      });
 
     await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
     const call = mockSendMail.mock.calls[0]![0]!;
     expect(call.replyTo).toBeUndefined();
+  });
+
+  // ─── Etapa 1 — mail sender real con config de joyería ──────────────────────
+
+  it("Etapa 1: emailSenderName del tenant compone From visible ('\"Joyería X\" <addr>')", async () => {
+    process.env.MAIL_FROM = "no-reply@tptech.local";
+
+    mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale());
+    mockPrisma.jewelry.findUnique
+      .mockReset()
+      // Primera llamada (generateSalePdf): emisor para el PDF.
+      .mockResolvedValueOnce(makeJewelry())
+      // Segunda llamada (resolveTenantMailContext): config de mail.
+      .mockResolvedValueOnce({
+        emailEnabled:    true,
+        emailSenderName: "Joyería Tuport",
+        emailReplyTo:    "ventas@joyeriatuport.com",
+        email:           "info@joyeriatuport.com",
+      });
+
+    await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+
+    const call = mockSendMail.mock.calls[0]![0]!;
+    // From compuesto: display name quoteado + ángulos sobre el MAIL_FROM env.
+    expect(call.from).toBe('"Joyería Tuport" <no-reply@tptech.local>');
+    // Reply-To toma del campo DEDICADO (emailReplyTo), NO del legacy.
+    expect(call.replyTo).toBe("ventas@joyeriatuport.com");
+
+    delete (process.env as Record<string, string | undefined>).MAIL_FROM;
+  });
+
+  it("Etapa 1: sin emailSenderName → From cae al MAIL_FROM env plano", async () => {
+    process.env.MAIL_FROM = "no-reply@tptech.local";
+
+    mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale());
+    mockPrisma.jewelry.findUnique
+      .mockReset()
+      .mockResolvedValueOnce(makeJewelry())
+      .mockResolvedValueOnce({
+        emailEnabled:    true,
+        emailSenderName: "",
+        emailReplyTo:    "ventas@joy.com",
+        email:           "",
+      });
+
+    await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    const call = mockSendMail.mock.calls[0]![0]!;
+    expect(call.from).toBe("no-reply@tptech.local"); // sin display name
+    expect(call.replyTo).toBe("ventas@joy.com");
+
+    delete (process.env as Record<string, string | undefined>).MAIL_FROM;
+  });
+
+  it("Etapa 1: emailReplyTo dedicado tiene prioridad sobre email legacy", async () => {
+    process.env.MAIL_FROM = "no-reply@tptech.local";
+
+    mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale());
+    mockPrisma.jewelry.findUnique
+      .mockReset()
+      .mockResolvedValueOnce(makeJewelry())
+      .mockResolvedValueOnce({
+        emailEnabled:    true,
+        emailSenderName: "Joyería X",
+        emailReplyTo:    "ventas@joy.com",       // dedicado — gana
+        email:           "info@joy.com",          // legacy — ignorado
+      });
+
+    await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    const call = mockSendMail.mock.calls[0]![0]!;
+    expect(call.replyTo).toBe("ventas@joy.com");
+
+    delete (process.env as Record<string, string | undefined>).MAIL_FROM;
   });
 
   it("HTML del cuerpo escapea entidades del message del usuario", async () => {

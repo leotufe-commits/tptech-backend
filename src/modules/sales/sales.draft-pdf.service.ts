@@ -29,13 +29,20 @@
 //      mismo buffer que se descarga. Un único render por operación.
 // =============================================================================
 
-import {
-  renderPrintableToPdf,
-  type SaleDraftPrintableProps,
-  type RenderPrintablePageConfig,
+import type {
+  SaleDraftPrintableProps,
+  RenderPrintablePageConfig,
 } from "../../lib/pdf/renderPrintableToPdf.js";
 import { sendMail } from "../../lib/mail.service.js";
-import { prisma } from "../../lib/prisma.js";
+// Etapa 1 (mail sender real) — SSOT del header de mail por tenant.
+// Mismo modulo que usa `sendSaleByEmail` (sales.service.ts) — garantiza
+// que ambos flujos componen From/Reply-To identicos.
+import { resolveTenantMailContext } from "../../lib/tenantMailContext.js";
+// Etapa 2 (PDF unico canonico) — provider fachada que sirve tanto al
+// flujo legacy (Sale persistido) como al draft. Aca usamos solo el path
+// `renderFromDraft`. Si en un futuro queremos consolidar ambos flujos en
+// un endpoint unico, este es el unico lugar a tocar.
+import { renderFromDraft } from "../../lib/saleInvoicePdfProvider.js";
 // E2 — Log documental del envío. Inmutable, sin propagar errores —
 // si el log falla, el envío sigue ok. El log NO impacta el flujo.
 import { createDocumentEmailLog } from "../../lib/document-email-log.js";
@@ -65,17 +72,21 @@ export interface SendDraftEmailInput extends RenderDraftPdfInput {
 // ─── Render principal ────────────────────────────────────────────────────────
 
 /** Renderea un PDF a partir del draft visual del frontend. NO toca
- *  Sale, NO toca pricing-engine, NO persiste. Mismo flag PDF_ENGINE
- *  que el flujo legacy; default `html`. Si HTML falla, propaga el
- *  error al caller — para el endpoint draft NO hay fallback pdfkit
- *  porque pdfkit requiere un Sale persistido con template completo
- *  para renderear las columnas correctamente.
+ *  Sale, NO toca pricing-engine, NO persiste.
  *
- *  Si el operador necesita rollback al pdfkit, debe usar
- *  `GET /sales/:id/pdf` (endpoint legacy) con la venta persistida. */
+ *  Etapa 2 — Esta funcion ahora es un wrapper delgado sobre el provider
+ *  canonico (`saleInvoicePdfProvider.renderFromDraft`). Mantenemos la
+ *  firma `(input) → Buffer` para back-compat con el controller
+ *  (`renderDraftPdf`) y con los tests existentes. El log `[PDF] engine=
+ *  html source=draft` se emite ahora dentro del provider — un unico
+ *  punto de logging por origen de PDF. */
 export async function renderSaleDraftPdf(input: RenderDraftPdfInput): Promise<Buffer> {
-  console.info("[PDF] engine=html source=draft");
-  return renderPrintableToPdf(input.printable, input.page);
+  const { buffer } = await renderFromDraft({
+    printable: input.printable,
+    page:      input.page,
+    filename:  input.filename,
+  });
+  return buffer;
 }
 
 /** Envía por mail el PDF del draft. Mismo renderer que el download
@@ -89,16 +100,24 @@ export async function sendSaleDraftByEmail(
   jewelryId:    string,
   sentByUserId?: string | null,
 ): Promise<{ messagedRecipient: string; filename: string }> {
-  const buffer   = await renderSaleDraftPdf(input);
-  const filename = input.filename ?? "Factura.pdf";
-
-  // Reply-To: email de la joyería si está configurado (mismo criterio
-  // que el flujo legacy `sendSaleByEmail` en `sales.service.ts`).
-  const tenant = await prisma.jewelry.findUnique({
-    where:  { id: jewelryId },
-    select: { email: true },
+  // Etapa 2 — Mismo provider canonico que `renderSaleDraftPdf` arriba.
+  // El adjunto del mail draft sale del MISMO render que la descarga
+  // draft → byte-equivalente. Devolvemos `filename` resuelto por el
+  // provider en lugar de duplicarlo aca (default "Factura.pdf").
+  const result   = await renderFromDraft({
+    printable: input.printable,
+    page:      input.page,
+    filename:  input.filename,
   });
-  const replyTo = tenant?.email && tenant.email.trim().length > 0 ? tenant.email : undefined;
+  const buffer   = result.buffer;
+  const filename = result.filename;
+
+  // Etapa 1 — From/Reply-To desde el SSOT del tenant (mismo helper que
+  // `sendSaleByEmail` en `sales.service.ts`). Garantiza headers consistentes
+  // entre ambos flujos (legacy y draft) y prepara el terreno para que
+  // futuros documentos (presupuestos / ordenes / NC / remitos) usen la
+  // misma resolucion de branding del tenant.
+  const mailCtx = await resolveTenantMailContext(jewelryId);
 
   const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;
 
@@ -110,7 +129,8 @@ export async function sendSaleDraftByEmail(
       subject: input.subject,
       html,
       text:    input.message,
-      replyTo,
+      from:    mailCtx.from,
+      replyTo: mailCtx.replyTo,
       attachments: [
         { filename, content: buffer, contentType: "application/pdf" },
       ],

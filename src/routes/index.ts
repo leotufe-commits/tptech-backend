@@ -42,7 +42,9 @@ import importBatchesRoutes from "../modules/import-batches/import-batches.routes
 import salesChannelsRoutes from "../modules/sales-channels/sales-channels.routes.js";
 import couponsRoutes from "../modules/coupons/coupons.routes.js";
 import receiptsRoutes from "../modules/receipts/receipts.routes.js";
+import receiptSeriesRoutes from "../modules/receipt-series/receipt-series.routes.js";
 import unitsRoutes from "../modules/units/units.routes.js";
+import userPreferencesRoutes from "../modules/user-preferences/user-preferences.routes.js";
 
 /* =====================
    ✅ DASHBOARD
@@ -66,6 +68,7 @@ router.use("/storage", requireAuth, storageRoutes);
 ===================== */
 router.use("/movimientos", requireAuth, movimientosRoutes);
 router.use("/users", requireAuth, usersRoutes);
+router.use("/user-preferences", requireAuth, userPreferencesRoutes);
 router.use("/company", requireAuth, companyRoutes);
 router.use("/roles", requireAuth, rolesRoutes);
 router.use("/warehouses", requireAuth, warehousesRoutes);
@@ -92,6 +95,7 @@ router.use("/import-batches",       requireAuth, importBatchesRoutes);
 router.use("/sales-channels",       requireAuth, salesChannelsRoutes);
 router.use("/coupons",             requireAuth, couponsRoutes);
 router.use("/receipts",            requireAuth, receiptsRoutes);
+router.use("/receipt-series",      requireAuth, receiptSeriesRoutes);
 
 /**
  * Catalogs
