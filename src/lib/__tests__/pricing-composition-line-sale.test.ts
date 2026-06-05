@@ -18,6 +18,7 @@ import {
   extractCompositionMetals,
   computeHechuraSaleFactor,
   computeMetalSaleFactor,
+  computeMetalSaleFactorPre,
 } from "../pricing-composition.js";
 import type { PricingStep } from "../pricing-engine/pricing-engine.js";
 import type { SalePriceResult } from "../pricing-engine/pricing-engine.types.js";
@@ -45,6 +46,7 @@ function buildResult(args: {
   metalCost?: number;
   metalSale?: number;
   metalMarginPct?: number;
+  metalSalePreRounding?: number;
 }): SalePriceResult {
   return {
     steps: args.steps,
@@ -55,6 +57,7 @@ function buildResult(args: {
       hechuraCost: args.hechuraCost,
       hechuraSale: args.hechuraSale,
       hechuraMarginPct: args.hechuraMarginPct,
+      ...(args.metalSalePreRounding != null ? { metalSalePreRounding: args.metalSalePreRounding } : {}),
     } as any,
   } as unknown as SalePriceResult;
 }
@@ -306,5 +309,62 @@ describe("F1.5 #A++ — METAL lineSale passthrough", () => {
       const margenPct = ((m.lineSale! - m.lineCost!) / m.lineCost!) * 100;
       expect(margenPct).toBeCloseTo(150, 3);
     });
+  });
+});
+
+// =============================================================================
+// 6. F1.6 — METAL lineSalePreRounding (receta BASE, PRE redondeo físico)
+// =============================================================================
+
+describe("F1.6 — METAL lineSalePreRounding (PRE redondeo)", () => {
+  it("caso real: lineSale = POST (574.331,25) ; lineSalePreRounding = PRE (572.343,75)", () => {
+    const steps = [
+      step("COST_LINES_METAL", 400000, { qty: "1", unitValue: "400000", variantId: "mv-1" }, "Oro 18k"),
+    ];
+    const result = buildResult({
+      steps,
+      hechuraMarginPct: 0, hechuraCost: 0, hechuraSale: 0,
+      metalCost: 400000, metalSale: 574331.25, metalMarginPct: 0,
+      metalSalePreRounding: 572343.75,
+    });
+    const factor    = computeMetalSaleFactor(result);
+    const factorPre = computeMetalSaleFactorPre(result);
+    const [item] = extractCompositionMetals(steps, undefined, factor, factorPre);
+    expect(item.lineSale).toBeCloseTo(574331.25, 2);             // POST (contaminado)
+    expect(item.lineSalePreRounding).toBeCloseTo(572343.75, 2);  // PRE (receta base)
+    expect(item.lineSale!).toBeGreaterThan(item.lineSalePreRounding!);
+  });
+
+  it("Σ lineSalePreRounding === metalSalePreRounding (multi-fila, sin prorrateo)", () => {
+    const steps = [
+      step("COST_LINES_METAL", 300000, { qty: "1", unitValue: "300000", variantId: "mv-a" }, "Oro 18k"),
+      step("COST_LINES_METAL", 100000, { qty: "1", unitValue: "100000", variantId: "mv-b" }, "Oro 24k"),
+    ];
+    const result = buildResult({
+      steps,
+      hechuraMarginPct: 0, hechuraCost: 0, hechuraSale: 0,
+      metalCost: 400000, metalSale: 574331.25, metalMarginPct: 0,
+      metalSalePreRounding: 572343.75,
+    });
+    const metals = extractCompositionMetals(
+      steps, undefined, computeMetalSaleFactor(result), computeMetalSaleFactorPre(result),
+    );
+    const sumPre = metals.reduce((a, m) => a + (m.lineSalePreRounding ?? 0), 0);
+    expect(Math.abs(sumPre - 572343.75)).toBeLessThan(0.001);   // invariante exacta
+  });
+
+  it("Sin metalSalePreRounding (no hubo redondeo) → factorPre null → lineSalePreRounding null", () => {
+    const steps = [
+      step("COST_LINES_METAL", 300, { qty: "1", unitValue: "300", variantId: "mv-1" }, "Oro 18k"),
+    ];
+    const result = buildResult({
+      steps,
+      hechuraMarginPct: 0, hechuraCost: 0, hechuraSale: 0,
+      metalCost: 300, metalSale: 600, metalMarginPct: 100,   // metalSalePreRounding ausente
+    });
+    expect(computeMetalSaleFactorPre(result)).toBeNull();
+    const [item] = extractCompositionMetals(steps, undefined, computeMetalSaleFactor(result), null);
+    expect(item.lineSalePreRounding).toBeNull();
+    expect(item.lineSale).toBe(600);   // POST sigue presente (fallback de la UI)
   });
 });

@@ -77,6 +77,12 @@ export type CompositionMetalItem = {
   costLineId:        string | null;
   /** MetalVariant.id de esta línea METAL. */
   metalVariantId:    string | null;
+  /** Metal PADRE (Divisas → Metales Padre) = `step.meta.metalId`. MISMA
+   *  identidad que `lineCommercialRoundingMetals[].metalParentId`, para que el
+   *  card de artículo matchee el gramo comercial redondeado por ID (no por
+   *  nombre). `null` en snapshots viejos → el frontend cae al match por nombre.
+   *  NO reemplaza `metalVariantId` (variante): son identidades distintas. */
+  metalParentId:     string | null;
   /** Resuelto vía batch query desde MetalVariant + Metal. null si la
    *  variante no se pudo resolver (ej. eliminada). */
   metalName:         string | null;
@@ -113,6 +119,15 @@ export type CompositionMetalItem = {
    * prorrateo manual del Simulador (POLICY R4.1).
    */
   lineSale:          number | null;
+  /**
+   * F1.6 — venta del cost-line ANTES del redondeo físico/comercial del metal
+   *  (receta base para la tabla "Composición del costo"). =
+   *  `lineCost × (metalSalePreRounding / metalCost)` — mismo passthrough lineal
+   *  que `lineSale` pero sobre el agregado PRE. `null` cuando NO hubo redondeo de
+   *  metal (entonces `lineSale` YA es la base y la UI cae a él). Metadata de
+   *  display/auditoría — NO afecta totales ni el comportamiento comercial.
+   *  Invariante: `Σ lineSalePreRounding === metalSalePreRounding`. */
+  lineSalePreRounding?: number | null;
   /**
    * Fase 2.3 — precio por gramo BASE (sin merma aplicada). Viene de
    * `step.meta.quotePrice` que el motor cost emite directo desde la
@@ -684,6 +699,7 @@ export function extractCompositionMetals(
   steps: PricingStep[] | null | undefined,
   metalVariantInfoMap?: Map<string, MetalVariantInfo>,
   metalSaleFactor: number | null = null,
+  metalSaleFactorPre: number | null = null,
 ): CompositionMetalItem[] {
   if (!Array.isArray(steps) || steps.length === 0) return [];
   return steps
@@ -708,6 +724,13 @@ export function extractCompositionMetals(
         lineCostFinite != null && metalSaleFactor != null && Number.isFinite(metalSaleFactor)
           ? lineCostFinite * metalSaleFactor
           : null;
+      // F1.6 — venta PRE redondeo por cost-line (receta base). MISMA fórmula
+      // lineal que `lineSale`, sobre el factor PRE. `null` ⇒ no hubo redondeo de
+      // metal ⇒ la UI cae a `lineSale` (que ya es la base). Sin prorrateo.
+      const lineSalePreRounding =
+        lineCostFinite != null && metalSaleFactorPre != null && Number.isFinite(metalSaleFactorPre)
+          ? lineCostFinite * metalSaleFactorPre
+          : null;
       // FASE F2 — propagar el origen de la merma desde el step. Valores
       // válidos: "costLineOverride" | "entity" | "line" | "default".
       // Steps viejos sin este campo caen a null → el frontend no muestra badge.
@@ -727,6 +750,11 @@ export function extractCompositionMetals(
       return {
         costLineId:      typeof meta.costLineId === "string" ? meta.costLineId : null,
         metalVariantId:  variantId,
+        // Metal padre = `meta.metalId` (MISMA fuente que el redondeo comercial
+        // per-línea). Garantiza match por ID con `lineCommercialRoundingMetals`.
+        metalParentId:   typeof meta.metalId === "string" && meta.metalId.length > 0
+          ? meta.metalId
+          : null,
         metalName:       variantInfo?.metalName   ?? null,
         // Fase 2.4 — variantName del MetalVariant (nombre comercial).
         variantName:     variantInfo?.variantName ?? null,
@@ -736,6 +764,7 @@ export function extractCompositionMetals(
         appliedMermaPct: mermaNum != null && Number.isFinite(mermaNum) ? mermaNum : null,
         lineCost:        lineCostFinite,
         lineSale,
+        lineSalePreRounding,
         quotePrice:      quotePriceNum != null && Number.isFinite(quotePriceNum) ? quotePriceNum : null,
         mermaSource,
         lineCostBase,
@@ -1068,6 +1097,27 @@ export function computeMetalSaleFactor(
   return metalSale / metalCost;
 }
 
+/**
+ * Factor de venta del metal PRE redondeo físico/comercial. Espejo EXACTO de
+ * `computeMetalSaleFactor`, pero sobre `metalSalePreRounding` (sale-side agregado
+ * ANTES del Δgramos). Permite exponer `lineSalePreRounding` por cost-line para la
+ * tabla de Composición (receta base), con la MISMA fórmula lineal que `lineSale`
+ * — sin prorrateo. `null` cuando el motor NO emitió el PRE (no hubo redondeo de
+ * metal) ⇒ el caller deja `lineSalePreRounding` null y la UI cae a `lineSale`.
+ * NO afecta totales ni pricing — metadata display.
+ */
+export function computeMetalSaleFactorPre(
+  result: SalePriceResult | null | undefined,
+): number | null {
+  const br = result?.metalHechuraBreakdown;
+  if (!br) return null;
+  const metalCost    = br.metalCost;
+  const metalSalePre = (br as { metalSalePreRounding?: number | null }).metalSalePreRounding;
+  if (metalCost == null || !Number.isFinite(metalCost) || metalCost === 0) return null;
+  if (metalSalePre == null || !Number.isFinite(metalSalePre)) return null;
+  return Number(metalSalePre) / metalCost;
+}
+
 export function computeHechuraSaleFactor(
   result: SalePriceResult | null | undefined,
 ): number | null {
@@ -1120,9 +1170,10 @@ export function buildComposition(
   // F1.5 #A++ — metalSaleFactor permite exponer `lineSale` per METAL
   // (passthrough del margen METAL del breakdown). Reemplaza el prorrateo
   // manual que hoy hace el Simulador (POLICY R4.1).
-  const hechuraSaleFactor = computeHechuraSaleFactor(result);
-  const metalSaleFactor   = computeMetalSaleFactor(result);
-  const metals   = extractCompositionMetals(result.steps, metalVariantInfoMap, metalSaleFactor);
+  const hechuraSaleFactor  = computeHechuraSaleFactor(result);
+  const metalSaleFactor    = computeMetalSaleFactor(result);
+  const metalSaleFactorPre = computeMetalSaleFactorPre(result);
+  const metals   = extractCompositionMetals(result.steps, metalVariantInfoMap, metalSaleFactor, metalSaleFactorPre);
   const hechuras = extractCompositionHechuras(result.steps, hechuraSaleFactor);
   const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems, hechuraSaleFactor);
   const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems, hechuraSaleFactor);
