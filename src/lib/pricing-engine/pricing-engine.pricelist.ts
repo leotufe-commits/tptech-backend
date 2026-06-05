@@ -424,11 +424,6 @@ export function applyPriceList(
       // Capturas pre-redondeo (auditoría — válidas para los dos dominios).
       const metalSalePreRounding   = metalSaleD.toNumber();
       const hechuraSalePreRounding = hechuraSaleD.toNumber();
-      // DEBUG TEMPORAL 2026-05-28 — captura pre/post para diagnóstico del
-      // bug reportado "hechura desglosada no redondea en producción".
-      // Quitar este log una vez confirmado el comportamiento en producción.
-      const __debugHechuraBefore = hechuraSalePreRounding;
-      const __debugMetalBefore   = metalSalePreRounding;
 
       let commercialPhysicalSnapshot: CommercialPhysicalRoundingSnapshot | null = null;
 
@@ -443,17 +438,34 @@ export function applyPriceList(
         if (!suppressMetalLine) {
           if (physicalEnabled) {
             // ── Path PHYSICAL ─────────────────────────────────────────────
-            // Redondea gramos POR METAL PADRE de la línea con la matemática
-            // del helper neutral (`roundDocumentMetalGrams`) — misma usada
-            // por el Financiero PHYSICAL. La suma de `monetaryEquivalent`
-            // (Δgramos × metalPricePerGram) se aplica como ajuste $ sobre
-            // `metalSaleD` (sin tocar la hechura, sin contaminar el bucket
-            // monetario — regla canónica).
+            // Redondea gramos COMERCIALES (post-margen) POR METAL PADRE de la
+            // línea con la matemática del helper neutral (`roundDocumentMetalGrams`).
+            // La suma de `monetaryEquivalent` (Δgramos × metalPricePerGram) se
+            // aplica como ajuste $ sobre `metalSaleD` (sin tocar la hechura, sin
+            // contaminar el bucket monetario — regla canónica).
+            //
+            // ── FIX ORDEN MARGEN→REDONDEO (POLICY §R-Rounding-14, 2026-06-02) ──
+            // El redondeo comercial físico debe operar DESPUÉS del margen, igual
+            // que el path PER_DOCUMENT (`commercial-document-rounding.ts` →
+            // `preGrams = gramsPure × marginFactor`). Antes redondeaba
+            // `m.gramsPure` PRE-margen (ej. 1,2375 → 1,20); ahora redondea los
+            // gramos COMERCIALES `gramsPure × marginFactor` (1,36125 → 1,40).
+            //
+            // `marginFactor = 1 + mMarginPct/100 = metalSale/metalCost`. El
+            // margen vive en los GRAMOS, no en el precio: `m.metalPricePerGram`
+            // es la COTIZACIÓN de COSTO (`meta.quotePrice`, ver
+            // `pricing-engine.sale.ts`), por lo que se mantiene igual y
+            // `monetaryEquivalent = deltaGrams × metalPricePerGram` cierra
+            // coherente con `metalSaleD` (= gramsComerciales × cotización costo).
+            // SOLO afecta el carril comercial (snapshot + metalSale + total de
+            // venta). NO toca el balance físico (`gramsPure`) ni la cuenta
+            // corriente metálica, que se arman por separado desde los cost steps.
+            const metalMarginFactor = 1 + mMarginPct / 100;
             const physicalResult = applyCommercialPhysicalRoundingForMetals({
               metals: cost.metalsByParent!.map((m) => ({
                 metalParentId:     m.metalParentId,
                 metalParentName:   m.metalParentName,
-                grams:             m.gramsPure,
+                grams:             m.gramsPure * metalMarginFactor,
                 metalPricePerGram: m.metalPricePerGram,
               })),
               configByMetalParentId: commercialPhysicalCfg.configByMetalParentId,
@@ -493,27 +505,6 @@ export function applyPriceList(
           hechuraSaleD = applyRounding(hechuraSaleD, modeH, roundingDirectionHechura ?? "NEAREST");
         }
       }
-      if (process.env.TPTECH_DEBUG_ROUNDING === "1") {
-        // eslint-disable-next-line no-console
-        console.log("[PRICE_LIST_BREAKDOWN_ROUNDING_DEBUG]", {
-          priceListId:                (priceList as any).id ?? null,
-          priceListName:              (priceList as any).name ?? null,
-          mode,
-          roundingTarget,
-          effectiveTarget,
-          roundingMode,
-          roundingDirection,
-          roundingModeHechura:        roundingModeHechura ?? null,
-          roundingDirectionHechura:   roundingDirectionHechura ?? null,
-          roundingApplyOn,
-          metalBeforeRounding:        __debugMetalBefore,
-          metalAfterRounding:         metalSaleD.toNumber(),
-          hechuraBeforeRounding:      __debugHechuraBefore,
-          hechuraAfterRounding:       hechuraSaleD.toNumber(),
-          willApplyComponentRounding: effectiveTarget === "METAL",
-        });
-      }
-
       rawPrice = metalSaleD.add(hechuraSaleD);
 
       // Guardar desglose para que el motor lo incluya en el resultado

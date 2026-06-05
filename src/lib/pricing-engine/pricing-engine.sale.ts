@@ -2767,6 +2767,15 @@ export async function resolveFinalSalePrice(
           // de la lista al resultado del motor.
           pureGramsBase:     metalHechuraBreakdown.pureGramsBase     ?? null,
           pureGramsSale:     metalHechuraBreakdown.pureGramsSale     ?? null,
+          // Etapa C-comercial — Propagar auditoría del redondeo COMERCIAL
+          // MONETARIO (metal $ legacy + hechura). MISMO patrón que `physical`:
+          // sin esto, el helper reconstruye el shape exact pero pierde el
+          // pre/delta del redondeo de hechura (HUNDRED, etc.) que `applyPriceList`
+          // sí calculó, y el card no puede mostrar "Redondeo comercial -ARS X".
+          metalSalePreRounding:     metalHechuraBreakdown.metalSalePreRounding     ?? null,
+          metalSaleRoundingDelta:   metalHechuraBreakdown.metalSaleRoundingDelta   ?? null,
+          hechuraSalePreRounding:   metalHechuraBreakdown.hechuraSalePreRounding   ?? null,
+          hechuraSaleRoundingDelta: metalHechuraBreakdown.hechuraSaleRoundingDelta ?? null,
           // B1 (Etapa C-comercial) — Propagar snapshot del redondeo PHYSICAL
           // comercial. Sin esto, el helper reconstruye el shape exact pero
           // pierde `physical` aunque la lista lo haya emitido, y el snapshot
@@ -2977,6 +2986,15 @@ export type MetalHechuraExactDetail = {
   /** Sprint 3 — Gramos puros (post purity) base y de venta. POLICY.md §8. */
   pureGramsBase?:     number | null;
   pureGramsSale?:     number | null;
+  /** Auditoría del redondeo COMERCIAL MONETARIO (metal $ legacy + hechura).
+   *  Passthrough para que deriveMetalHechuraBreakdown no pierda estos campos
+   *  en su reconstrucción — mismo patrón que `physical` (POLICY
+   *  §R-Rounding-14 / Etapa C-comercial). Sin esto, el redondeo de la hechura
+   *  (`hechuraSale` post) llega sin su `pre`/`delta` y el card no lo muestra. */
+  metalSalePreRounding?:     number | null;
+  metalSaleRoundingDelta?:   number | null;
+  hechuraSalePreRounding?:   number | null;
+  hechuraSaleRoundingDelta?: number | null;
   /** B3 — Snapshot del redondeo COMERCIAL PHYSICAL. Passthrough para que
    *  deriveMetalHechuraBreakdown no pierda el campo en su reconstrucción
    *  (POLICY §R-Rounding-14 / Etapa C-comercial). */
@@ -3070,6 +3088,14 @@ export function deriveMetalHechuraBreakdown(
       metalSaleEstimated:   false,
       hechuraSaleEstimated: false,
       source:               "METAL_HECHURA",
+      // Etapa C-comercial — Passthrough de la auditoría del redondeo COMERCIAL
+      // MONETARIO (metal $ legacy + hechura). MISMO patrón que `physical`: sin
+      // esto, aunque la construcción de `exactBreakdown` los propague, este
+      // return los descartaba y el card no podía mostrar el redondeo de hechura.
+      ...(exactBreakdown.metalSalePreRounding     != null ? { metalSalePreRounding:     exactBreakdown.metalSalePreRounding }     : {}),
+      ...(exactBreakdown.metalSaleRoundingDelta   != null ? { metalSaleRoundingDelta:   exactBreakdown.metalSaleRoundingDelta }   : {}),
+      ...(exactBreakdown.hechuraSalePreRounding   != null ? { hechuraSalePreRounding:   exactBreakdown.hechuraSalePreRounding }   : {}),
+      ...(exactBreakdown.hechuraSaleRoundingDelta != null ? { hechuraSaleRoundingDelta: exactBreakdown.hechuraSaleRoundingDelta } : {}),
       // B2 (Etapa C-comercial) — Passthrough del snapshot PHYSICAL comercial.
       // Sin esto, aunque B1 le pase `physical` al helper, este return lo
       // descartaba y el snapshot v6 quedaba con `metalHechuraBreakdown.physical = null`.

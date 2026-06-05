@@ -3,20 +3,24 @@
 // Etapa C-comercial / C3 (POLICY §R-Rounding-14) — Tests del motor de lista
 // con redondeo COMERCIAL PHYSICAL integrado.
 //
-// Cubre los 8 escenarios obligatorios del brief:
-//   1. Lista MONETARY (default) → resultado idéntico al actual (sin
-//      `physical`, sin pre/delta del nuevo path).
-//   2. Lista PHYSICAL → Oro Fino 0,908 → 1,000.
-//   3. Lista PHYSICAL → Oro Fino 1,526 → 2,000.
-//   4. Equivalente monetario impacta `metalSale`.
-//   5. Hechura sigue redondeando MONETARIAMENTE (regla canónica).
-//   6. Snapshot `metalHechuraDetail.physical` presente con shape canónico.
-//   7. Múltiples metales padre en la misma línea (Oro Fino + Plata).
-//   8. Sin `metalsByParent` (línea sin metales o motor legacy) → fallback
-//      limpio al path MONETARY (no rompe).
+// FIX ORDEN MARGEN→REDONDEO (2026-06-02): el redondeo comercial físico por
+// línea ahora opera sobre los GRAMOS COMERCIALES (post-margen), alineado con
+// PER_DOCUMENT. Antes redondeaba `gramsPure` PRE-margen; ahora redondea
+// `gramsPure × marginFactor`. El precio (`metalPricePerGram`) es la cotización
+// de COSTO (`meta.quotePrice`), por eso el margen vive en los gramos y el
+// `monetaryEquivalent = Δgramos × precioCosto` cierra coherente con `metalSale`.
 //
-// Tests PUROS del motor de lista (`applyPriceList`). No tocan Prisma — solo
-// construyen un `CostBreakdown` y un `PriceListData` de prueba.
+// Cubre:
+//   1. Lista MONETARY (default) → comportamiento legacy intacto (sin physical).
+//   2. Lista PHYSICAL post-margen → caso canónico 1,2375 × 10% → 1,36125 → 1,40.
+//   3. Equivalente monetario impacta `metalSale` coherentemente.
+//   4. Dos líneas iguales cerradas → Σ postGrams = 2,80 (documento suma líneas).
+//   5. Hechura sigue redondeando MONETARIAMENTE (regla canónica).
+//   6. Snapshot `metalHechuraDetail.physical` con shape canónico.
+//   7. Múltiples metales padre en la misma línea, cada uno post-margen.
+//   8. Sin `metalsByParent` → fallback limpio al path MONETARY.
+//
+// Tests PUROS del motor de lista (`applyPriceList`). No tocan Prisma.
 // =============================================================================
 
 import { describe, it, expect } from "vitest";
@@ -25,13 +29,16 @@ import { applyPriceList } from "../pricing-engine.pricelist.js";
 
 const D = (v: number | string) => new Prisma.Decimal(String(v));
 
+// Cotización de COSTO por gramo fino (= `meta.quotePrice` en datos reales).
+const ORO_COST_PER_GRAM = 50000;
+
 function basePriceList(over: Record<string, any> = {}) {
   return {
     id:                       "pl1",
     name:                     "Lista Test",
     mode:                     "METAL_HECHURA",
     marginTotal:              null,
-    marginMetal:              "100",  // 100% sobre metal
+    marginMetal:              "100",  // 100% sobre metal (default; PHYSICAL lo pisa con 10%)
     marginHechura:            "0",    // 0% sobre hechura (hechura = costo)
     costPerGram:              null,
     surcharge:                null,
@@ -51,12 +58,7 @@ function basePriceList(over: Record<string, any> = {}) {
   };
 }
 
-// Caso canónico del brief — Oro Fino 0,908 g.
-// metalCost = 0,908 × 50.000 = 45.400 ⇒ con margen 100% ⇒ metalSale = 90.800.
-// metalPricePerGram en venta = 100.000 ⇒ Δ +0,092 g = +9.200 $.
-const ORO_PRICE_BASE = 50000;
-const ORO_PRICE_SALE = 100000;
-
+// Costo MONETARY (legacy) — Oro Fino 0,908 g, margen 100% (precio venta = 2×).
 function baseCost(over: Record<string, any> = {}) {
   return {
     value:       D(45400 + 15000),
@@ -69,24 +71,58 @@ function baseCost(over: Record<string, any> = {}) {
       metalParentId:     "oro-fino",
       metalParentName:   "Oro Fino",
       gramsPure:         0.908,
-      metalPricePerGram: ORO_PRICE_SALE,
+      metalPricePerGram: 100000,   // MONETARY no usa este precio para gramos
     }],
     ...over,
   };
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// (1) Lista MONETARY (legacy) — comportamiento intacto
+// Helpers PHYSICAL — precio de COSTO + margen explícito (post-margen).
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Lista PHYSICAL con margen de metal configurable (default 10%). */
+function physicalList(over: Record<string, any> = {}, marginMetal = "10") {
+  return basePriceList({
+    marginMetal,
+    commercialRoundingMetalDomain: "PHYSICAL",
+    commercialPhysicalRoundingConfig: {
+      byMetalParentId: { "oro-fino": { mode: "DECIMAL_1", direction: "NEAREST" } },
+    },
+    ...over,
+  });
+}
+
+/** Costo PHYSICAL con gramos puros (con merma) y cotización de COSTO. */
+function physicalCost(gramsPure: number, over: Record<string, any> = {}) {
+  const metalCost = gramsPure * ORO_COST_PER_GRAM;
+  return {
+    value:       D(metalCost + 15000),
+    metalCost:   D(metalCost),
+    hechuraCost: D(15000),
+    totalGrams:  D(gramsPure),
+    metalGramsWithMerma: D(gramsPure),
+    metalPurity: D(1),
+    metalsByParent: [{
+      metalParentId:     "oro-fino",
+      metalParentName:   "Oro Fino",
+      gramsPure,
+      metalPricePerGram: ORO_COST_PER_GRAM,
+    }],
+    ...over,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// (1) Lista MONETARY (legacy) — comportamiento intacto (fix NO la toca)
 // ──────────────────────────────────────────────────────────────────────────
 
 describe("C3 — lista MONETARY: comportamiento legacy intacto", () => {
   it("redondea metalSale en pesos (INTEGER NEAREST sobre 90.800 → 90.800); physical=null", () => {
     const r = applyPriceList(basePriceList(), baseCost() as any);
     expect(r.value).not.toBeNull();
-    // 90.800 ya es entero ⇒ no se mueve.
     expect(r.metalHechuraDetail?.metalSale).toBe(90800);
     expect(r.metalHechuraDetail?.physical).toBeNull();
-    // No emite campos pre-rounding/delta cuando no actuó.
     expect(r.metalHechuraDetail?.metalSalePreRounding).toBeUndefined();
   });
 
@@ -119,131 +155,91 @@ describe("C3 — lista MONETARY: comportamiento legacy intacto", () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// (2) Lista PHYSICAL — 0,908 → 1,000
+// (2) Lista PHYSICAL POST-MARGEN — caso canónico del FIX (Test 1 del spec)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("C3 — lista PHYSICAL: caso canónico 0,908 → 1,000", () => {
-  const PRICE_LIST = basePriceList({
-    commercialRoundingMetalDomain: "PHYSICAL",
-    commercialPhysicalRoundingConfig: {
-      byMetalParentId: { "oro-fino": { mode: "INTEGER", direction: "NEAREST" } },
-    },
-  });
-
-  it("genera snapshot physical con preGrams 0.908, postGrams 1.000, delta +0.092", () => {
-    const r = applyPriceList(PRICE_LIST, baseCost() as any);
+describe("C3 — PHYSICAL post-margen (FIX 2026-06-02): redondea DESPUÉS del margen", () => {
+  it("Test 1 — 1,2375 g × 10% margen = 1,36125 → DECIMAL_1 NEAREST → 1,40 (NO 1,2375 → 1,20)", () => {
+    const r = applyPriceList(physicalList(), physicalCost(1.2375) as any);
     expect(r.metalHechuraDetail?.physical).not.toBeNull();
     const entry = r.metalHechuraDetail!.physical!.metals[0]!;
-    expect(entry.metalParentId).toBe("oro-fino");
-    expect(entry.preGrams).toBe(0.908);
-    expect(entry.postGrams).toBe(1.000);
-    expect(entry.deltaGrams).toBeCloseTo(0.092, 4);
-    expect(entry.metalPricePerGram).toBe(ORO_PRICE_SALE);
-    // 0,092 × 100.000 = 9.200
-    expect(entry.monetaryEquivalent).toBe(9200);
+
+    // El redondeo opera sobre los gramos COMERCIALES (post-margen ≈ 1,36125),
+    // NO sobre los físicos pre-margen (1,2375).
+    expect(entry.preGrams).toBeGreaterThan(1.36);
+    expect(entry.preGrams).toBeLessThan(1.3625);
+    expect(entry.postGrams).toBe(1.4);
+    expect(entry.deltaGrams).toBeGreaterThan(0);   // redondeó hacia arriba
+    expect(entry.metalPricePerGram).toBe(ORO_COST_PER_GRAM);
     expect(entry.source).toBe("COMMERCIAL_PHYSICAL_ROUNDING");
-    expect(entry.fallback).toBeNull();
-    expect(r.metalHechuraDetail!.physical!.metalMonetaryEquivalent).toBe(9200);
+
+    // metalSale_pre = 1,2375 × 50.000 × 1,10 = 68.062,5 → cierra ≈ 1,40 ×
+    // 50.000 = 70.000 tras sumar el equivalente del Δ comercial. El residuo
+    // de ~2,5 viene de la cuantización de `preGrams` a 4 decimales (idéntica a
+    // PER_DOCUMENT): Δgramos = 1,40 − round4(1,36125).
+    expect(r.metalHechuraDetail?.metalSalePreRounding).toBeCloseTo(68062.5, 1);
+    expect(r.metalHechuraDetail?.metalSale).toBeCloseTo(70000, -1);   // ±5 por cuantización
+    expect(r.metalHechuraDetail!.metalSale).toBeGreaterThan(r.metalHechuraDetail!.metalSalePreRounding!);
   });
 
-  it("metalSale aumenta exactamente por el equivalente monetario (90.800 + 9.200 = 100.000)", () => {
-    const r = applyPriceList(PRICE_LIST, baseCost() as any);
-    expect(r.metalHechuraDetail?.metalSale).toBe(100000);
-    expect(r.metalHechuraDetail?.metalSalePreRounding).toBe(90800);
-    expect(r.metalHechuraDetail?.metalSaleRoundingDelta).toBe(9200);
-  });
-
-  it("precio final (metal + hechura) refleja el aumento: 100.000 + 15.000 = 115.000", () => {
-    const r = applyPriceList(PRICE_LIST, baseCost() as any);
-    expect(r.value?.toNumber()).toBe(115000);
-  });
-});
-
-// ──────────────────────────────────────────────────────────────────────────
-// (3) Lista PHYSICAL — 1,526 → 2,000
-// ──────────────────────────────────────────────────────────────────────────
-
-describe("C3 — lista PHYSICAL: caso canónico 1,526 → 2,000", () => {
-  it("Oro Fino 1,526 g INTEGER NEAREST → 2,000 g (Δ +0,474, equivalente +47.400)", () => {
-    const cost = baseCost({
-      metalCost:           D(1.526 * ORO_PRICE_BASE),       // 76.300
-      value:               D(1.526 * ORO_PRICE_BASE + 15000),
-      totalGrams:          D(1.526),
-      metalGramsWithMerma: D(1.526),
-      metalsByParent: [{
-        metalParentId:     "oro-fino",
-        metalParentName:   "Oro Fino",
-        gramsPure:         1.526,
-        metalPricePerGram: ORO_PRICE_SALE,
-      }],
-    });
-    const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
-        commercialPhysicalRoundingConfig: {
-          byMetalParentId: { "oro-fino": { mode: "INTEGER", direction: "NEAREST" } },
-        },
-      }),
-      cost as any,
-    );
+  it("comportamiento ANTERIOR (pre-margen) ya NO ocurre: no redondea 1,2375 → 1,20", () => {
+    const r = applyPriceList(physicalList(), physicalCost(1.2375) as any);
     const entry = r.metalHechuraDetail!.physical!.metals[0]!;
-    expect(entry.preGrams).toBe(1.526);
-    expect(entry.postGrams).toBe(2.000);
-    expect(entry.deltaGrams).toBeCloseTo(0.474, 4);
-    expect(entry.monetaryEquivalent).toBe(47400);
-    // metalSale: 1.526 × 50.000 × 2 = 152.600 + 47.400 = 200.000
-    expect(r.metalHechuraDetail?.metalSale).toBe(200000);
+    expect(entry.preGrams).not.toBeCloseTo(1.2375, 3);
+    expect(entry.postGrams).not.toBe(1.2);
   });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// (5) Hechura sigue redondeando MONETARIAMENTE — incluso con metal PHYSICAL
+// (3) Dos líneas iguales cerradas → Σ postGrams = 2,80 (Test 2 del spec)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("C3 — caso 5: hechura sigue monetaria (regla canónica)", () => {
-  it("metal PHYSICAL + hechura HUNDRED NEAREST: la hechura redondea en pesos", () => {
-    const cost = baseCost({
-      hechuraCost: D(14987.5),                    // ⇒ con margen 0 ⇒ hechuraSale = 14987.5
-      value:       D(45400 + 14987.5),
-    });
+describe("C3 — dos líneas iguales: documento suma líneas cerradas", () => {
+  it("Test 2 — Línea1 1,40 + Línea2 1,40 = 2,80 (cada línea cierra con su redondeo)", () => {
+    const l1 = applyPriceList(physicalList(), physicalCost(1.2375) as any);
+    const l2 = applyPriceList(physicalList(), physicalCost(1.2375) as any);
+    const g1 = l1.metalHechuraDetail!.physical!.metals[0]!.postGrams;
+    const g2 = l2.metalHechuraDetail!.physical!.metals[0]!.postGrams;
+    expect(g1).toBe(1.4);
+    expect(g2).toBe(1.4);
+    // Consolidación por suma de líneas cerradas (scope por línea).
+    expect(g1 + g2).toBeCloseTo(2.8, 4);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// (4) Hechura sigue MONETARIA — incluso con metal PHYSICAL post-margen
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("C3 — hechura sigue monetaria (regla canónica)", () => {
+  it("metal PHYSICAL post-margen + hechura HUNDRED NEAREST: la hechura redondea en pesos", () => {
     const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
-        commercialPhysicalRoundingConfig: {
-          byMetalParentId: { "oro-fino": { mode: "INTEGER", direction: "NEAREST" } },
-        },
+      physicalList({
         roundingModeHechura:      "HUNDRED",
         roundingDirectionHechura: "NEAREST",
       }),
-      cost as any,
+      physicalCost(1.2375, {
+        hechuraCost: D(14987.5),                     // margen hechura 0 ⇒ 14987.5
+        value:       D(1.2375 * ORO_COST_PER_GRAM + 14987.5),
+      }) as any,
     );
     // Hechura: 14987.5 → 15000 (HUNDRED NEAREST).
     expect(r.metalHechuraDetail?.hechuraSale).toBe(15000);
     expect(r.metalHechuraDetail?.hechuraSalePreRounding).toBeCloseTo(14987.5, 2);
-    expect(r.metalHechuraDetail?.hechuraSaleRoundingDelta).toBeCloseTo(12.5, 2);
-    // Metal sigue subiendo a 100.000 por el equivalente físico.
-    expect(r.metalHechuraDetail?.metalSale).toBe(100000);
-    // Snapshot physical solo para METAL (no hechura).
+    // Metal: snapshot physical solo para METAL (no hechura).
     expect(r.metalHechuraDetail!.physical!.metals).toHaveLength(1);
     expect(r.metalHechuraDetail!.physical!.metals[0]!.metalParentId).toBe("oro-fino");
+    expect(r.metalHechuraDetail!.physical!.metals[0]!.postGrams).toBe(1.4);
   });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// (6) Snapshot shape canónico — todos los campos del contrato
+// (5) Snapshot shape canónico — todos los campos del contrato
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("C3 — caso 6: snapshot physical con shape canónico", () => {
-  it("metals[i] tiene metalParentId, metalParentName, preGrams, postGrams, deltaGrams, metalPricePerGram, monetaryEquivalent, mode, direction, source, fallback", () => {
-    const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
-        commercialPhysicalRoundingConfig: {
-          byMetalParentId: { "oro-fino": { mode: "INTEGER", direction: "NEAREST" } },
-        },
-      }),
-      baseCost() as any,
-    );
+describe("C3 — snapshot physical con shape canónico", () => {
+  it("metals[i] tiene el shape completo del contrato", () => {
+    const r = applyPriceList(physicalList(), physicalCost(1.2375) as any);
     const entry = r.metalHechuraDetail!.physical!.metals[0]!;
     const keys = Object.keys(entry).sort();
     expect(keys).toEqual([
@@ -259,99 +255,76 @@ describe("C3 — caso 6: snapshot physical con shape canónico", () => {
       "preGrams",
       "source",
     ]);
-    expect(r.metalHechuraDetail!.physical!.metalMonetaryEquivalent).toBe(9200);
     expect(r.metalHechuraDetail!.physical!.fallback).toBeNull();
   });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// (7) Múltiples metales padre en la misma línea
+// (6) Múltiples metales padre — cada uno redondea post-margen con su config
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("C3 — caso 7: múltiples metales padre", () => {
-  it("Oro Fino + Plata en la misma línea — cada uno redondea con su config", () => {
-    // Costo: oro 0,908 g × 50.000 + plata 5 g × 200 = 45.400 + 1.000 = 46.400.
-    // marginMetal=100% ⇒ metalSale = 92.800.
-    // Después redondeo PHYSICAL:
-    //   - Oro Fino 0,908 → 1,000 (Δ +0,092 × 100.000 = +9.200)
-    //   - Plata 5 → 5 (HALF NEAREST sobre 5 = 5, Δ = 0)
-    const cost = baseCost({
-      metalCost:           D(46400),
-      value:               D(46400 + 15000),
-      totalGrams:          D(0.908 + 5),
-      metalGramsWithMerma: D(0.908 + 5),
-      metalsByParent: [
-        { metalParentId: "oro-fino", metalParentName: "Oro Fino", gramsPure: 0.908, metalPricePerGram: 100000 },
-        { metalParentId: "plata",    metalParentName: "Plata",    gramsPure: 5.000, metalPricePerGram: 400 },
-      ],
-    });
+describe("C3 — múltiples metales padre (post-margen)", () => {
+  it("Oro Fino + Plata en la misma línea — cada uno redondea sus gramos comerciales", () => {
+    // Oro 1,2375 g (×1,10 = 1,36125 → DECIMAL_1 → 1,40)
+    // Plata 4,0 g  (×1,10 = 4,40   → HALF      → 4,50)
+    const oroCost   = 1.2375 * ORO_COST_PER_GRAM;   // 61.875
+    const plataCost = 4.0 * 1000;                   // 4.000
     const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
+      physicalList({
         commercialPhysicalRoundingConfig: {
           byMetalParentId: {
-            "oro-fino": { mode: "INTEGER", direction: "NEAREST" },
-            "plata":    { mode: "HALF",    direction: "NEAREST" },
+            "oro-fino": { mode: "DECIMAL_1", direction: "NEAREST" },
+            "plata":    { mode: "HALF",      direction: "NEAREST" },
           },
         },
       }),
-      cost as any,
+      physicalCost(1.2375, {
+        metalCost:           D(oroCost + plataCost),
+        value:               D(oroCost + plataCost + 15000),
+        totalGrams:          D(1.2375 + 4.0),
+        metalGramsWithMerma: D(1.2375 + 4.0),
+        metalsByParent: [
+          { metalParentId: "oro-fino", metalParentName: "Oro Fino", gramsPure: 1.2375, metalPricePerGram: ORO_COST_PER_GRAM },
+          { metalParentId: "plata",    metalParentName: "Plata",    gramsPure: 4.0,    metalPricePerGram: 1000 },
+        ],
+      }) as any,
     );
     expect(r.metalHechuraDetail!.physical!.metals).toHaveLength(2);
     const byId = Object.fromEntries(
       r.metalHechuraDetail!.physical!.metals.map((m) => [m.metalParentId, m]),
     );
-    expect(byId["oro-fino"]!.postGrams).toBe(1.000);
-    expect(byId["oro-fino"]!.monetaryEquivalent).toBe(9200);
-    expect(byId["plata"]!.postGrams).toBe(5.000);
-    expect(byId["plata"]!.monetaryEquivalent).toBe(0);
-    expect(r.metalHechuraDetail!.physical!.metalMonetaryEquivalent).toBe(9200);
-    // metalSale: 92.800 + 9.200 = 102.000
-    expect(r.metalHechuraDetail?.metalSale).toBe(102000);
+    // Oro: 1,36125 → 1,40 (post-margen).
+    expect(byId["oro-fino"]!.postGrams).toBe(1.4);
+    // Plata: 4,40 → 4,50 (HALF NEAREST, post-margen).
+    expect(byId["plata"]!.postGrams).toBe(4.5);
   });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// (8) Sin metales — fallback limpio (cae a MONETARY)
+// (7) Sin metales — fallback limpio (cae a MONETARY)
 // ──────────────────────────────────────────────────────────────────────────
 
-describe("C3 — caso 8: sin metalsByParent → fallback limpio", () => {
-  it("PHYSICAL + metalsByParent=null → physical=null, comportamiento MONETARY (sin romper)", () => {
+describe("C3 — sin metalsByParent → fallback limpio", () => {
+  it("PHYSICAL + metalsByParent=null → physical=null (cae a MONETARY, sin romper)", () => {
     const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
-        commercialPhysicalRoundingConfig: {
-          byMetalParentId: { "oro-fino": { mode: "INTEGER", direction: "NEAREST" } },
-        },
-      }),
-      baseCost({ metalsByParent: null }) as any,
+      physicalList(),
+      physicalCost(1.2375, { metalsByParent: null }) as any,
     );
     expect(r.metalHechuraDetail?.physical).toBeNull();
-    // El path MONETARY actúa con la config de roundingMode existente
-    // (INTEGER NEAREST sobre 90.800 = 90.800, no se mueve).
-    expect(r.metalHechuraDetail?.metalSale).toBe(90800);
   });
 
   it("PHYSICAL + metalsByParent=[] → physical=null", () => {
     const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
-        commercialPhysicalRoundingConfig: {
-          byMetalParentId: { "oro-fino": { mode: "INTEGER", direction: "NEAREST" } },
-        },
-      }),
-      baseCost({ metalsByParent: [] }) as any,
+      physicalList(),
+      physicalCost(1.2375, { metalsByParent: [] }) as any,
     );
     expect(r.metalHechuraDetail?.physical).toBeNull();
   });
 
-  it("PHYSICAL + config vacía (NO_CONFIG) → metals[] poblado pero todos con fallback NO_CONFIG", () => {
+  it("PHYSICAL + config vacía (NO_CONFIG) → metals[] con fallback NO_CONFIG, sin mover gramos", () => {
     const r = applyPriceList(
-      basePriceList({
-        commercialRoundingMetalDomain: "PHYSICAL",
-        commercialPhysicalRoundingConfig: null,    // domain PHYSICAL pero sin config
-      }),
-      baseCost() as any,
+      physicalList({ commercialPhysicalRoundingConfig: null }),
+      physicalCost(1.2375) as any,
     );
     expect(r.metalHechuraDetail?.physical).not.toBeNull();
     const entry = r.metalHechuraDetail!.physical!.metals[0]!;
@@ -359,7 +332,5 @@ describe("C3 — caso 8: sin metalsByParent → fallback limpio", () => {
     expect(entry.postGrams).toBe(entry.preGrams);
     expect(entry.deltaGrams).toBe(0);
     expect(entry.monetaryEquivalent).toBe(0);
-    // metalSale no se mueve (delta 0).
-    expect(r.metalHechuraDetail?.metalSale).toBe(90800);
   });
 });

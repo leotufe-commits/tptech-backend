@@ -403,6 +403,16 @@ export interface SalePriceResult {
     /** FASE 1 — trazabilidad de cómo se llegó al breakdown. La UI puede
      *  ramificar el render según este valor. */
     source?: MetalHechuraBreakdownSource;
+    /** Etapa C-comercial — Auditoría del redondeo COMERCIAL MONETARIO
+     *  (subtotal $ del metal legacy + bucket hechura). `*PreRounding` = valor
+     *  antes del redondeo; `*RoundingDelta` = post − pre. Solo presentes cuando
+     *  el redondeo de ese dominio actuó. Aditivos y opcionales. Sin esto, el
+     *  redondeo de la hechura (HUNDRED, etc.) llega sin su pre/delta y el card
+     *  no puede mostrar la fila "Redondeo comercial". */
+    metalSalePreRounding?:     number | null;
+    metalSaleRoundingDelta?:   number | null;
+    hechuraSalePreRounding?:   number | null;
+    hechuraSaleRoundingDelta?: number | null;
     /** Etapa C-comercial — Snapshot del redondeo PHYSICAL del comercial.
      *  Solo presente cuando la lista operó con
      *  `commercialRoundingMetalDomain="PHYSICAL"` y el redondeo de gramos

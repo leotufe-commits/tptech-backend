@@ -359,3 +359,70 @@ describe("deriveMetalHechuraBreakdown — invariante de suma", () => {
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Etapa C-comercial — la auditoría del redondeo COMERCIAL MONETARIO
+// (metal $ legacy + hechura) DEBE sobrevivir a deriveMetalHechuraBreakdown.
+//
+// Regresión real: la lista "Desglosada" (roundingModeHechura=HUNDRED) redondea
+// hechuraSale 142.504,50 → 142.500 (delta −4,50). applyPriceList lo calcula,
+// pero la reconstrucción descartaba `*PreRounding`/`*RoundingDelta` (solo
+// reenviaba `physical`). Resultado: el card no podía mostrar "Redondeo
+// comercial −ARS 4,50". Estos campos son passthrough puro — mismo patrón que
+// `physical`.
+//
+// ⚠️ COMPAT LEGACY: `hechura*RoundingDelta`/`*PreRounding` pertenecen al carril
+// PER_LINE (redondeo de hechura PURA, pre-tax). El camino CANÓNICO es
+// PER_DOCUMENT (Etapa D'): el redondeo cae sobre el SALDO comercial post-tax y
+// se expone como `hechuraRoundingMonetaryImpact` /
+// `lineMonetarySaldoPostCommercialRounding` (ver commercial-document-rounding*
+// .test.ts). Este passthrough se mantiene solo para que las listas/snapshots
+// PER_LINE existentes sigan mostrando su fila — no es el contrato vigente.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("deriveMetalHechuraBreakdown — passthrough del redondeo comercial monetario", () => {
+  it("hechura HUNDRED: pre 142.504,50 / post 142.500 / delta −4,50 sobreviven", () => {
+    const exact: MetalHechuraExactDetail = {
+      metalSale:        347568.75,
+      hechuraSale:      142500,        // ya redondeado por la lista (HUNDRED)
+      metalMarginPct:   10,
+      hechuraMarginPct: 50,
+      hechuraSalePreRounding:   142504.5,
+      hechuraSaleRoundingDelta: -4.5,
+      metalSalePreRounding:     340312.5,
+      metalSaleRoundingDelta:   7256.25,
+    };
+    const r = deriveMetalHechuraBreakdown(baseInput({
+      metalCost:      309375,
+      hechuraCost:    95003,
+      costTotal:      404378,
+      basePrice:      490068.75,       // 347568.75 + 142500
+      priceSource:    "PRICE_LIST",
+      exactBreakdown: exact,
+    }))!;
+    expect(r.source).toBe("METAL_HECHURA");
+    // El valor final NO cambia (passthrough — no recalcula).
+    expect(r.hechuraSale).toBe(142500);
+    // Los campos de auditoría YA NO se pierden:
+    expect(r.hechuraSalePreRounding).toBe(142504.5);
+    expect(r.hechuraSaleRoundingDelta).toBe(-4.5);
+    expect(r.metalSalePreRounding).toBe(340312.5);
+    expect(r.metalSaleRoundingDelta).toBe(7256.25);
+  });
+
+  it("sin redondeo (campos ausentes en exact) → siguen ausentes (no inventa)", () => {
+    const exact: MetalHechuraExactDetail = {
+      metalSale:        650,
+      hechuraSale:      350,
+      metalMarginPct:   30,
+      hechuraMarginPct: 75,
+    };
+    const r = deriveMetalHechuraBreakdown(baseInput({
+      metalCost: 500, hechuraCost: 200, costTotal: 700, basePrice: 1000,
+      priceSource: "PRICE_LIST", exactBreakdown: exact,
+    }))!;
+    expect(r.hechuraSalePreRounding).toBeUndefined();
+    expect(r.hechuraSaleRoundingDelta).toBeUndefined();
+    expect(r.metalSalePreRounding).toBeUndefined();
+    expect(r.metalSaleRoundingDelta).toBeUndefined();
+  });
+});
