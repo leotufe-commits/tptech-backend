@@ -442,6 +442,14 @@ model UserPreference {
   /// Solo precarga UI (igual que los otros defaults). NO afecta pricing-engine.
   defaultGlobalDiscountType String?
 
+  /// Tipo de saldo predeterminado del usuario para Factura de ventas:
+  ///   · "UNIFIED"   → el operador prefiere saldo unificado (monetario).
+  ///   · "BREAKDOWN" → el operador prefiere saldo desglosado (metal + monetario).
+  ///   · null        → sin preferencia → delega a lista/tenant/fallback.
+  /// Nivel de la jerarquía R11.4 ENTRE cliente y lista de precios. El override
+  /// manual del documento y el default del cliente siguen teniendo prioridad.
+  defaultBalanceMode String?
+
   /// Layout personalizable del modal de Factura de ventas. JSON opaco
   /// para el backend (solo persiste y devuelve tal cual). El frontend
   /// valida el shape con `reconcileLayout` y aplica el default si es

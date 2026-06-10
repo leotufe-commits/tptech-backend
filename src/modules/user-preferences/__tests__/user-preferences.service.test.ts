@@ -52,6 +52,7 @@ describe("getMyPreference", () => {
       defaultChannelId: null,
       defaultCurrencyId: null,
       defaultGlobalDiscountType: null,
+      defaultBalanceMode: null,
       invoiceLayoutConfig: null,
       preferredInvoiceViewPreset: null,
       invoiceUiPreferences: null,

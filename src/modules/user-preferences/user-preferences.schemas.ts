@@ -63,6 +63,13 @@ const optInvoiceUiPreferences = z
   .nullable()
   .optional();
 
+// Tipo de saldo por defecto del usuario (UNIFIED / BREAKDOWN). `null` = sin
+// preferencia. Nivel R11.4 entre cliente y lista de precios.
+const optBalanceMode = z
+  .enum(["UNIFIED", "BREAKDOWN"])
+  .nullable()
+  .optional();
+
 export const updatePreferenceSchema = z.object({
   defaultWarehouseId: optId,
   defaultSellerId:    optId,
@@ -70,6 +77,7 @@ export const updatePreferenceSchema = z.object({
   defaultChannelId:   optId,
   defaultCurrencyId:  optId,
   defaultGlobalDiscountType: optGlobalDiscountType,
+  defaultBalanceMode: optBalanceMode,
   invoiceLayoutConfig: optInvoiceLayoutConfig,
   preferredInvoiceViewPreset: optInvoiceViewPreset,
   invoiceUiPreferences: optInvoiceUiPreferences,

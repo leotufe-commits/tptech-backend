@@ -79,6 +79,8 @@ export type SalesPreferenceDTO = {
   defaultChannelId: string | null;
   defaultCurrencyId: string | null;
   defaultGlobalDiscountType: GlobalDiscountType | null;
+  /** Tipo de saldo por defecto del usuario (nivel R11.4 entre cliente y lista). */
+  defaultBalanceMode: "UNIFIED" | "BREAKDOWN" | null;
   invoiceLayoutConfig: InvoiceLayoutConfig | null;
   preferredInvoiceViewPreset: InvoiceViewPreset | null;
   invoiceUiPreferences: InvoiceUiPreferences | null;
@@ -89,6 +91,14 @@ export type SalesPreferenceDTO = {
 function optDiscountType(v: any): GlobalDiscountType | null {
   const t = s(v).toUpperCase();
   if (t === "PERCENT" || t === "AMOUNT") return t;
+  return null;
+}
+
+/** Sanitiza el tipo de saldo del usuario. Solo "UNIFIED" | "BREAKDOWN";
+ *  cualquier otro valor → null (sin preferencia). */
+function optBalanceMode(v: any): "UNIFIED" | "BREAKDOWN" | null {
+  const t = s(v).toUpperCase();
+  if (t === "UNIFIED" || t === "BREAKDOWN") return t;
   return null;
 }
 
@@ -151,6 +161,7 @@ function toDTO(row: any): SalesPreferenceDTO {
     defaultChannelId: row?.defaultChannelId ?? null,
     defaultCurrencyId: row?.defaultCurrencyId ?? null,
     defaultGlobalDiscountType: safeType,
+    defaultBalanceMode: optBalanceMode(row?.defaultBalanceMode),
     invoiceLayoutConfig: optLayoutConfig(row?.invoiceLayoutConfig),
     preferredInvoiceViewPreset: optInvoiceViewPreset(row?.preferredInvoiceViewPreset),
     invoiceUiPreferences: optInvoiceUiPreferences(row?.invoiceUiPreferences),
@@ -247,6 +258,7 @@ export async function updateMyPreference(
     defaultChannelId:          optId(body?.defaultChannelId),
     defaultCurrencyId:         optId(body?.defaultCurrencyId),
     defaultGlobalDiscountType: optDiscountType(body?.defaultGlobalDiscountType),
+    defaultBalanceMode:        optBalanceMode(body?.defaultBalanceMode),
     invoiceLayoutConfig:       optLayoutConfig(body?.invoiceLayoutConfig),
     preferredInvoiceViewPreset: optInvoiceViewPreset(body?.preferredInvoiceViewPreset),
     invoiceUiPreferences:      optInvoiceUiPreferences(body?.invoiceUiPreferences),
@@ -257,12 +269,13 @@ export async function updateMyPreference(
   // Cualquier id que NO venga en body queda como `null` aquí (skip-friendly).
   const {
     defaultGlobalDiscountType: _t,
+    defaultBalanceMode: _b,
     invoiceLayoutConfig: _l,
     preferredInvoiceViewPreset: _p,
     invoiceUiPreferences: _u,
     ...ownershipPart
   } = sanitized;
-  void _t; void _l; void _p; void _u;
+  void _t; void _b; void _l; void _p; void _u;
   await validateOwnership(jewelryId, ownershipPart);
 
   // updateData = subconjunto de `sanitized` cuyos keys vinieron en body. Si
@@ -273,6 +286,7 @@ export async function updateMyPreference(
   for (const k of [
     "defaultWarehouseId", "defaultSellerId", "defaultPriceListId",
     "defaultChannelId", "defaultCurrencyId", "defaultGlobalDiscountType",
+    "defaultBalanceMode",
     "invoiceLayoutConfig", "preferredInvoiceViewPreset", "invoiceUiPreferences",
   ] as const) {
     if (inBody(k)) updateData[k] = (sanitized as Record<string, any>)[k];
@@ -295,6 +309,7 @@ export async function updateMyPreference(
     defaultChannelId:          sanitized.defaultChannelId,
     defaultCurrencyId:         sanitized.defaultCurrencyId,
     defaultGlobalDiscountType: sanitized.defaultGlobalDiscountType,
+    defaultBalanceMode:        sanitized.defaultBalanceMode,
     invoiceLayoutConfig:       layoutForPrisma(sanitized.invoiceLayoutConfig),
     preferredInvoiceViewPreset: sanitized.preferredInvoiceViewPreset,
     invoiceUiPreferences:      uiPrefsForPrisma(sanitized.invoiceUiPreferences),
