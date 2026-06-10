@@ -1443,10 +1443,12 @@ export const PRICING_LINE_SNAPSHOT_VERSION = 7;
 export type BalanceMode = "UNIFIED" | "BREAKDOWN";
 
 /** De dónde salió el `BalanceMode` resuelto. Auditoría/trazabilidad. Refleja la
- *  prioridad R11.4: documento → cliente → lista → tenant → fallback. */
+ *  prioridad R11.4: documento → cliente → preferencia usuario → lista →
+ *  tenant → fallback. */
 export type BalanceModeSource =
   | "DOCUMENT_OVERRIDE"
   | "ENTITY_DEFAULT"
+  | "USER_PREFERENCE"
   | "PRICELIST_DEFAULT"
   | "TENANT_DEFAULT"
   | "FALLBACK_UNIFIED";
@@ -1464,6 +1466,9 @@ export interface BalanceModeResolverInput {
   documentOverride?: BalanceMode | null;
   /** Default del cliente / proveedor (`CommercialEntity.balanceMode`). */
   entityDefault?:    BalanceMode | null;
+  /** Preferencia del usuario (`UserPreference.defaultBalanceMode`, scope
+   *  SALES_INVOICE). Se evalúa DESPUÉS del cliente y ANTES de la lista. */
+  userPreferenceDefault?: BalanceMode | null;
   /** Default de la lista de precios. Listas METAL_HECHURA típicamente BREAKDOWN. */
   priceListDefault?: BalanceMode | null;
   /** Default del tenant (`Jewelry.defaultBalanceMode`). Última red. */

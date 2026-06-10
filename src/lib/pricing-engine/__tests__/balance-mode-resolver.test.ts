@@ -193,3 +193,76 @@ describe("resolveBalanceMode — invariantes", () => {
     expect(after).toBe(before);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nivel USER_PREFERENCE (entre cliente y lista).
+// Prioridad: override → cliente → preferencia usuario → lista → tenant → fallback
+// ─────────────────────────────────────────────────────────────────────────────
+describe("resolveBalanceMode — nivel preferencia del usuario", () => {
+  it("usa la preferencia del usuario cuando no hay override ni cliente", () => {
+    const r = resolveBalanceMode({
+      documentOverride: null,
+      entityDefault:    null,
+      userPreferenceDefault: "UNIFIED",
+      priceListDefault: "BREAKDOWN",
+      tenantDefault:    "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "UNIFIED", source: "USER_PREFERENCE" });
+  });
+
+  it("el cliente GANA sobre la preferencia del usuario", () => {
+    const r = resolveBalanceMode({
+      documentOverride: null,
+      entityDefault:    "BREAKDOWN",
+      userPreferenceDefault: "UNIFIED",
+      priceListDefault: null,
+      tenantDefault:    null,
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "ENTITY_DEFAULT" });
+  });
+
+  it("el override del documento GANA sobre la preferencia del usuario", () => {
+    const r = resolveBalanceMode({
+      documentOverride: "UNIFIED",
+      entityDefault:    null,
+      userPreferenceDefault: "BREAKDOWN",
+      priceListDefault: null,
+      tenantDefault:    null,
+    });
+    expect(r).toEqual({ mode: "UNIFIED", source: "DOCUMENT_OVERRIDE" });
+  });
+
+  it("la preferencia del usuario GANA sobre la lista de precios", () => {
+    const r = resolveBalanceMode({
+      documentOverride: null,
+      entityDefault:    null,
+      userPreferenceDefault: "BREAKDOWN",
+      priceListDefault: "UNIFIED",
+      tenantDefault:    "UNIFIED",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "USER_PREFERENCE" });
+  });
+
+  it("sin preferencia del usuario → delega a la lista de precios", () => {
+    const r = resolveBalanceMode({
+      documentOverride: null,
+      entityDefault:    null,
+      userPreferenceDefault: null,
+      priceListDefault: "BREAKDOWN",
+      tenantDefault:    "UNIFIED",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "PRICELIST_DEFAULT" });
+  });
+
+  it("valor no-enum en preferencia del usuario → se ignora (delega)", () => {
+    const r = resolveBalanceMode({
+      documentOverride: null,
+      entityDefault:    null,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      userPreferenceDefault: "MIXTO" as any,
+      priceListDefault: null,
+      tenantDefault:    "UNIFIED",
+    });
+    expect(r).toEqual({ mode: "UNIFIED", source: "TENANT_DEFAULT" });
+  });
+});

@@ -574,6 +574,29 @@ export interface SaleDocumentTotalsInput {
    * Default 0 (sin metal).
    */
   metalValuationSumForCommercialRounding?: number;
+  /**
+   * Etapa Σ-round (POLICY §R-Rounding-15, canónico 2026-06-03) — Snapshot
+   * comercial PRECOMPUTADO por el caller a partir de `Σ round(línea)`.
+   *
+   * Cuando viene poblado, `computeSaleDocumentTotals` lo usa TAL CUAL:
+   *   · `commercialDocumentRoundingApplied = commercialDocumentRoundingPrecomputed`
+   *   · `commercialDelta = commercialDocumentRoundingPrecomputed.totalAdjustment`
+   * y NO ejecuta `applyCommercialDocumentRounding` (que hace `round(Σ)` sobre
+   * el agregado). Así el total del comprobante consolida la suma de los
+   * valores comerciales finales VISIBLES por línea (metal + hechura), idéntico
+   * a lo que el operador ve y suma artículo por artículo.
+   *
+   * El caller (sales.service) lo construye con
+   * `consolidateCommercialDocFromPerLine` a partir de los MISMOS helpers
+   * per-línea que alimentan el display (`computeLineCommercialRoundingMetals`
+   * + `computeLineAutonomousCommercialMoney`) → footer = Σ líneas por
+   * construcción, y preview = confirm (ambos arman el precomputed igual).
+   *
+   * Cuando es `null`/omitido, se cae al camino legacy `round(Σ)` vía
+   * `commercialDocumentRounding` (back-compat con callers/tests que no lo
+   * conocen). Solo aplica a scope BREAKDOWN; UNIFIED sigue por `round(Σ)`.
+   */
+  commercialDocumentRoundingPrecomputed?: CommercialDocRoundingApplied | null;
 }
 
 /**
@@ -1105,7 +1128,16 @@ export function computeSaleDocumentTotals(
   const totalComercialPreCommercialRounding = round2(taxableBase + taxAmount);
   let commercialDocumentRoundingApplied: CommercialDocRoundingApplied | null = null;
   let totalComercialPostCommercialRounding = totalComercialPreCommercialRounding;
-  if (input.commercialDocumentRounding) {
+  if (input.commercialDocumentRoundingPrecomputed) {
+    // ── Etapa Σ-round (canónico) — el caller ya consolidó `Σ round(línea)`.
+    // El motor NO recalcula: usa el snapshot precomputado tal cual y suma su
+    // `totalAdjustment` al total. Misma posición en el pipeline que el camino
+    // legacy (post-tax, pre-envío/pago/financiero) — solo cambia el ORIGEN del
+    // delta (Σ round línea en vez de round Σ agregado).
+    commercialDocumentRoundingApplied = input.commercialDocumentRoundingPrecomputed;
+    const adj = commercialDocumentRoundingApplied?.totalAdjustment ?? 0;
+    totalComercialPostCommercialRounding = round2(totalComercialPreCommercialRounding + adj);
+  } else if (input.commercialDocumentRounding) {
     const commercialResult = applyCommercialDocumentRounding({
       totalComercialPostTax: totalComercialPreCommercialRounding,
       metalValuationSum:     input.metalValuationSumForCommercialRounding ?? 0,

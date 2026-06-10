@@ -15,6 +15,7 @@ import { describe, it, expect } from "vitest";
 import {
   aggregateMetalsForCommercialDocRounding,
   computeLineCommercialRoundingMetals,
+  computeLineAutonomousCommercialMoney,
 } from "../commercial-doc-rounding-wiring.js";
 import type { CommercialDocRoundingPartConfig } from "../../../lib/pricing-engine/commercial-document-rounding.js";
 
@@ -206,5 +207,72 @@ describe("computeLineCommercialRoundingMetals — gramos comerciales PER-LÍNEA"
     });
     expect(out.get(0)).toHaveLength(1);
     expect(out.get(1)).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Listas mixtas (Opción 1, 2026-06-03) — config de redondeo POR LÍNEA.
+// Cada línea usa la config de SU lista; sin entrada → cae al default (`metalCfg`
+// / `hechuraCfg`). Prueba que en mixto cada línea conserva su redondeo propio.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("config por línea — metalCfgByLineIdx / hechuraCfgByLineIdx (mixto)", () => {
+  const NONE: CommercialDocRoundingPartConfig = { mode: "NONE", direction: "NEAREST" };
+  const HUNDRED_NEAREST: CommercialDocRoundingPartConfig = { mode: "HUNDRED", direction: "NEAREST" };
+
+  it("metalCfgByLineIdx: línea 0 redondea (DECIMAL_1), línea 1 sin config (NONE) → no redondea", () => {
+    // Ambas líneas mismo Oro (1,2375 g × 1,10 = 1,36125). L0 con DECIMAL_1 → 1,40;
+    // L1 sin entrada en el map → usa metalCfg default NONE → postGrams = preGrams.
+    const agg = aggregateMetalsForCommercialDocRounding([
+      lineWith(1, [{ parentId: ORO, name: "Oro Fino", gramsPerUnit: 1.2375, price: 100 }]),
+      lineWith(1, [{ parentId: ORO, name: "Oro Fino", gramsPerUnit: 1.2375, price: 100 }]),
+    ]);
+    const out = computeLineCommercialRoundingMetals({
+      gramsPureByParentByLineIdx: agg.gramsPureByParentByLineIdx,
+      metalNameById:              nameMap([ORO, "Oro Fino"]),
+      marginFactorByLineIdx:      new Map([[0, 1.10], [1, 1.10]]),
+      metalCfg:                   NONE,                               // default
+      metalCfgByLineIdx:          new Map([[0, DECIMAL_1_NEAREST]]),  // solo L0 redondea
+      lineCount:                  2,
+    });
+    expect(out.get(0)![0].postGrams).toBe(1.4);                       // L0 redondeada
+    expect(out.get(1)![0].postGrams).toBeCloseTo(1.3613, 4);          // L1 sin redondeo (= pre)
+    expect(out.get(1)![0].deltaGrams).toBe(0);
+  });
+
+  it("hechuraCfgByLineIdx: línea 0 redondea saldo (HUNDRED), línea 1 sin config → no redondea", () => {
+    const metals = computeLineCommercialRoundingMetals({
+      gramsPureByParentByLineIdx: new Map(),  // sin metales → solo importa el saldo
+      metalNameById:              new Map(),
+      marginFactorByLineIdx:      new Map(),
+      metalCfg:                   NONE,
+      lineCount:                  2,
+    });
+    const out = computeLineAutonomousCommercialMoney({
+      lineCommercialRoundingMetals: metals,
+      refValueByParent:             new Map(),
+      lineTotalWithTaxByIdx:        new Map([[0, 185475.21], [1, 185475.21]]),
+      metalSaleSumByIdx:            new Map([[0, 0], [1, 0]]),
+      hechuraCfg:                   NONE,                               // default
+      hechuraCfgByLineIdx:          new Map([[0, HUNDRED_NEAREST]]),    // solo L0 redondea
+      lineCount:                    2,
+    });
+    // L0: saldo 185.475,21 → HUNDRED NEAREST → 185.500.
+    expect(out.get(0)!.lineMonetarySaldoPostCommercialRounding).toBe(185500);
+    // L1: sin config → NONE → saldo sin redondear.
+    expect(out.get(1)!.lineMonetarySaldoPostCommercialRounding).toBeCloseTo(185475.21, 2);
+  });
+
+  it("sin los maps por línea → usa el cfg único (back-compat)", () => {
+    const agg = aggregateMetalsForCommercialDocRounding([
+      lineWith(1, [{ parentId: ORO, name: "Oro Fino", gramsPerUnit: 1.2375, price: 100 }]),
+    ]);
+    const out = computeLineCommercialRoundingMetals({
+      gramsPureByParentByLineIdx: agg.gramsPureByParentByLineIdx,
+      metalNameById:              nameMap([ORO, "Oro Fino"]),
+      marginFactorByLineIdx:      new Map([[0, 1.10]]),
+      metalCfg:                   DECIMAL_1_NEAREST,   // sin metalCfgByLineIdx
+      lineCount:                  1,
+    });
+    expect(out.get(0)![0].postGrams).toBe(1.4);
   });
 });

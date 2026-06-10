@@ -309,6 +309,8 @@ export async function previewSale(req: any, res: Response) {
           ? balanceModeOverride
           : null,
       manualAdjustment:     manualAdjustmentInput,
-    }),
+    },
+    // userId → nivel "preferencia del usuario" del Balance Mode (R11.4).
+    s(req.userId || req.user?.id || "") || null),
   );
 }

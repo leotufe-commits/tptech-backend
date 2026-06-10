@@ -1460,6 +1460,82 @@ Cuando se ejecute (después del cierre de Factura de Ventas):
   - §R-Rounding-14:1214 → estado de cumplimiento del comercial: ⚠️ Legacy.
   - §R-Rounding-15 (esta sección) → trayectoria de migración formal.
 
+#### 7. ACTUALIZACIÓN 2026-06-03 — Consolidación comercial PER_DOCUMENT = `Σ round(línea)` (canónico)
+
+> **Decisión funcional aprobada por el operador (2026-06-03).** Revierte el
+> sentido descripto en los puntos 1-6 de arriba para la capa
+> `commercialDocumentRounding` (Etapa D' BREAKDOWN). Los puntos 1-6 quedan como
+> registro histórico del plan previo; **esta subsección es la regla vigente.**
+
+**Regla canónica nueva.** El Redondeo Comercial PER_DOCUMENT en modo BREAKDOWN
+consolida el comprobante como la **SUMA de los valores comerciales finales
+visibles por línea** (`Σ round(línea)`), **NO** como el redondeo del agregado
+documental (`round(Σ)`):
+
+```
+footerMetalGrams      = Σ_líneas  round(gramsSale_línea)         por metal padre
+footerMonetaryAmount  = Σ_líneas  round(saldoMonetario_línea)
+totalComercialDoc     = Σ_líneas  lineTotalWithTaxPostCommercialRounding
+```
+
+**Motivación.** El operador ve el valor comercial final POR LÍNEA (metal y
+monetario) y espera que el footer / "Total del comprobante" sea la suma exacta
+de lo visible, sin residuos por `round(Σ) ≠ Σ round`. La consistencia
+display↔total prima sobre la cota `±step/2` del agregado.
+
+**Invariante obligatoria** (verificable — `consolidateCommercialDocFromPerLine.test.ts`):
+
+```
+METAL comercial (Σ metalSale + Σ metalRoundingMonetaryImpact)
+  + MONETARIO comercial (Σ lineMonetarySaldoPostCommercialRounding)
+  === total comercial del comprobante     (sin residuo round(Σ) vs Σ round)
+```
+
+**Dominios disjuntos (sin cambios respecto a §R-Rounding-14).** El equivalente
+monetario del redondeo de gramos vive en `breakdown.metals[*].monetaryEquivalent`
+/ `breakdown.metalMonetaryEquivalent`; el bucket hechura/saldo en
+`breakdown.hechura`. NUNCA se mezclan.
+
+**Orden inmutable (sin cambios).** El redondeo comercial sigue siendo post-tax,
+pre-envío/pago/financiero. El **redondeo financiero queda como capa POSTERIOR**
+sobre el total ya consolidado: `totalFinal = totalComercial + redondeoFinanciero`.
+
+**Implementación (SSOT):**
+- `commercial-doc-rounding-wiring.ts` → `consolidateCommercialDocFromPerLine`
+  arma el snapshot `Σ round(línea)` a partir de los MISMOS helpers per-línea que
+  alimentan el display (`computeLineCommercialRoundingMetals` +
+  `computeLineAutonomousCommercialMoney`) ⇒ footer = suma visual por construcción.
+- `pricing-engine.document.ts` → `computeSaleDocumentTotals` acepta
+  `commercialDocumentRoundingPrecomputed`. Cuando viene, lo usa tal cual
+  (snapshot + `totalAdjustment`) y NO ejecuta `applyCommercialDocumentRounding`
+  (`round(Σ)`). `previewSale` y `confirmSale` arman el precomputed idéntico ⇒
+  preview = confirmación.
+- Granularidad del gramo POR LÍNEA: **nivel línea** (round del agregado de la
+  línea, qty incluida) vía `computeCommercialPostGrams`. El redondeo PER_UNIT
+  dentro de una línea NO se usa.
+
+**Alcance.** Solo scope **BREAKDOWN** (footer DESGLOSADO). UNIFIED conserva
+`round(Σ)` sobre el total comercial. `applyCommercialDocumentRounding` (round Σ)
+permanece como camino legacy/fallback (UNIFIED, snapshots históricos, callers
+sin precomputed).
+
+**Inmutabilidad histórica.** Ventas confirmadas previas NO se modifican (snapshot
+inmutable). El cambio aplica a ventas nuevas con listas PER_DOCUMENT BREAKDOWN.
+
+#### 8. (RESERVADO) — Opción 2 (identidad comercial de línea en MIXTO)
+
+> **REVERTIDA 2026-06-03.** La Opción 2 (supresión PER_LINE + consolidación del
+> subconjunto desglosado en documentos MIXTOS) se implementó y luego se
+> **revirtió** por una regresión: en mixto producía un MONETARIO inválido
+> (`83.059,70`). El modo MIXTO permanece en **Opción 1** (display per-línea
+> únicamente, sin supresión ni consolidación documental; `Sale.total` intacto).
+> Fase 0/1 (`lineCommercialSummary`) NO se tocó. Una futura reimplementación
+> debe validarse end-to-end (preview + confirm) con los 3 escenarios
+> (Desglosada+Desglosada, Unificada+Unificada, Unificada+Desglosada) antes de
+> activarse.
+
+<!-- Contenido original de la Opción 2 retirado en el rollback. -->
+
 ---
 
 ## §Tax & Discounts Pipeline — modelo fiscal oficial TPTech

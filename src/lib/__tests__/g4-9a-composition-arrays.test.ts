@@ -77,9 +77,13 @@ describe("F1.3 #9-A — extractCompositionMetals", () => {
     ]);
     const items = extractCompositionMetals(steps, map);
     expect(items).toHaveLength(2);
-    expect(items[0]).toEqual({
+    // De-fragilizado (test frágil) — `toMatchObject` tolera campos ADITIVOS
+    // nuevos en el output sin romper; sigue validando exactamente estas claves.
+    expect(items[0]).toMatchObject({
       costLineId:      "cl-m1",
       metalVariantId:  "mv-1",
+      // Este fixture no setea meta.metalId → metalParentId null (fallback).
+      metalParentId:   null,
       metalName:       "Oro",
       // Fase 2.4 — variantName propagado desde MetalVariantInfo del map.
       // Este fixture no setea variantName en el map → null (fallback al
@@ -102,6 +106,31 @@ describe("F1.3 #9-A — extractCompositionMetals", () => {
     expect(items[1].metalVariantId).toBe("mv-2");
     expect(items[1].metalName).toBe("Plata");
     expect(items[1].lineCost).toBe(400);
+  });
+
+  it("propaga metalParentId desde meta.metalId (identidad del metal padre)", () => {
+    const steps = [
+      makeStep("COST_LINES_METAL", 600, {
+        costLineId: "cl-m1", variantId: "mv-1", metalId: "metal-oro-fino",
+        qty: "1.30", merma: 5, quotePrice: "400.00",
+      }),
+    ];
+    const map = new Map([
+      ["mv-1", { purity: 0.75, purityLabel: "18k", metalName: "Oro", variantName: null }],
+    ]);
+    const items = extractCompositionMetals(steps, map);
+    // metalParentId = meta.metalId (MISMA identidad que lineCommercialRoundingMetals).
+    expect(items[0].metalParentId).toBe("metal-oro-fino");
+    // NO reemplaza la variante.
+    expect(items[0].metalVariantId).toBe("mv-1");
+  });
+
+  it("metalParentId null cuando meta.metalId ausente (snapshot viejo → fallback)", () => {
+    const steps = [
+      makeStep("COST_LINES_METAL", 600, { costLineId: "cl", variantId: "mv-1", qty: "1", merma: 0 }),
+    ];
+    const items = extractCompositionMetals(steps, undefined);
+    expect(items[0].metalParentId).toBeNull();
   });
 
   it("baseline correct: sin steps METAL → array vacío (nunca undefined)", () => {

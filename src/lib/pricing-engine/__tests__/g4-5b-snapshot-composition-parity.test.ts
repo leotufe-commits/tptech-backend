@@ -237,7 +237,7 @@ describe("snapshot parity — products/services preservan todos los campos", () 
     );
     // Construimos el snapshot directamente con la composition armada.
     // Cero recálculo monetario en el path snapshot — passthrough estructural.
-    const snap = { composition } as PricingLineSnapshot;
+    const snap = { composition } as unknown as PricingLineSnapshot;
 
     // Products
     const p = snap.composition!.products[0];

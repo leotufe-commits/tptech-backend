@@ -120,10 +120,11 @@ describe("computeSaleDocumentTotals — orden de aplicación: canal → cupón �
     expect(out.taxableBase).toBe(980);
     // totalBeforeTax = taxableBase + shipping = 980 + 80 = 1060
     expect(out.totalBeforeTax).toBe(1060);
-    // totalWithTax = totalBeforeTax + tax = 1060 + 100 = 1160
-    expect(out.totalWithTax).toBe(1160);
-    // total = totalWithTax + payment + rounding = 1160 + 50 − 0.5 = 1209.5
-    expect(out.total).toBeCloseTo(1209.5, 2);
+    // §Tax.4 — globalDiscount 20 baja taxableBase (1000→980), ratio 0.98 → el
+    // tax escala 100→98. totalWithTax = totalBeforeTax + tax = 1060 + 98 = 1158
+    expect(out.totalWithTax).toBe(1158);
+    // total = totalWithTax + payment + rounding = 1158 + 50 − 0.5 = 1207.5
+    expect(out.total).toBeCloseTo(1207.5, 2);
   });
 
   it("total nunca es negativo", () => {
@@ -177,8 +178,10 @@ describe("computeSaleDocumentTotals — escenario combinado", () => {
     expect(out.channelAdjustmentAmount).toBe(105);
     expect(out.couponDiscountAmount).toBe(200);
     expect(out.taxableBase).toBe(2005);
-    expect(out.taxAmount).toBe(210);
-    expect(out.total).toBe(2215);
+    // §Tax.4 — taxableBase 2005 < subtotal 2100 (cupón) → ratio 0.95476 → el
+    // tax escala 210 × 0.95476 = 200.5. total = 2005 + 200.5 = 2205.5.
+    expect(out.taxAmount).toBe(200.5);
+    expect(out.total).toBe(2205.5);
   });
 
   it("redondeo de centavos al sumar muchas líneas", () => {
@@ -1111,10 +1114,10 @@ describe("computeSaleDocumentTotals — Rounding deferred de lista en input.roun
       shippingAmount:       200,
       roundingAdjustment:   -100,  // delta del rounding deferred
     });
-    // subtotal=1000, canal=+100, taxableBase=1100, tax=210 (sin scaling porque
-    // ratio=1), totalBeforeTax=1100+200=1300, totalWithTax=1300+210=1510,
-    // total=1510 + 0(payment) + (-100)(rounding) = 1410.
-    expect(out.total).toBe(1410);
+    // §Tax.4 — canal +10% SUBE taxableBase (1000→1100), ratio 1.1 → el tax
+    // escala 210→231. totalBeforeTax=1100+200=1300, totalWithTax=1300+231=1531,
+    // total=1531 + 0(payment) + (-100)(rounding) = 1431.
+    expect(out.total).toBe(1431);
   });
 
   it("PARIDAD VISUAL: Σ lineTotalWithTax === documentTotals.total cuando hay rounding deferred TOTAL", () => {

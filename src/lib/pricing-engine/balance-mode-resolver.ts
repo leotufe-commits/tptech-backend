@@ -5,9 +5,10 @@
 // Aplica la prioridad oficial (POLICY.md §11 R11.4):
 //   1. Override manual del documento (`Sale.balanceModeOverride`)
 //   2. Default del cliente/proveedor (`CommercialEntity.balanceMode`)
-//   3. Default de la lista de precios (`PriceList.balanceMode`)
-//   4. Default del tenant (`Jewelry.defaultBalanceMode`)
-//   5. Fallback → `UNIFIED`
+//   3. Preferencia del usuario (`UserPreference.defaultBalanceMode`)
+//   4. Default de la lista de precios (`PriceList.balanceMode`)
+//   5. Default del tenant (`Jewelry.defaultBalanceMode`)
+//   6. Fallback → `UNIFIED`
 //
 // Función pura: sin side effects, sin DB, sin async. Testeable aisladamente.
 //
@@ -49,6 +50,9 @@ export function resolveBalanceMode(
   }
   if (isBalanceMode(input.entityDefault)) {
     return { mode: input.entityDefault, source: "ENTITY_DEFAULT" };
+  }
+  if (isBalanceMode(input.userPreferenceDefault)) {
+    return { mode: input.userPreferenceDefault, source: "USER_PREFERENCE" };
   }
   if (isBalanceMode(input.priceListDefault)) {
     return { mode: input.priceListDefault, source: "PRICELIST_DEFAULT" };

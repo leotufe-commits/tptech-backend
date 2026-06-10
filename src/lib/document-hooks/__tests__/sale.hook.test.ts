@@ -521,6 +521,159 @@ describe("T56 — Fase 3B.6: BREAKDOWN crea metalEntries", () => {
   });
 });
 
+describe("Ajuste manual → cuenta corriente registra la deuda FINAL", () => {
+  // Helper: snapshot BREAKDOWN mínimo (sólo los campos que el hook lee).
+  function manualBreakdownSnapshot(args: {
+    monetaryAdjustment: number;
+    metalMonetaryEquivalent?: number;
+    metals?: Array<{ metalParentId: string | null; metalParentName?: string; postGrams: number }>;
+  }): any {
+    const metalEq = args.metalMonetaryEquivalent ?? 0;
+    return {
+      scope: "BREAKDOWN",
+      breakdown: {
+        metals: (args.metals ?? []).map((m) => ({
+          metalParentId:      m.metalParentId,
+          metalParentName:    m.metalParentName ?? "",
+          preGrams:           0,
+          postGrams:          m.postGrams,
+          deltaGrams:         0,
+          metalPricePerGram:  0,
+          monetaryEquivalent: 0,
+        })),
+        monetary: { preAmount: 0, amount: args.monetaryAdjustment, postAmount: args.monetaryAdjustment },
+      },
+      totals: {
+        monetaryAdjustment:      args.monetaryAdjustment,
+        metalMonetaryEquivalent: metalEq,
+        totalMonetaryAdjustment: args.monetaryAdjustment + metalEq,
+      },
+      audit: { appliedBy: null, appliedAt: "2026-06-01T00:00:00.000Z", reason: null },
+    };
+  }
+
+  // Test 1 — UNIFICADO registra el Total Final (engine 523.300, ajuste -3.300).
+  it("Test 1 — UNIFICADO: amountOriginal = Sale.total final (520.000)", async () => {
+    const sale = makeSaleRecord({ total: { toString: () => "520000" } });
+    const { tx, state } = buildMockTx({ sale });
+
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "UNIFIED",
+      // Un ajuste UNIFIED ya está reflejado en Sale.total; el hook lee el total.
+      manualAdjustmentSnapshot: {
+        scope: "UNIFIED",
+        unified: { engineTotal: 523300, amount: -3300, postAmount: 520000 },
+        totals: { monetaryAdjustment: -3300, metalMonetaryEquivalent: 0, totalMonetaryAdjustment: -3300 },
+        audit: { appliedBy: null, appliedAt: "2026-06-01T00:00:00.000Z", reason: null },
+      } as any,
+    });
+
+    const mov = state.createdMovements[0];
+    expect(mov.amountBase.toString()).toBe("520000");
+    expect(mov.amountOriginal.toString()).toBe("520000");
+    expect(state.createdMetalEntries).toHaveLength(0);
+  });
+
+  // Test 2 — DESGLOSADO con ajuste monetario: saldo final, metal intacto.
+  it("Test 2 — DESGLOSADO ajuste monetario: saldo monetario refleja el final (185.500)", async () => {
+    const sale = makeSaleRecord({ total: { toString: () => "335500" } });
+    const { tx, state } = buildMockTx({ sale });
+    const bd = makeBreakdown({
+      metals: [{
+        metalParentId: "oro-fino", metalParentName: "Oro Fino",
+        gramsOriginal: 2, purity: 0.75, gramsPure: 1.5,
+        quotePriceSnapshot: 100000, valuationMonetary: 150000,
+        valuationCurrencyCode: "ARS", sourceLineIds: ["line-1"],
+      }],
+      monetaryBalance: { amount: 185475, currencyCode: "ARS", currencyRate: 1, amountBase: 185475 },
+    });
+
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN",
+      balanceBreakdown: bd,
+      manualAdjustmentSnapshot: manualBreakdownSnapshot({ monetaryAdjustment: 25 }),
+    });
+
+    const mov = state.createdMovements[0];
+    // 185.475 (pre) + 25 (delta monetario) = 185.500.
+    expect(mov.amountBase.toString()).toBe("185500");
+    expect(mov.amountOriginal.toString()).toBe("185500");
+    // Metal SIN cambios (el ajuste fue monetario).
+    expect(state.createdMetalEntries).toHaveLength(1);
+    expect(state.createdMetalEntries[0].gramsPure.toString()).toBe("1.5");
+  });
+
+  // Test 3 — DESGLOSADO con ajuste de gramos: metal final 1,100 g.
+  it("Test 3 — DESGLOSADO ajuste de gramos: gramsPure persiste el final (1,100 g)", async () => {
+    const sale = makeSaleRecord({ total: { toString: () => "160000" } });
+    const { tx, state } = buildMockTx({ sale });
+    const bd = makeBreakdown({
+      metals: [{
+        metalParentId: "oro-fino", metalParentName: "Oro Fino",
+        gramsOriginal: 1.05, purity: 1, gramsPure: 1.05,
+        quotePriceSnapshot: 100000, valuationMonetary: 105000,
+        valuationCurrencyCode: "ARS", sourceLineIds: ["line-1"],
+      }],
+      monetaryBalance: { amount: 50000, currencyCode: "ARS", currencyRate: 1, amountBase: 50000 },
+    });
+
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN",
+      balanceBreakdown: bd,
+      manualAdjustmentSnapshot: manualBreakdownSnapshot({
+        monetaryAdjustment: 0,
+        metalMonetaryEquivalent: 5000,
+        metals: [{ metalParentId: "oro-fino", metalParentName: "Oro Fino", postGrams: 1.1 }],
+      }),
+    });
+
+    expect(state.createdMetalEntries).toHaveLength(1);
+    const entry = state.createdMetalEntries[0];
+    // gramsPure POST-ajuste (1,05 + 0,05 = 1,10).
+    expect(entry.gramsPure.toString()).toBe("1.1");
+    // gramsOriginal reescalado manteniendo pureza 1 → 1,10.
+    expect(entry.gramsOriginal.toString()).toBe("1.1");
+    // Saldo monetario sin cambios (el ajuste fue de gramos).
+    expect(state.createdMovements[0].amountBase.toString()).toBe("50000");
+  });
+
+  // Test 4 — Invariante: deuda monetaria + valuación metálica registrada = Sale.total.
+  it("Test 4 — DESGLOSADO invariante: monetario + Σ(gramsPure × cotización) = Sale.total", async () => {
+    const sale = makeSaleRecord({ total: { toString: () => "390500" } });
+    const { tx, state } = buildMockTx({ sale });
+    const quote = 100000;
+    const bd = makeBreakdown({
+      metals: [{
+        metalParentId: "oro-fino", metalParentName: "Oro Fino",
+        gramsOriginal: 2, purity: 1, gramsPure: 2.0,
+        quotePriceSnapshot: quote, valuationMonetary: 200000,
+        valuationCurrencyCode: "ARS", sourceLineIds: ["line-1"],
+      }],
+      monetaryBalance: { amount: 185475, currencyCode: "ARS", currencyRate: 1, amountBase: 185475 },
+    });
+
+    await onSaleConfirmed(tx as any, "sale-1", {
+      balanceMode: "BREAKDOWN",
+      balanceBreakdown: bd,
+      manualAdjustmentSnapshot: manualBreakdownSnapshot({
+        monetaryAdjustment: 25,
+        metalMonetaryEquivalent: 5000,
+        metals: [{ metalParentId: "oro-fino", metalParentName: "Oro Fino", postGrams: 2.05 }],
+      }),
+    });
+
+    const mov = state.createdMovements[0];
+    const entry = state.createdMetalEntries[0];
+    const monetaryRegistrada = Number(mov.amountBase.toString());
+    const valuacionMetalica  = Number(entry.gramsPure.toString()) * quote;
+
+    // Invariante crítico: deuda monetaria + valuación metálica = Sale.total.
+    expect(monetaryRegistrada + valuacionMetalica).toBeCloseTo(390500, 2);
+    expect(monetaryRegistrada).toBe(185500);
+    expect(Number(entry.gramsPure.toString())).toBeCloseTo(2.05, 6);
+  });
+});
+
 describe("T56 — Fase 3B.6: validación BREAKDOWN", () => {
   it("BREAKDOWN sin balanceBreakdown → throw controlado (no escribe nada)", async () => {
     const { tx, state } = buildMockTx({ sale: makeSaleRecord() });

@@ -55,6 +55,9 @@ export interface ResolveSaleBalanceModeArgs {
   /** Legacy `CommercialEntity.balanceType` para back-compat. Se traduce con
    *  `mapBalanceTypeToMode`; el nuevo campo tiene prioridad sobre este. */
   entityBalanceTypeLegacy?: string | null;
+  /** Preferencia del usuario (`UserPreference.defaultBalanceMode`, scope
+   *  SALES_INVOICE). Se evalúa DESPUÉS del cliente y ANTES de la lista. */
+  userPreferenceDefault?: BalanceMode | null;
   /** Default de la lista de precios resuelta. */
   priceListDefault?: BalanceMode | null;
   /** `PriceList.mode` de la lista resuelta (`MARGIN_TOTAL` / `METAL_HECHURA`
@@ -99,6 +102,7 @@ export function resolveSaleBalanceMode(
   return resolveBalanceMode({
     documentOverride: args.documentOverride ?? null,
     entityDefault,
+    userPreferenceDefault: args.userPreferenceDefault ?? null,
     priceListDefault,
     tenantDefault:    args.tenantDefault    ?? null,
   });

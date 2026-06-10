@@ -285,8 +285,16 @@ describe("createSale — fuente de verdad: motor", () => {
     });
     // No hay venta previa con código → primer código
     mockPrisma.sale.findFirst.mockResolvedValue(null);
-    // Devolver lo que se le pasa a create
-    mockPrisma.sale.create.mockImplementation(async (args: any) => ({ id: "s1", ...args.data }));
+    // Devolver lo que se le pasa a create.
+    // `prisma.sale.create` usa `select: SALE_DETAIL_SELECT`, que proyecta
+    // `lines` como ARRAY de filas persistidas — no como el objeto de escritura
+    // anidada `{ create: [...] }`. `syncDraftDocumentTotals` (post-create) hace
+    // `lines.map(...)` sobre esa forma; el mock debe emular la proyección.
+    mockPrisma.sale.create.mockImplementation(async (args: any) => ({
+      id: "s1",
+      ...args.data,
+      lines: args.data.lines?.create ?? [],
+    }));
 
     mockResolveFinalSalePrice.mockResolvedValue(fakeSalePriceResult({
       unitPrice: new D("1000"),

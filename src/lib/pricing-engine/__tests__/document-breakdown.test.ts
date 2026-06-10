@@ -257,8 +257,9 @@ describe("computeSaleDocumentTotals — agregados intactos ante otros ajustes", 
     expect(out.hechuraCostSubtotal).toBe(200);
     expect(out.metalSaleSubtotal).toBe(1300);
     expect(out.hechuraSaleSubtotal).toBe(300);
-    // Totales tradicionales siguen funcionando.
-    expect(out.taxAmount).toBe(336);
+    // §Tax.4 — los descuentos de cabecera bajan la taxableBase → el tax escala
+    // 336 × ratio = 331.8 (el `lineTaxAmount` input sigue 336; el documento lo escala).
+    expect(out.taxAmount).toBe(331.8);
     expect(out.total % 10).toBe(0);  // redondeo TEN aplicado
   });
 

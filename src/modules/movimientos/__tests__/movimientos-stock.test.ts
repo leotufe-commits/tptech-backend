@@ -316,8 +316,9 @@ describe("createMovement — validación de gramos", () => {
         kind: "IN", effectiveAt: new Date(),
         lines: [{ variantId: "var-1", grams: "0" }],
       })
-    ).rejects.toThrow("al menos una línea");
-    // grams=0 es filtrado por filter(l.grams) → lines vacías → assert falla
+    ).rejects.toThrow("mayores a 0");
+    // grams=0 ahora se rechaza explícitamente como gramo inválido (≤0), igual
+    // que grams negativos ("mayores a 0"), en vez de filtrarse silenciosamente.
   });
 
   it("IN rechaza grams negativos", async () => {

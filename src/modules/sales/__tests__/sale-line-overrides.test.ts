@@ -168,8 +168,10 @@ describe("createSale — overrides per-line persisten", () => {
       }],
     });
 
-    // El motor recibió el override.
-    expect(mockResolveFinalSalePrice).toHaveBeenCalledTimes(1);
+    // El motor recibió el override. createSale resuelve precio 2 veces:
+    // (1) snapshot por línea (resolveDraftSaleLinesPricing) +
+    // (2) totales del documento (syncDraftDocumentTotals → previewSale).
+    expect(mockResolveFinalSalePrice).toHaveBeenCalledTimes(2);
     const motorArgs = mockResolveFinalSalePrice.mock.calls[0][1];
     expect(motorArgs.manualPriceOverride).toBe(1500);
 

@@ -121,7 +121,10 @@ function costMetalPhysical(gramsPure: number, pricePerGram: number) {
       metalParentId:     "OroFino",
       metalParentName:   "Oro Fino",
       gramsPure,
-      metalPricePerGram: pricePerGram * 2,  // venta = 100% margen sobre costo
+      // Cotización de COSTO (= meta.quotePrice en datos reales). El margen NO
+      // vive en el precio: se aplica a los gramos comerciales
+      // (gramsPure × marginFactor) — FIX post-margen 2026-06-02.
+      metalPricePerGram: pricePerGram,
     }],
   } as any;
 }
@@ -229,17 +232,17 @@ describe("Gate anti-doble — HECHURA (PER_LINE vs PER_DOCUMENT)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("Gate anti-doble — METAL FÍSICO (PER_LINE vs PER_DOCUMENT)", () => {
-  // Caso: 1.2375 g de oro, precio 50000 costo / 100000 venta.
-  // Sin redondeo: metalSale = 1.2375 × 100000 = 123750.
-  // Con DECIMAL_1 NEAREST sobre 1.2375 g → 1.2 g (delta -0.0375 g × 100000 = -3750)
-  //   → metalSale post = 120000.
+  // Caso: 1.2375 g de oro, cotización de COSTO 50000, margen metal 100%.
+  // FIX post-margen: el redondeo opera sobre los gramos COMERCIALES
+  //   gramsComerciales = 1.2375 × 2 = 2.475 → DECIMAL_1 NEAREST → 2.5 g.
+  //   metalSale_pre = 61875 × 2 = 123750; + Δ (0.025 g × 50000 = 1250) = 125000.
 
-  it("PER_LINE (sin flag): applyPriceList ejecuta el path PHYSICAL — metalSale ajustada", () => {
+  it("PER_LINE (sin flag): applyPriceList ejecuta el path PHYSICAL — metalSale ajustada (post-margen)", () => {
     const result = applyPriceList(listMetalPhysical(), costMetalPhysical(1.2375, 50000));
     expect(result.metalHechuraDetail).not.toBeNull();
     expect(result.metalHechuraDetail!.physical).not.toBeNull();
-    // metalSale redondeada: 1.2375 × 100000 − 3750 = 120000
-    expect(result.metalHechuraDetail!.metalSale).toBe(120000);
+    // metalSale = 2.5 g comerciales × 50000 = 125000
+    expect(result.metalHechuraDetail!.metalSale).toBe(125000);
   });
 
   it("PER_DOCUMENT (suppressLineMetalPhysicalRounding=true): applyPriceList NO ejecuta el path PHYSICAL — metalSale cruda", () => {
@@ -272,12 +275,15 @@ describe("Gate anti-doble — METAL FÍSICO (PER_LINE vs PER_DOCUMENT)", () => {
 
     const docResult = applyCommercialDocumentRounding({
       totalComercialPostTax: totalCrudo,
-      metalValuationSum:     metalSaleCrudo,    // valorización física = metalSale
+      metalValuationSum:     metalSaleCrudo,
+      // PER_DOCUMENT también redondea gramos COMERCIALES → pasa el factor de
+      // margen (= metalSale/metalCost = 2) y la cotización de COSTO (50000).
+      metalCommercialMarginFactor: 2,
       metalsByParent: [{
         metalParentId:     "OroFino",
         metalParentName:   "Oro Fino",
         gramsPure:         1.2375,
-        metalPricePerGram: 100000,
+        metalPricePerGram: 50000,
       }],
       config: {
         scope:   "BREAKDOWN",
@@ -286,9 +292,9 @@ describe("Gate anti-doble — METAL FÍSICO (PER_LINE vs PER_DOCUMENT)", () => {
       },
     });
 
-    // Ambos modos coinciden: 120000 (PER_LINE) = 123750 + (-3750) (PER_DOCUMENT).
-    expect(totalPerLine).toBe(120000);
-    expect(docResult.totalPostCommercial).toBe(120000);
+    // Ambos modos coinciden post-margen: 2.5 g × 50000 = 125000.
+    expect(totalPerLine).toBe(125000);
+    expect(docResult.totalPostCommercial).toBe(125000);
   });
 });
 
@@ -316,7 +322,7 @@ describe("INVARIANTE — PER_LINE y PER_DOCUMENT nunca simultáneos", () => {
         metalParentId:     "OroFino",
         metalParentName:   "Oro Fino",
         gramsPure:         1.2375,
-        metalPricePerGram: 100000,
+        metalPricePerGram: 50000,   // cotización de COSTO (margen vive en gramos)
       }],
     } as any;
 
@@ -337,11 +343,14 @@ describe("INVARIANTE — PER_LINE y PER_DOCUMENT nunca simultáneos", () => {
     const docB = applyCommercialDocumentRounding({
       totalComercialPostTax: totalCrudo,
       metalValuationSum:     metalSaleCrudo,
+      // PER_DOCUMENT redondea gramos COMERCIALES → mismo factor de margen (2)
+      // y cotización de COSTO (50000) que el path PER_LINE.
+      metalCommercialMarginFactor: 2,
       metalsByParent: [{
         metalParentId:     "OroFino",
         metalParentName:   "Oro Fino",
         gramsPure:         1.2375,
-        metalPricePerGram: 100000,
+        metalPricePerGram: 50000,
       }],
       config: {
         scope:   "BREAKDOWN",

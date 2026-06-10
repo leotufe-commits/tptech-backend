@@ -86,6 +86,36 @@ describe("resolveSaleBalanceMode — prioridad R11.4", () => {
     expect(r).toEqual({ mode: "BREAKDOWN", source: "PRICELIST_DEFAULT" });
   });
 
+  it("userPreferenceDefault gana cuando documento y cliente son null (sobre lista)", () => {
+    const r = resolveSaleBalanceMode({
+      documentOverride:        null,
+      entityBalanceMode:       null,
+      entityBalanceTypeLegacy: null,
+      userPreferenceDefault:   "UNIFIED",
+      priceListDefault:        "BREAKDOWN",
+      tenantDefault:           "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "UNIFIED", source: "USER_PREFERENCE" });
+  });
+
+  it("cliente GANA sobre la preferencia del usuario", () => {
+    const r = resolveSaleBalanceMode({
+      documentOverride:        null,
+      entityBalanceMode:       "BREAKDOWN",
+      userPreferenceDefault:   "UNIFIED",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "ENTITY_DEFAULT" });
+  });
+
+  it("preferencia del usuario AUSENTE → delega a lista (back-compat)", () => {
+    const r = resolveSaleBalanceMode({
+      documentOverride:        null,
+      entityBalanceMode:       null,
+      priceListDefault:        "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "PRICELIST_DEFAULT" });
+  });
+
   it("tenantDefault gana cuando los 3 niveles superiores son null", () => {
     const r = resolveSaleBalanceMode({
       tenantDefault: "BREAKDOWN",

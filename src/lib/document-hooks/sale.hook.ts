@@ -25,6 +25,10 @@ import {
   type BalanceMode,
   type DocumentBalanceBreakdown,
 } from "../pricing-engine/pricing-engine.js";
+import type {
+  ManualAdjustmentSnapshot,
+  ManualAdjustmentSnapshotMetalEntry,
+} from "../manual-adjustment/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos públicos
@@ -49,6 +53,13 @@ export interface OnSaleConfirmedOpts {
   /** Breakdown canónico construido por confirmSale. Si no se provee, el
    *  snapshot v3 lo deriva como UNIFIED implícito (`monetary.amount=total`). */
   balanceBreakdown?: DocumentBalanceBreakdown;
+  /** Snapshot del ajuste manual (capa 17) ya construido por confirmSale.
+   *  Necesario SOLO en DESGLOSADO para registrar la deuda FINAL en cuenta
+   *  corriente: el delta monetario (`totals.monetaryAdjustment`) impacta el
+   *  saldo monetario y el delta de gramos (`breakdown.metals[].postGrams`)
+   *  impacta la deuda metálica por metal padre. Null/undefined cuando no hubo
+   *  ajuste → comportamiento legacy intacto. */
+  manualAdjustmentSnapshot?: ManualAdjustmentSnapshot | null;
 }
 
 export interface OnSaleConfirmedResult {
@@ -149,11 +160,16 @@ export async function onSaleConfirmed(
   //    · `sourceDocumentType = "SALE"` / `sourceDocumentId = sale.id` siempre
   //      (R11.7 — trazabilidad inversa universal).
   //    · UNIFIED: amountBase/Original/currency desde `snapshot.totals` (igual
-  //      que pre-3B.6). NO se crean `AccountMovementMetalEntry`.
-  //    · BREAKDOWN: amountBase/Original/currency desde
-  //      `opts.balanceBreakdown.monetaryBalance` (la fuente de verdad es el
-  //      breakdown confirmado, NO se reconstruye nada). Se crea una
-  //      `AccountMovementMetalEntry` por cada metal padre con `gramsPure > 0`.
+  //      que pre-3B.6). `snapshot.totals.total = Sale.total = finalTotal`, así
+  //      que ya incluye redondeo financiero + ajuste manual. NO se crean
+  //      `AccountMovementMetalEntry`.
+  //    · BREAKDOWN: amountBase/Original desde `opts.balanceBreakdown.
+  //      monetaryBalance` MÁS el delta monetario del ajuste manual
+  //      (`manualAdjustmentSnapshot.totals.monetaryAdjustment`) para registrar
+  //      la deuda monetaria FINAL. Se crea una `AccountMovementMetalEntry` por
+  //      metal padre con `gramsPure > 0`, usando los gramos POST-ajuste manual
+  //      (`postGrams`) cuando el operador ajustó gramos (principio "no
+  //      mezclar": delta monetario → saldo; delta de gramos → metal).
   //    · BREAKDOWN sin breakdown válido → falla controladamente (R11.5):
   //      mejor abortar la confirmación que persistir una cuenta corriente
   //      inconsistente.
@@ -181,12 +197,27 @@ export async function onSaleConfirmed(
       ? opts.balanceBreakdown.monetaryBalance
       : null;
 
-    // amountBase / amountOriginal / currency según el modo.
+    // Delta monetario del ajuste manual (capa 17) que pertenece al BUCKET
+    // hechura / saldo monetario (todo lo no-metal). En UNIFIED-sobre-BREAKDOWN
+    // es el ajuste global; en BREAKDOWN es `breakdown.monetary.amount`. El
+    // ajuste de GRAMOS NO entra acá: impacta la deuda metálica (más abajo).
+    // Principio "no mezclar" (POLICY §R-Rounding-1).
+    //
+    // Por qué sumamos sobre `mb.amount` (Opción B, realizada con la valuación
+    // del propio motor): `mb.amount` YA es `engineTotal − Σ valuación metal`.
+    // Sumarle el delta monetario del operador da, por álgebra,
+    // `Sale.total − Σ valuación metal final` — sin recalcular la conversión de
+    // Divisas ni introducir una segunda valuación, y respetando el clamp ≥ 0
+    // que ya vive en `Sale.total` / `finalTotal`. Sin ajuste → delta 0 →
+    // comportamiento idéntico a pre-fix.
+    const manualMonetaryAdj = mb != null
+      ? (opts.manualAdjustmentSnapshot?.totals?.monetaryAdjustment ?? 0)
+      : 0;
     const movAmountBase     = mb != null
-      ? new Prisma.Decimal(String(mb.amountBase))
+      ? new Prisma.Decimal(String(mb.amountBase)).add(new Prisma.Decimal(String(manualMonetaryAdj)))
       : new Prisma.Decimal(String(snapshot.totals.totalBase));
     const movAmountOriginal = mb != null
-      ? new Prisma.Decimal(String(mb.amount))
+      ? new Prisma.Decimal(String(mb.amount)).add(new Prisma.Decimal(String(manualMonetaryAdj)))
       : new Prisma.Decimal(String(snapshot.totals.total));
     // Si el breakdown trae currencyCode vacío (preview sin conversión),
     // caemos al code del snapshot para no perder la moneda.
@@ -229,10 +260,19 @@ export async function onSaleConfirmed(
     //     son GRAMOS — no se convierten de moneda. Las filas inválidas
     //     (gramsPure≤0) se descartan defensivamente (no rompen el flujo).
     if (effectiveMode === "BREAKDOWN" && opts.balanceBreakdown) {
+      // Deuda metálica FINAL: si hubo ajuste manual de gramos (Etapa C,
+      // scope BREAKDOWN), las entries persisten los gramos puros POST-ajuste
+      // (`postGrams`), no los pre. Un ajuste UNIFIED sobre un documento
+      // BREAKDOWN no toca gramos (sus deltas viven en el saldo monetario).
+      const manualMetals =
+        opts.manualAdjustmentSnapshot?.scope === "BREAKDOWN"
+          ? opts.manualAdjustmentSnapshot.breakdown.metals
+          : undefined;
       const entryRows = buildAccountMovementMetalEntryRows({
         movementId: mov.id,
         jewelryId:  sale.jewelryId,
         breakdown:  opts.balanceBreakdown,
+        manualMetals,
       });
       if (entryRows.length > 0) {
         await tx.accountMovementMetalEntry.createMany({ data: entryRows });
@@ -802,6 +842,11 @@ export interface BuildMetalEntryRowsArgs {
   movementId: string;
   jewelryId:  string;
   breakdown:  DocumentBalanceBreakdown;
+  /** Ajustes manuales de gramos por metal padre (Etapa C). Cuando un metal
+   *  tiene ajuste, su `gramsPure` final pasa a ser `postGrams` (gramos puros
+   *  post-ajuste); `gramsOriginal` se reescala manteniendo la pureza ponderada.
+   *  El delta físico pertenece al metal padre (no se mueve al saldo monetario). */
+  manualMetals?: ManualAdjustmentSnapshotMetalEntry[];
 }
 
 /** Proyecta `balanceBreakdown.metals[]` al shape de `AccountMovementMetalEntry`.
@@ -866,8 +911,36 @@ export function buildAccountMovementMetalEntryRows(
     }
   }
 
+  // Mapa de gramos puros FINALES por metal padre cuando hubo ajuste manual de
+  // gramos (Etapa C). El ajuste opera sobre `gramsPure` → `postGrams` es el
+  // valor final. La clave usa el mismo esquema null→"__null__" que el dedup.
+  const manualPostByParent = new Map<string, number>();
+  for (const mm of args.manualMetals ?? []) {
+    if (mm == null) continue;
+    const post = Number(mm.postGrams);
+    if (!Number.isFinite(post)) continue;
+    manualPostByParent.set(mm.metalParentId ?? "__null__", post);
+  }
+
   const out: Prisma.AccountMovementMetalEntryCreateManyInput[] = [];
-  for (const acc of accByParent.values()) {
+  for (const [key, acc] of accByParent) {
+    // Aplicar ajuste manual de gramos (Etapa C) si existe para este padre: la
+    // deuda metálica usa los gramos puros FINALES (`postGrams`). Reescalamos
+    // `gramsOriginal` manteniendo la pureza ponderada (el operador ajusta
+    // contenido puro, no la aleación). Sin pureza → original = puro.
+    let gramsPure     = acc.gramsPure;
+    let gramsOriginal = acc.gramsOriginal;
+    const manualPost = manualPostByParent.get(key);
+    if (manualPost != null) {
+      gramsPure     = manualPost;
+      gramsOriginal = acc.purity != null && acc.purity > 1e-9
+        ? gramsPure / acc.purity
+        : gramsPure;
+    }
+    // Tras el ajuste, descartar si el metal quedó en ~0 (sin deuda metálica).
+    if (!Number.isFinite(gramsPure)     || gramsPure     <= 1e-9) continue;
+    if (!Number.isFinite(gramsOriginal) || gramsOriginal <= 1e-9) continue;
+
     // sourceLineId único cuando exactamente UNA línea aportó al padre.
     const sourceLineId =
       acc.sourceLineIds.size === 1
@@ -878,11 +951,11 @@ export function buildAccountMovementMetalEntryRows(
       jewelryId:       args.jewelryId,
       metalParentId:   acc.metalParentId,
       metalParentName: acc.metalParentName,
-      gramsOriginal:   new Prisma.Decimal(String(acc.gramsOriginal)),
+      gramsOriginal:   new Prisma.Decimal(String(gramsOriginal)),
       purity:          acc.purity != null
         ? new Prisma.Decimal(String(acc.purity))
         : null,
-      gramsPure:       new Prisma.Decimal(String(acc.gramsPure)),
+      gramsPure:       new Prisma.Decimal(String(gramsPure)),
       sourceLineId,
     });
   }
