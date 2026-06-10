@@ -3,3 +3,6 @@ dist
 .env
 /generated/prisma
 uploads/
+# Claude Code harness artifacts (no versionar)
+.claude/worktrees/
+.claude/scheduled_tasks.lock
