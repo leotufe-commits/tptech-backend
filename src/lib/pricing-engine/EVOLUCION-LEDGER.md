@@ -137,3 +137,28 @@ UNIFICADA: lineSummary ? 0 : resolveCommercialHechuraImpact(...)   (sin cambios)
 
 ### Estado consolidado del Footer y el Card (impacto monetario)
 Tras Paso 2.2 (Footer) + Trabajo #2 (Card), **ambas superficies leen el impacto monetario C-FASE1-first** — simetría completa. Ambos cambios quedan validados y trazados en ledger, sin commit aislado por dirty working tree.
+
+---
+
+## Entrada — Etapa 2 / Evolución Controlada / Trabajo #1
+
+| Campo | Valor |
+|---|---|
+| **Trabajo** | #1 del Backlog — Footer gramos → C-FASE1-first. |
+| **Archivo afectado** | `tptech-frontend/src/components/sales/TotalDelComprobanteCard/helpers.ts`. |
+| **Bloque** | `buildVisibleGramsByParent` (resolución de `byParent` para los gramos por metal padre del Footer). |
+| **Cambio realizado** | Orden de lectura del `byParent` de gramos: **FASE0-only → C-FASE1-first**. Nuevo: `byParent = display?.metals?.byParent ?? summary?.metals?.byParent ?? null` (display = `lineCommercialDisplaySummary`, summary = `lineCommercialSummary`). Era `summary?.metals?.byParent ?? null`. |
+| **Motivo arquitectónico** | Alinear el último helper de gramos del Footer con su gemelo `groupLineCommercialMetalRoundingByParent` (que ya lee `display ?? summary`) y con el Contrato de Consumo (C-FASE1 fuente canónica per-línea). |
+| **Naturaleza** | Display-only (gramos del bloque METALES del Footer); near-no-op numérico (FASE1==FASE0 visibleGrams en líneas frescas; FASE1 más correcto line-local en MIXED). |
+| **Preservado** | Match por `metalParentName`; consolidación Σ por nombre; fallback a `gramsEquivLine`; lectura defensiva desde `pricingMeta`; retorno `{}` sin líneas/metales. |
+| **Validaciones realizadas** | Red de paridad Card↔Footer (#3) + tests del Footer + guard `no-family-a-in-line-surfaces` + `tsc --noEmit`. |
+| **Resultado de tests** | **30 archivos / 384 tests verdes; `tsc --noEmit` 0 errores.** |
+| **Impacto sobre núcleo** | **NULO** sobre `Sale.total`, snapshots, motor y FIX MIXED. No se tocó el Card ni otros helpers (`sumLineCommercial*` intactos). |
+| **Estado** | ✅ Validado — ❌ **NO commiteado de forma aislada**. |
+| **Motivo de no-commit aislado** | `helpers.ts` contiene cambios previos sin commitear (Paso 2.2 + backlog ~611 ins vs HEAD); el hunk no es aislable con `git add <archivo>`. Misma situación que Paso 2.2 / Trabajo #2. |
+| **Riesgo** | **Operativo / git** (atribución), **NO funcional**. Reversible (restaurar `byParent` a FASE0-only). |
+| **Condición para commit limpio** | (a) Commitear primero el backlog previo de `helpers.ts` → luego este cambio commitea limpio; **o** (b) sostener este ledger hasta ordenar el working tree. |
+| **Decisión vigente** | Opción Ledger (igual que Paso 2.2 y Trabajo #2). |
+
+### Estado consolidado del Footer (post Trabajo #1)
+Las **tres** lecturas per-línea del Footer (gramos, impacto metal, impacto monetario) son ahora **C-FASE1-first**. El Footer quedó **plenamente convergido a C-FASE1** como fuente primaria, con fallbacks B/FASE0/legacy intactos para datos históricos. Cambios de código validados pero **no commiteados aisladamente** (dirty tree): Paso 2.2, Trabajo #2, Trabajo #1.
