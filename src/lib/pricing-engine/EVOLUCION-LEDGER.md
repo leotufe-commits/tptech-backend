@@ -104,3 +104,36 @@ No puede concluirse todavía (sin prueba numérica): que C-FASE1 sea correcta en
 
 ### CONCLUSIÓN
 MIXED queda registrado oficialmente como **régimen de fallback con kernel de dominio reducido**, con sus hechos separados de sus hipótesis. El contrato permanece inalterado; el roadmap, confirmado.
+
+---
+
+## Entrada — Etapa 2 / Evolución Controlada / Trabajo #2
+
+| Campo | Valor |
+|---|---|
+| **Trabajo** | #2 del Backlog — Card impacto monetario → C-FASE1-first. |
+| **Archivo afectado** | `tptech-frontend/src/components/ui/TPDocumentLineAdvancedEditor.tsx`. |
+| **Bloque** | `desglosadoImpact` (dentro del bloque `compositionDetailOpen`; descomposición monetaria expandida del Card). |
+| **Cambio realizado** | Orden de lectura del impacto monetario del redondeo comercial per-línea: **B-first → C-FASE1-first**. Nuevo orden: (1) `lineSummary.monetary.roundingImpact` (C-FASE1, `lineSummary = lineCommercialDisplaySummary ?? lineCommercialSummary`) → (2) `lineOwnHechuraRoundingMonetaryImpact` (B) → (3) `resolveCommercialHechuraImpact` (legacy). |
+| **Motivo arquitectónico** | Alinear el Card con el Contrato de Consumo (C-FASE1 fuente canónica per-línea), con el Footer (Paso 2.2) y con la cadena de impacto **metal** del propio Card. Elimina la última lectura monetaria B-first del Card. |
+| **Naturaleza** | Display-only (sub-línea expandida); near-no-op numérico (C-FASE1 y B = mismo primitivo autónomo → equivalentes en líneas frescas). **Rama UNIFICADA preservada byte-equivalente.** |
+| **Validaciones realizadas** | Tests render del Card + helpers de display + red de paridad Card↔Footer (#3) + guard `no-family-a-in-line-surfaces` + `tsc --noEmit`. |
+| **Resultado de tests** | **9 archivos / 68 tests verdes; `tsc --noEmit` 0 errores.** |
+| **Impacto sobre núcleo** | **NULO** sobre `Sale.total`, snapshots, motor y FIX MIXED (bloque del total `:5017-5023` intacto). No se tocó Footer ni `helpers.ts`. |
+| **Estado** | ✅ Validado — ❌ **NO commiteado de forma aislada**. |
+| **Motivo de no-commit aislado** | `TPDocumentLineAdvancedEditor.tsx` contiene **cambios previos sin commitear** (584 ins / 189 del vs HEAD, ajenos a la Etapa 2). El hunk del Trabajo #2 modifica código que no está en HEAD → no es aislable con `git add <archivo>` sin arrastrar trabajo ajeno. Misma situación que el Paso 2.2. |
+| **Riesgo** | **Operativo / git** (atribución), **NO funcional**. Reversible (restaurar el bloque `desglosadoImpact` al orden B-first). |
+| **Condición para commit limpio** | (a) Commitear primero el backlog previo de `TPDocumentLineAdvancedEditor.tsx` como su propio commit → luego este cambio y siguientes commitean limpio; **o** (b) sostener este ledger hasta ordenar el working tree. |
+| **Decisión vigente** | Opción Ledger (igual que Paso 2.2). No se commitea el Card; no se hace commit parcial. |
+
+### Referencia rápida del cambio (para reconstrucción/auditoría)
+Bloque `desglosadoImpact` (DESGLOSADA):
+```
+1) lineSummary.monetary.roundingImpact          (C-FASE1)  ← nuevo #1
+2) lineOwnHechuraRoundingMonetaryImpact          (B)
+3) resolveCommercialHechuraImpact(...)           (legacy)
+UNIFICADA: lineSummary ? 0 : resolveCommercialHechuraImpact(...)   (sin cambios)
+```
+
+### Estado consolidado del Footer y el Card (impacto monetario)
+Tras Paso 2.2 (Footer) + Trabajo #2 (Card), **ambas superficies leen el impacto monetario C-FASE1-first** — simetría completa. Ambos cambios quedan validados y trazados en ledger, sin commit aislado por dirty working tree.
