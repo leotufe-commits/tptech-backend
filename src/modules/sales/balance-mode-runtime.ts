@@ -32,7 +32,6 @@ import {
 } from "../../lib/pricing-engine/balance-mode-resolver.js";
 import {
   buildDocumentBalanceBreakdown,
-  mapBalanceTypeToMode,
   type BuildBreakdownLineInput,
 } from "../../lib/pricing-engine/pricing-engine.balance.js";
 import type {
@@ -50,10 +49,14 @@ import type {
 export interface ResolveSaleBalanceModeArgs {
   /** Override manual del documento (top de R11.4). */
   documentOverride?: BalanceMode | null;
-  /** Default del cliente desde el nuevo campo `CommercialEntity.balanceMode`. */
+  /** Preferencia del cliente — campo canónico `CommercialEntity.balanceMode`
+   *  (nullable). `null` = "sin preferencia" → el cliente DELEGA en el resto de
+   *  la jerarquía. Es la ÚNICA entrada del nivel "Cliente" desde 2026-06-14. */
   entityBalanceMode?: BalanceMode | null;
-  /** Legacy `CommercialEntity.balanceType` para back-compat. Se traduce con
-   *  `mapBalanceTypeToMode`; el nuevo campo tiene prioridad sobre este. */
+  /** @deprecated 2026-06-14 — Legacy `CommercialEntity.balanceType`. Ya NO
+   *  participa de la resolución: las filas históricas se migraron a
+   *  `balanceMode` (backfill). Se conserva por compatibilidad de firma; el
+   *  resolver lo ignora. */
   entityBalanceTypeLegacy?: string | null;
   /** Preferencia del usuario (`UserPreference.defaultBalanceMode`, scope
    *  SALES_INVOICE). Se evalúa DESPUÉS del cliente y ANTES de la lista. */
@@ -74,8 +77,8 @@ export interface ResolveSaleBalanceModeArgs {
   tenantDefault?: BalanceMode | null;
 }
 
-/** Resuelve el Balance Mode del documento aplicando R11.4 + back-compat
- *  `balanceType` legacy. Función pura — sin DB, sin async.
+/** Resuelve el Balance Mode del documento aplicando R11.4. El nivel "Cliente"
+ *  es una SUGERENCIA (`balanceMode` nullable; null delega). Función pura.
  *
  *  Default inteligente del nivel lista (POLICY §11 R11.4 — extensión 2026-05):
  *  cuando `PriceList.balanceMode` viene `null` y `PriceList.mode ==="METAL_HECHURA"`,
@@ -89,9 +92,15 @@ export interface ResolveSaleBalanceModeArgs {
 export function resolveSaleBalanceMode(
   args: ResolveSaleBalanceModeArgs,
 ): BalanceModeResolution {
-  // Compatibilidad: nuevo campo `balanceMode` gana sobre legacy `balanceType`.
-  const entityDefault =
-    args.entityBalanceMode ?? mapBalanceTypeToMode(args.entityBalanceTypeLegacy ?? null);
+  // Cliente = NIVEL DE SUGERENCIA (R11.4). Su preferencia vive ÚNICAMENTE en el
+  // campo canónico `CommercialEntity.balanceMode` (nullable):
+  //   · "UNIFIED" / "BREAKDOWN" → el cliente sugiere ese modo.
+  //   · null = "sin preferencia" → DELEGA al siguiente nivel (Mis preferencias
+  //     → Lista → Joyería → fallback). El cliente ya NO impone comportamiento.
+  // El legacy `balanceType` (no-null) dejó de participar: las filas históricas
+  // se migraron a `balanceMode` (backfill 2026-06-14). La historia se preserva
+  // por DATA, nunca reinterpretando en runtime.
+  const entityDefault = args.entityBalanceMode ?? null;
 
   // Default inteligente del nivel lista — sólo cuando `balanceMode` no está
   // explícito. Si la lista trae UNIFIED/BREAKDOWN explícito, ese gana siempre.

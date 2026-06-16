@@ -51,41 +51,6 @@ async function listWarehousesBase(jewelryId: string) {
   });
 }
 
-/* =========================
-   INTERNAL: EFFECTIVE FAVORITE
-   - devuelve favoriteWarehouseId válido (activo + existente)
-   - si no hay, auto-asigna el primero activo (si existe)
-========================= */
-async function getOrAssignEffectiveFavoriteWarehouseId(opts: {
-  jewelryId: string;
-  userId: string;
-  warehouses: Array<{ id: string; isActive: boolean }>;
-}) {
-  const jewelryId = opts.jewelryId;
-  const userId = opts.userId;
-  const warehouses = opts.warehouses;
-
-  // Fuente de verdad: UserPreference (con fallback legacy SOLO LECTURA).
-  const currentFavId = await getSalesDefaultWarehouseId(jewelryId, userId);
-
-  const currentFavOk =
-    !!currentFavId && warehouses.some((w) => w.id === currentFavId && w.isActive === true);
-
-  let effectiveFavId: string | null = currentFavOk ? currentFavId : null;
-
-  if (!effectiveFavId) {
-    const firstActive = warehouses.find((w) => w.isActive === true) || null;
-
-    if (firstActive) {
-      effectiveFavId = firstActive.id;
-
-      // Persistir el auto-asignado en la NUEVA fuente de verdad.
-      await setSalesDefaultWarehouseId(jewelryId, userId, effectiveFavId);
-    }
-  }
-
-  return effectiveFavId;
-}
 
 /* =========================
    LIST (for user)
@@ -110,12 +75,6 @@ export async function listWarehousesForUser(jewelryId: string, userId: string) {
     }),
   ]);
 
-  const effectiveFavId = await getOrAssignEffectiveFavoriteWarehouseId({
-    jewelryId,
-    userId,
-    warehouses: rows.map((w) => ({ id: w.id, isActive: w.isActive })),
-  });
-
   const gramsMap = new Map<string, number>();
   for (const s of metalStocks) {
     gramsMap.set(s.warehouseId, Number(s._sum.grams ?? 0));
@@ -126,9 +85,14 @@ export async function listWarehousesForUser(jewelryId: string, userId: string) {
     piecesMap.set(s.warehouseId, Number(s._sum.quantity ?? 0));
   }
 
+  // `isFavorite` = favorito GENERAL de la joyería (columna real `Warehouse.isFavorite`).
+  // Ya NO se computa por-usuario ni se auto-asigna la preferencia personal al
+  // listar: el override personal vive en UserPreference y se setea explícitamente
+  // desde "Mis preferencias". Así el favorito de joyería arranca vacío hasta que
+  // alguien marque la estrella, y los usuarios sin preferencia comparten el mismo.
   return rows.map((w) => ({
     ...w,
-    isFavorite: !!effectiveFavId && effectiveFavId === w.id,
+    isFavorite: w.isFavorite,
     stockGrams: gramsMap.get(w.id) ?? 0,
     stockPieces: piecesMap.get(w.id) ?? 0,
   }));
@@ -423,15 +387,21 @@ async function getWarehouseNetGrams(opts: { jewelryId: string; warehouseId: stri
    - no toca users borrados
 ========================= */
 async function reassignFavoriteIfNeeded(jewelryId: string, removedWarehouseId: string) {
+  // Si el almacén removido era el favorito GENERAL de la joyería, limpiamos la
+  // marca. NO auto-promovemos otro: el favorito queda vacío hasta que alguien
+  // marque la estrella (coherente con el arranque vacío).
+  await prisma.warehouse.updateMany({
+    where: { id: removedWarehouseId, jewelryId, isFavorite: true },
+    data: { isFavorite: false },
+  });
+
+  // Además limpiamos las PREFERENCIAS PERSONALES (UserPreference) que apuntaban
+  // al almacén removido, para no dejar overrides colgados a un almacén inactivo.
   const newFavorite = await prisma.warehouse.findFirst({
     where: { jewelryId, deletedAt: null, isActive: true },
     orderBy: { createdAt: "asc" },
     select: { id: true },
   });
-
-  // Solo opera sobre UserPreference (fuente de verdad). Los usuarios que
-  // todavía dependen del legacy se autocuran lazy en listWarehousesForUser
-  // vía getOrAssignEffectiveFavoriteWarehouseId.
   await reassignSalesDefaultWarehouse(
     jewelryId,
     removedWarehouseId,
@@ -464,13 +434,24 @@ export async function setFavoriteWarehouse(opts: {
 
   const warehouse = await prisma.warehouse.findFirst({
     where: { id: warehouseId, jewelryId, deletedAt: null, isActive: true },
-    select: { id: true },
+    select: { id: true, isFavorite: true },
   });
   assert(warehouse, "No se puede marcar como favorito.");
 
-  // Preferencia PERSONAL del usuario → UserPreference (fuente de verdad).
-  // NO se escribe el legacy User.favoriteWarehouseId.
-  await setSalesDefaultWarehouseId(jewelryId, userId, warehouseId);
+  // Favorito GENERAL de la joyería (compartido), igual que SalesChannel /
+  // PriceList / Seller. NO toca la preferencia PERSONAL (UserPreference), que
+  // sigue siendo el override por usuario configurable en "Mis preferencias".
+  if (warehouse.isFavorite) {
+    // Re-click sobre el favorito actual → desmarcar (toggle off).
+    await prisma.warehouse.update({ where: { id: warehouseId }, data: { isFavorite: false } });
+    return { ok: true, favoriteWarehouseId: null };
+  }
+  // Único favorito por joyería: desmarca los demás y marca este.
+  await prisma.warehouse.updateMany({
+    where: { jewelryId, deletedAt: null, id: { not: warehouseId } },
+    data: { isFavorite: false },
+  });
+  await prisma.warehouse.update({ where: { id: warehouseId }, data: { isFavorite: true } });
 
   return { ok: true, favoriteWarehouseId: warehouseId };
 }

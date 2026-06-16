@@ -281,6 +281,12 @@ export function convertCompositionInPlace(comp: any, rate: number): void {
       // documentada `Σ metals[i].lineSale === metalHechuraBreakdown.metalSale`
       // (metalSale SÍ se convierte, ver convertMetalHechuraBreakdownInPlace).
       convertFieldNumber(m, "lineSale", rate);
+      // FASE 5 (cierre) — `lineSalePreRounding` (venta del metal PRE redondeo
+      // comercial, BASE) es monetario. El card lo usa indirectamente
+      // (saleAmountLinePre → sumMetalSalePre → metalFinalCard → cardMonetario):
+      // sin convertir, contamina el header MONETARIO residual en documento
+      // dolarizado con lista desglosada + redondeo comercial activo.
+      convertFieldNumber(m, "lineSalePreRounding", rate);
       // Fase 2.3 — `quotePrice` (precio por gramo BASE pre-merma) es
       // monetario y necesita conversión. Sin esto, VAL. UNIT. METAL
       // queda en moneda base mientras el resto del response viene en la
@@ -603,6 +609,22 @@ function convertPricingStepsInPlace(steps: any, rate: number): void {
     if (meta && typeof meta === "object") {
       convertFieldNumber(meta, "discountBase",   rate);
       convertFieldNumber(meta, "discountAmount", rate);
+      // COMBO_PRICE (Modelo A) — la meta del step lleva el precio comercial del
+      // combo en moneda BASE. El frontend lee `meta.finalPrice`/`meta.subtotal`/
+      // `meta.adjustmentAmount` (NO `step.value`) para la columna "Venta total"
+      // y los "Totales" del combo (`extractComboPriceMeta`). Sin convertir,
+      // quedaban en BASE con el símbolo de display → "símbolo nuevo, importe
+      // viejo". `adjustmentValue` es monetario SOLO en DISCOUNT_FIXED; en los
+      // modos *_PERCENT es porcentaje y NO se convierte. `adjustmentKind` y los
+      // contadores `components*Price` no son montos.
+      if (step.key === "COMBO_PRICE") {
+        convertFieldNumber(meta, "subtotal",         rate);
+        convertFieldNumber(meta, "finalPrice",       rate);
+        convertFieldNumber(meta, "adjustmentAmount", rate);
+        if (meta.adjustmentKind === "DISCOUNT_FIXED") {
+          convertFieldNumber(meta, "adjustmentValue", rate);
+        }
+      }
     }
   }
 }
@@ -616,6 +638,73 @@ function convertLineCommercialRoundingMetalsInPlace(arr: any, rate: number): voi
     convertFieldNumber(m, "metalReferenceValue", rate);
     convertFieldNumber(m, "monetaryImpact",      rate);
   }
+}
+
+/**
+ * FASE 5 (contrato multimoneda) — `lineCommercialSummary` (contrato FASE 1,
+ * Resumen Comercial del artículo). Convierte SOLO los MONTOS; los gramos
+ * comerciales (`visibleGrams`) y la metadata (mode/source/ids/names) NO.
+ */
+function convertLineCommercialSummaryInPlace(summary: any, rate: number): void {
+  if (!summary || rate === 1) return;
+  if (summary.metals) {
+    convertFieldNumber(summary.metals, "monetaryAmount", rate);
+    convertFieldNumber(summary.metals, "roundingImpact", rate);
+    // summary.metals.visibleGrams (gramos) — NO se convierte.
+    if (Array.isArray(summary.metals.byParent)) {
+      for (const p of summary.metals.byParent) {
+        convertFieldNumber(p, "monetaryAmount", rate);
+        convertFieldNumber(p, "roundingImpact", rate);
+        // p.visibleGrams (gramos), metalParentId/Name — NO se convierten.
+      }
+    }
+  }
+  if (summary.monetary) {
+    convertFieldNumber(summary.monetary, "amount",         rate);
+    convertFieldNumber(summary.monetary, "roundingImpact", rate);
+  }
+  convertFieldNumber(summary, "totalLineAmount", rate);
+  // mode, source.* — NO se convierten.
+}
+
+/**
+ * FASE 5 (contrato multimoneda) — `commercialRoundingContext` (snapshot del
+ * redondeo comercial replicado por línea, consumido por CommercialRoundingFooter).
+ * Convierte SOLO MONTOS y precio/gramo. Los gramos físicos (pre/post/deltaGrams,
+ * metalsPostGrams) y la metadata (scope/mode/direction/source/appliedAt/
+ * appliedToLineCount/fallback/ids/names) NO se convierten.
+ */
+function convertCommercialRoundingContextInPlace(ctx: any, rate: number): void {
+  if (!ctx || rate === 1) return;
+  convertFieldNumber(ctx, "totalAdjustment", rate);
+  if (ctx.unified) {
+    convertFieldNumber(ctx.unified, "pre",        rate);
+    convertFieldNumber(ctx.unified, "post",       rate);
+    convertFieldNumber(ctx.unified, "adjustment", rate);
+    // unified.mode/direction — NO.
+  }
+  if (ctx.breakdown) {
+    const b = ctx.breakdown;
+    if (Array.isArray(b.metals)) {
+      for (const m of b.metals) {
+        convertFieldNumber(m, "metalPricePerGram",  rate); // precio/gramo = monetario
+        convertFieldNumber(m, "monetaryEquivalent", rate);
+        convertFieldNumber(m, "preAmount",          rate); // opcional (back-compat)
+        convertFieldNumber(m, "postAmount",         rate); // opcional (back-compat)
+        // m.preGrams/postGrams/deltaGrams (gramos), metalParentId/Name, mode, direction — NO.
+      }
+    }
+    convertFieldNumber(b, "metalMonetaryEquivalent", rate);
+    convertFieldNumber(b, "combinedAdjustment",      rate);
+    if (b.hechura) {
+      convertFieldNumber(b.hechura, "preRoundingSaldoMonetario",  rate);
+      convertFieldNumber(b.hechura, "postRoundingSaldoMonetario", rate);
+      convertFieldNumber(b.hechura, "deltaSaldoMonetario",        rate);
+      // hechura.mode/direction/source — NO.
+    }
+    // b.metalsPostGrams[] (gramos físicos display) — NO se convierte.
+  }
+  // scope, source, appliedAt, appliedToLineCount, fallback — NO.
 }
 
 export function convertSalesLineInPlace(line: any, rate: number): void {
@@ -640,8 +729,42 @@ export function convertSalesLineInPlace(line: any, rate: number): void {
   // lineCommercialRoundingMetals[] — gramos NO se convierten; sí los $ por metal
   // (metalReferenceValue = precio/gramo, monetaryImpact = delta × precio).
   convertLineCommercialRoundingMetalsInPlace(line.lineCommercialRoundingMetals, rate);
+  // FASE 5 — Resumen Comercial del artículo + snapshot del redondeo comercial
+  // replicado por línea. MONTOS sí, gramos NO (ver helpers).
+  // El card prioriza `lineCommercialDisplaySummary` (display-only, autónomo) y
+  // cae a `lineCommercialSummary`; AMBOS comparten shape → mismo helper.
+  convertLineCommercialSummaryInPlace(line.lineCommercialDisplaySummary, rate);
+  convertLineCommercialSummaryInPlace(line.lineCommercialSummary, rate);
+  convertCommercialRoundingContextInPlace(line.commercialRoundingContext, rate);
+  // Fallbacks autónomos per-línea del card (prioridad 2 de las cadenas
+  // metal/hechura). MONETARIOS → se convierten. Cierran el contrato del card.
+  convertFieldNumber(line, "lineOwnMetalRoundingMonetaryImpact",   rate);
+  convertFieldNumber(line, "lineOwnHechuraRoundingMonetaryImpact", rate);
+  // Resumen Comercial AUTÓNOMO de la línea — total c/imp. y saldo monetario
+  // POST redondeo comercial. MONETARIOS → mismo trato que sus gemelos
+  // documentales (lineTotalWithTaxPostCommercialRounding :708 /
+  // lineMonetarySaldoPostCommercialRounding :710). Sin esto quedaban en BASE
+  // con símbolo de display ("símbolo nuevo, importe viejo").
+  convertFieldNumber(line, "lineOwnTotalWithTaxPostCommercialRounding",  rate);
+  convertFieldNumber(line, "lineOwnMonetarySaldoPostCommercialRounding", rate);
   convertFieldNumber(line, "quantityDiscountAmount",  rate);
   convertFieldNumber(line, "promotionDiscountAmount", rate);
+  convertFieldNumber(line, "customerDiscountAmount",  rate);
+  // Metadata "Cálculo: base × valor" de descuentos (cantidad / promo / cliente).
+  // Las BASES son siempre monetarias → se convierten. Los VALUE solo cuando el
+  // descuento es FIXED_AMOUNT (un % NO se convierte). Sin esto las bases
+  // quedaban en BASE mientras sus AMOUNT hermanos se convertían → "Cálculo" con
+  // monedas mezcladas en facturas no-base. (customer no tiene VALUE per-línea:
+  // su value/valueType viajan en `clientCommercialRules` a nivel documento.)
+  convertFieldNumber(line, "quantityDiscountBase",  rate);
+  convertFieldNumber(line, "promotionDiscountBase", rate);
+  convertFieldNumber(line, "customerDiscountBase",  rate);
+  if (line.quantityDiscountValueType === "FIXED_AMOUNT") {
+    convertFieldNumber(line, "quantityDiscountValue", rate);
+  }
+  if (line.promotionDiscountValueType === "FIXED_AMOUNT") {
+    convertFieldNumber(line, "promotionDiscountValue", rate);
+  }
   // Costo y margen.
   convertFieldNumber(line, "unitCost",     rate);
   convertFieldNumber(line, "unitMargin",   rate);
@@ -714,7 +837,21 @@ export function convertArticlePreviewResponseInPlace(res: any, rate: number): vo
   convertFieldNumber(res, "lineMonetarySaldoPostCommercialRounding", rate);
   convertFieldNumber(res, "metalRoundingMonetaryImpact",   rate);
   convertFieldNumber(res, "hechuraRoundingMonetaryImpact", rate);
+  // Paridad con `convertSalesLineInPlace` — familia `lineOwn*` (Resumen
+  // Comercial AUTÓNOMO de la línea). Hoy el Simulador NO emite estos campos
+  // (son específicos de Factura); los `convertFieldNumber` son no-op si están
+  // ausentes. Se incluyen para que, si el Simulador llegara a emitirlos, se
+  // conviertan igual que en Factura (Simulador == Factura, sin divergencia).
+  convertFieldNumber(res, "lineOwnMetalRoundingMonetaryImpact",         rate);
+  convertFieldNumber(res, "lineOwnHechuraRoundingMonetaryImpact",       rate);
+  convertFieldNumber(res, "lineOwnTotalWithTaxPostCommercialRounding",  rate);
+  convertFieldNumber(res, "lineOwnMonetarySaldoPostCommercialRounding", rate);
   convertLineCommercialRoundingMetalsInPlace(res.lineCommercialRoundingMetals, rate);
+  // FASE 5 — mismo contrato que Factura (Simulador/Comparador lo comparten).
+  // Primario display-only + fallback legacy (mismo shape → mismo helper).
+  convertLineCommercialSummaryInPlace((res as any).lineCommercialDisplaySummary, rate);
+  convertLineCommercialSummaryInPlace((res as any).lineCommercialSummary, rate);
+  convertCommercialRoundingContextInPlace((res as any).commercialRoundingContext, rate);
 
   // Costo de compra.
   convertFieldString(res, "costBase",      rate);

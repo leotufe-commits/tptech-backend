@@ -363,9 +363,26 @@ await sendMail({
 
 ## Funciones expuestas
 
-- `resolveTenantMailContext(jewelryId): Promise<TenantMailContext>` — la lookup completa (1 query Prisma con `select` mínimo de 4 campos).
+- `resolveTenantMailContext(jewelryId): Promise<TenantMailContext>` — la lookup completa (1 query Prisma con `select` explícito). Devuelve `from`/`replyTo`/`senderName`/`fromEmail`/`emailEnabled` **+ `branding`** (firma, contacto, teléfono, WhatsApp, dirección, horarios, web, Instagram, pie) para el CUERPO del mail.
 - `composeFromHeader(senderName, fromEmail): string | undefined` — helper PURO RFC 5322 (quotea display names con caracteres especiales, escape de comillas internas).
 - `resolveReplyTo(emailReplyTo, legacyEmail): string | undefined` — helper PURO con fallback chain.
+
+## Cuerpo del mail — `mail-branding.ts` (composer único)
+
+Archivo: **`src/lib/mail-branding.ts`** — SSOT de la **composición del cuerpo HTML**.
+`composeBrandedEmailHtml({ message, branding })` envuelve el mensaje del operador
+(intacto, escapado, en `<pre>`) con el branding del tenant (firma/contacto/pie),
+agregando cada bloque solo si tiene contenido. Lo consumen **los dos** paths de
+envío de Factura (`sendSaleByEmail` y `sendSaleDraftByEmail`) → "lo configurado en
+Configuración → Correos es lo que se envía". El branding sale de
+`tenantMailContext` (sigue siendo la única lectura del Jewelry). NO compone
+From/Reply-To, NO toca PDF/DocumentTemplate.
+
+> Deuda conocida (fuera de alcance Sprint 1 "B-lite"): la paridad **byte-a-byte**
+> entre este HTML y el preview React de Correos NO está garantizada (el preview es
+> una maqueta visual). El contrato actual es "config = enviado" a nivel de datos.
+> La paridad exacta requiere un composer compartido (tptech-shared) → futuro
+> Sprint de Infraestructura Compartida.
 
 ## Tests
 
@@ -515,8 +532,21 @@ mezclan**:
 
 ### Campos implementados
 
+Defaults de carga de comprobante (los que edita "Mis preferencias"):
 `defaultWarehouseId`, `defaultSellerId`, `defaultPriceListId`,
-`defaultChannelId`, `defaultCurrencyId` (todos opcionales).
+`defaultChannelId`, `defaultCurrencyId`, `defaultBalanceMode` (todos opcionales).
+
+Otros campos del modelo persistidos por OTRAS pantallas (no por "Mis
+preferencias"): `defaultGlobalDiscountType` (card Descuento global de Factura),
+`invoiceLayoutConfig` + `preferredInvoiceViewPreset` + `invoiceUiPreferences`
+("Configuración de vista" de Factura).
+
+> **Gap conocido — `invoiceLayoutPresets` ("Mis vistas").** El frontend
+> (`useInvoiceLayout`) ENVÍA `invoiceLayoutPresets` en el `PUT /user-preferences/me`,
+> pero el backend NO tiene la columna ni la persiste (se descarta en silencio);
+> hoy las vistas nombradas sobreviven solo por `localStorage`. Implementar la
+> persistencia requiere migración Prisma → fuera de alcance del Sprint 1 de
+> certificación; queda para un sprint propio / Fase 3-4.
 
 ### Prioridad de resolución de defaults (orden obligatorio)
 

@@ -15,9 +15,10 @@
 // (`preview-confirm-parity.test.ts`, `confirm-sale-pricing-snapshot.test.ts`).
 //
 // Reglas críticas validadas:
-//   · R11.4 prioridad: documentOverride > entityBalanceMode > legacy
-//     balanceType > priceListDefault > tenantDefault > FALLBACK_UNIFIED.
-//   · El nuevo `balanceMode` del cliente GANA sobre `balanceType` legacy.
+//   · R11.4 prioridad: documentOverride > entityBalanceMode (cliente) >
+//     userPreferenceDefault > priceListDefault > tenantDefault > FALLBACK_UNIFIED.
+//   · Cliente = SUGERENCIA: `balanceMode` null delega; el legacy `balanceType`
+//     ya NO participa de la resolución (migrado por backfill 2026-06-14).
 //   · IVA / promo / descuento / manualPrice nunca tocan gramos físicos.
 //   · UNIFIED → metals=[], monetary.amount=total.
 //   · BREAKDOWN → metals agrupado por padre + valuación; monetary = total −
@@ -63,16 +64,19 @@ describe("resolveSaleBalanceMode — prioridad R11.4", () => {
     expect(r).toEqual({ mode: "UNIFIED", source: "ENTITY_DEFAULT" });
   });
 
-  it("fallback a legacy balanceType cuando balanceMode nuevo es null", () => {
-    // Cliente histórico solo tiene `balanceType` legacy.
+  it("cliente SIN preferencia (balanceMode null) DELEGA — el legacy balanceType ya NO fuerza", () => {
+    // Contrato 2026-06-14: el cliente es un nivel de SUGERENCIA. `balanceMode`
+    // null = "sin preferencia" → delega al siguiente nivel. El legacy
+    // `balanceType` (aunque esté poblado) dejó de participar; las filas
+    // históricas se migraron a `balanceMode` por backfill.
     const r = resolveSaleBalanceMode({
       documentOverride:        null,
       entityBalanceMode:       null,
-      entityBalanceTypeLegacy: "BREAKDOWN",
+      entityBalanceTypeLegacy: "BREAKDOWN", // presente pero IGNORADO
       priceListDefault:        "UNIFIED",
       tenantDefault:           "UNIFIED",
     });
-    expect(r).toEqual({ mode: "BREAKDOWN", source: "ENTITY_DEFAULT" });
+    expect(r).toEqual({ mode: "UNIFIED", source: "PRICELIST_DEFAULT" });
   });
 
   it("priceListDefault gana cuando documento y entity son null", () => {
@@ -1045,16 +1049,72 @@ describe("R11.4 — escenarios integrales de resolución", () => {
     expect(r.source).toBe("FALLBACK_UNIFIED");
   });
 
-  it("[back-compat balanceType] cliente histórico solo con balanceType legacy", () => {
+  it("[cliente sin preferencia] balanceMode null delega; legacy balanceType ya no impone", () => {
     const r = resolveSaleBalanceMode({
       documentOverride:        null,
-      entityBalanceMode:       null,           // nuevo campo aún null
-      entityBalanceTypeLegacy: "BREAKDOWN",    // solo legacy poblado
+      entityBalanceMode:       null,           // sin preferencia
+      entityBalanceTypeLegacy: "BREAKDOWN",    // IGNORADO (contrato 2026-06-14)
       priceListDefault:        "UNIFIED",
       tenantDefault:           "UNIFIED",
     });
-    expect(r.mode).toBe("BREAKDOWN");
-    expect(r.source).toBe("ENTITY_DEFAULT");
+    expect(r.mode).toBe("UNIFIED");
+    expect(r.source).toBe("PRICELIST_DEFAULT");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cliente como NIVEL DE SUGERENCIA — casos del contrato 2026-06-14
+//
+// El cliente pasó de DECIDIR a SUGERIR: `balanceMode` null = "sin preferencia"
+// → delega en Mis preferencias → Lista → Joyería → fallback. Estos casos
+// reproducen 1:1 las validaciones acordadas con el operador.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Cliente como nivel de SUGERENCIA (contrato 2026-06-14)", () => {
+  it("Caso 1: cliente sin preferencia + Mis preferencias Desglosado → Desglosado", () => {
+    const r = resolveSaleBalanceMode({
+      entityBalanceMode:     null,
+      userPreferenceDefault: "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "USER_PREFERENCE" });
+  });
+
+  it("Caso 2: cliente Unificado + Mis preferencias Desglosado → Unificado (el cliente sugiere y gana)", () => {
+    const r = resolveSaleBalanceMode({
+      entityBalanceMode:     "UNIFIED",
+      userPreferenceDefault: "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "UNIFIED", source: "ENTITY_DEFAULT" });
+  });
+
+  it("Caso 3: cliente sin pref + Mis pref sin pref + Lista Desglosado → Desglosado", () => {
+    const r = resolveSaleBalanceMode({
+      entityBalanceMode:     null,
+      userPreferenceDefault: null,
+      priceListDefault:      "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "PRICELIST_DEFAULT" });
+  });
+
+  it("Caso 4: cliente sin pref + resto sin definir → Joyería (tenant)", () => {
+    const r = resolveSaleBalanceMode({
+      entityBalanceMode: null,
+      tenantDefault:     "BREAKDOWN",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "TENANT_DEFAULT" });
+  });
+
+  it("Caso 5: todo sin definir → fallback UNIFIED", () => {
+    const r = resolveSaleBalanceMode({ entityBalanceMode: null });
+    expect(r).toEqual({ mode: "UNIFIED", source: "FALLBACK_UNIFIED" });
+  });
+
+  it("Caso 6: el override del operador gana aunque el cliente sugiera otra cosa", () => {
+    const r = resolveSaleBalanceMode({
+      documentOverride:  "BREAKDOWN",
+      entityBalanceMode: "UNIFIED",
+    });
+    expect(r).toEqual({ mode: "BREAKDOWN", source: "DOCUMENT_OVERRIDE" });
   });
 });
 

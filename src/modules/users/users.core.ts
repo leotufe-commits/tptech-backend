@@ -14,6 +14,7 @@ import { env } from "../../config/env.js";
 
 import { prisma } from "../../lib/prisma.js";
 import { auditLog } from "../../lib/auditLogger.js";
+import { themeSchema } from "./users.schemas.js";
 
 import {
   requireTenantId,
@@ -841,16 +842,18 @@ export async function updateMyFavoriteWarehouse(req: Request, res: Response) {
 /* =========================
    🎨 THEME PREFERENCE (ME)
 ========================= */
-const VALID_THEMES = ["classic", "dark", "blue", "gray", "emerald"] as const;
-
 export async function updateMyTheme(req: Request, res: Response) {
   const actorId = (req as any).userId as string;
-  const { theme } = req.body as { theme?: string };
 
-  const clean = String(theme ?? "").trim().toLowerCase();
-  if (!VALID_THEMES.includes(clean as any)) {
+  // Normalizamos antes de validar (compat: el frontend manda lowercase, pero
+  // toleramos espacios/casing). La lista válida vive en users.schemas.ts
+  // (themeSchema) — única fuente del backend.
+  const raw = String((req.body as { theme?: string })?.theme ?? "").trim().toLowerCase();
+  const parsed = themeSchema.safeParse({ theme: raw });
+  if (!parsed.success) {
     return res.status(400).json({ message: "Tema inválido." });
   }
+  const clean = parsed.data.theme;
 
   await prisma.user.update({
     where: { id: actorId },

@@ -33,6 +33,14 @@ vi.mock("../pricing-engine.cost.js", () => ({
   // a "regla METALS no aplica" — comportamiento neutral para tests viejos.
   getArticleMetalVariantIds: vi.fn().mockResolvedValue([]),
   loadArticleMetalVariantsBatch: vi.fn().mockResolvedValue(new Map()),
+  // applyAdjustment: helper PURO (sin DB) reutilizado por el branch combo para
+  // aplicar el lineAdj del cost-line. Réplica exacta de pricing-engine.cost.ts.
+  applyAdjustment: (base: any, kind?: any, adjType?: any, adjRaw?: any) => {
+    if (!kind || kind === "" || adjRaw == null) return base;
+    const absVal = new Prisma.Decimal(Math.abs(Number(adjRaw)).toString());
+    const adjAmount = adjType === "PERCENTAGE" ? base.mul(absVal.div(100)) : absVal;
+    return kind === "SURCHARGE" ? base.add(adjAmount) : base.sub(adjAmount);
+  },
 }));
 
 const mockResolvePriceList = vi.hoisted(() => vi.fn());
@@ -40,10 +48,31 @@ const mockApplyPriceList   = vi.hoisted(() => vi.fn());
 vi.mock("../pricing-engine.pricelist.js", () => ({
   resolvePriceList: (...args: any[]) => mockResolvePriceList(...args),
   applyPriceList:   (...args: any[]) => mockApplyPriceList(...args),
+  // Implementación PURA real (NO mockeada) — necesaria desde que el combo
+  // conserva `deferredRounding` y puede ejecutar el redondeo FINAL_PRICE/TOTAL.
+  // Espejo exacto de `applyRounding` en pricing-engine.pricelist.ts.
+  applyRounding: (value: any, mode: string, direction: string) => {
+    if (mode === "NONE") return value;
+    const v = Number(value?.toString?.() ?? value);
+    let step: number;
+    switch (mode) {
+      case "INTEGER":   step = 1;    break;
+      case "DECIMAL_1": step = 0.1;  break;
+      case "DECIMAL_2": step = 0.01; break;
+      case "TEN":       step = 10;   break;
+      case "HUNDRED":   step = 100;  break;
+      default: return value;
+    }
+    const rounded =
+      direction === "UP"   ? Math.ceil(v / step) * step  :
+      direction === "DOWN" ? Math.floor(v / step) * step :
+                             Math.round(v / step) * step;
+    return new Prisma.Decimal(String(rounded));
+  },
 }));
 
 // Import DESPUÉS de los mocks
-import { resolveFinalSalePrice } from "../pricing-engine.sale.js";
+import { resolveFinalSalePrice, buildPricingSnapshot } from "../pricing-engine.sale.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -602,6 +631,931 @@ describe("Combo comercial — guards del motor", () => {
     expect(comboStep).toBeDefined();
     expect(comboStep?.status).toBe("missing");
     expect(comboStep?.message).toMatch(/[Cc]iclo/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMBO — precio derivado de componentes (Opción A)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// El precio de venta de un COMBO_COMMERCIAL se deriva de sus componentes:
+//   precio combo = Σ(precio de venta del componente × cantidad) ± ajuste propio
+//   costo  combo = Σ(costo del componente × cantidad)
+// cuando NO hay lista de precios ni precio manual. priceSource="COMBO_COMPONENTS".
+// El ajuste reutiliza el SSOT applyComboAdjustment (combo.utils.ts).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Combo comercial — precio derivado de componentes (Opción A)", () => {
+  /** Registra artículos por id para el findFirst recursivo (combo + componentes). */
+  function registerArticles(map: Record<string, any>) {
+    mockPrisma.article.findFirst.mockImplementation(async (args: any) => {
+      const id = args?.where?.id;
+      return map[id] ?? null;
+    });
+  }
+
+  /** Línea de componente del combo (PRODUCT con catalogItemId). */
+  function comp(id: string, qty: number) {
+    return {
+      type: "PRODUCT",
+      catalogItemId: id,
+      quantity: new D(String(qty)),
+      catalogItem: { id, code: id.toUpperCase(), name: id },
+    };
+  }
+
+  it("1) combo con un componente con precio → unitCost/unitPrice/totalWithTax > 0", async () => {
+    registerArticles({
+      "combo-1": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("200") }),
+    });
+    mockResolveArticleCost.mockResolvedValue(costOf(100));
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-1" });
+
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.unitCost?.toNumber()).toBe(100);            // Σ costo componente × qty
+    expect(res.unitPrice?.toNumber()).toBe(200);           // Σ precio componente × qty
+    expect(res.totalWithTax?.toNumber()).toBeGreaterThan(0);
+    expect(res.partial).toBe(false);
+
+    // Step de trazabilidad del precio del combo
+    const priceStep = res.steps.find((s) => s.key === "COMBO_PRICE");
+    expect(priceStep?.status).toBe("ok");
+    expect((priceStep?.meta as any)?.subtotal).toBe(200);
+  });
+
+  it("2) varios componentes → unitCost = Σ(costo×qty), unitPrice = Σ(precio×qty)", async () => {
+    registerArticles({
+      "combo-2": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [comp("comp-a", 2), comp("comp-b", 3)],
+      }),
+      "comp-a": makeDbArticle({ useManualSalePrice: true, salePrice: new D("200") }),
+      "comp-b": makeDbArticle({ useManualSalePrice: true, salePrice: new D("300") }),
+    });
+    mockResolveArticleCost.mockResolvedValue(costOf(100)); // costo 100 por componente
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-2" });
+
+    expect(res.unitCost?.toNumber()).toBe(500);   // 100×2 + 100×3
+    expect(res.unitPrice?.toNumber()).toBe(1300);  // 200×2 + 300×3
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+  });
+
+  describe("3) ajuste propio del combo (comboAdjustmentKind/Value)", () => {
+    function comboWithAdjustment(kind: string, value: number | null) {
+      registerArticles({
+        "combo-adj": makeDbArticle({
+          commercialMode: "COMBO_COMMERCIAL",
+          comboAdjustmentKind: kind,
+          comboAdjustmentValue: value != null ? new D(String(value)) : null,
+          costComposition: [comp("comp-1", 1)],
+        }),
+        "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("1000") }),
+      });
+      mockResolveArticleCost.mockResolvedValue(costOf(400));
+    }
+
+    it("NONE → suma directa (1000)", async () => {
+      comboWithAdjustment("NONE", null);
+      const res = await resolveFinalSalePrice("j1", { articleId: "combo-adj" });
+      expect(res.unitPrice?.toNumber()).toBe(1000);
+    });
+
+    it("DISCOUNT_PERCENT 10 → 900", async () => {
+      comboWithAdjustment("DISCOUNT_PERCENT", 10);
+      const res = await resolveFinalSalePrice("j1", { articleId: "combo-adj" });
+      expect(res.unitPrice?.toNumber()).toBeCloseTo(900, 4);
+    });
+
+    it("SURCHARGE_PERCENT 10 → 1100", async () => {
+      comboWithAdjustment("SURCHARGE_PERCENT", 10);
+      const res = await resolveFinalSalePrice("j1", { articleId: "combo-adj" });
+      expect(res.unitPrice?.toNumber()).toBeCloseTo(1100, 4);
+    });
+
+    it("DISCOUNT_FIXED 250 → 750", async () => {
+      comboWithAdjustment("DISCOUNT_FIXED", 250);
+      const res = await resolveFinalSalePrice("j1", { articleId: "combo-adj" });
+      expect(res.unitPrice?.toNumber()).toBeCloseTo(750, 4);
+    });
+  });
+
+  it("4) simulador ↔ factura: el resolver compartido es determinístico (misma línea, mismo resultado)", async () => {
+    // El Simulador (getPricingPreview) y la Factura (previewSale) resuelven la
+    // línea con el MISMO resolveFinalSalePrice. Si el resolver es determinístico
+    // sobre el mismo input, ambas superficies muestran el mismo número.
+    registerArticles({
+      "combo-par": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [comp("comp-1", 2)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("150") }),
+    });
+    // mockImplementation → objeto de costo fresco por llamada (el branch combo
+    // muta costResult.value; en producción cada call recibe un objeto nuevo).
+    mockResolveArticleCost.mockImplementation(async () => costOf(80));
+
+    const sim = await resolveFinalSalePrice("j1", { articleId: "combo-par" });
+    const inv = await resolveFinalSalePrice("j1", { articleId: "combo-par" });
+
+    expect(inv.priceSource).toBe(sim.priceSource);
+    expect(inv.unitPrice?.toNumber()).toBe(sim.unitPrice?.toNumber());
+    expect(inv.unitCost?.toNumber()).toBe(sim.unitCost?.toNumber());
+    expect(inv.totalWithTax?.toNumber()).toBe(sim.totalWithTax?.toNumber());
+    expect(sim.unitPrice?.toNumber()).toBe(300); // 150 × 2
+  });
+
+  it("5) preview ↔ confirmación: el snapshot del precio del combo es estable entre llamadas", async () => {
+    // Preview y confirmación consumen el MISMO resolver. La estabilidad del
+    // COMBO_PRICE + totales entre llamadas idénticas es la base de la paridad
+    // preview/confirm (la parity full-stack vive en preview-confirm-parity.test.ts).
+    registerArticles({
+      "combo-snap": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        comboAdjustmentKind: "DISCOUNT_PERCENT",
+        comboAdjustmentValue: new D("20"),
+        costComposition: [comp("comp-1", 1), comp("comp-2", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("600") }),
+      "comp-2": makeDbArticle({ useManualSalePrice: true, salePrice: new D("400") }),
+    });
+    // objeto de costo fresco por llamada (ver nota en el test de paridad sim↔factura)
+    mockResolveArticleCost.mockImplementation(async () => costOf(200));
+
+    const previewRes = await resolveFinalSalePrice("j1", { articleId: "combo-snap" });
+    const confirmRes = await resolveFinalSalePrice("j1", { articleId: "combo-snap" });
+
+    // subtotal 1000, descuento 20% → 800
+    expect(previewRes.unitPrice?.toNumber()).toBeCloseTo(800, 4);
+    expect(confirmRes.unitPrice?.toNumber()).toBe(previewRes.unitPrice?.toNumber());
+    expect(confirmRes.unitCost?.toNumber()).toBe(previewRes.unitCost?.toNumber());
+
+    const pStep = previewRes.steps.find((s) => s.key === "COMBO_PRICE");
+    const cStep = confirmRes.steps.find((s) => s.key === "COMBO_PRICE");
+    expect((cStep?.meta as any)?.finalPrice).toBe((pStep?.meta as any)?.finalPrice);
+    expect((pStep?.meta as any)?.adjustmentAmount).toBeCloseTo(200, 4); // 20% de 1000
+  });
+
+  it("6) componente sin precio → no explota, marca parcial y deja advertencia clara", async () => {
+    registerArticles({
+      "combo-miss": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [comp("comp-ok", 1), comp("comp-noprice", 1)],
+      }),
+      "comp-ok":      makeDbArticle({ useManualSalePrice: true, salePrice: new D("500") }),
+      "comp-noprice": makeDbArticle({ /* sin precio manual ni lista → noPrice */ }),
+    });
+    mockResolveArticleCost.mockResolvedValue(costOf(100));
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-miss" });
+
+    // No rompe: el combo conserva el precio del componente válido
+    expect(res.unitPrice?.toNumber()).toBe(500);
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.partial).toBe(true);
+
+    const priceStep = res.steps.find((s) => s.key === "COMBO_PRICE");
+    expect(priceStep).toBeDefined();
+    expect(priceStep?.status).toBe("partial");
+    expect((priceStep?.meta as any)?.componentsWithPrice).toBe(1);
+    expect((priceStep?.meta as any)?.componentsMissingPrice).toBe(1);
+  });
+
+  it("combo con salePrice=0 residual + componentes con precio → COMBO_COMPONENTS (no MANUAL_FALLBACK)", async () => {
+    // Regresión: el combo puede tener salePrice=0 persistido (legacy). El
+    // fallback salePrice NO debe ganarle al precio derivado de componentes.
+    registerArticles({
+      "combo-sp0": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        salePrice: new D("0"),          // ← salePrice residual no-nulo
+        useManualSalePrice: false,
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("750") }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(300));
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-sp0" });
+
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.unitPrice?.toNumber()).toBe(750);
+    expect(res.unitCost?.toNumber()).toBe(300);
+    expect(res.totalWithTax?.toNumber()).toBeGreaterThan(0);
+  });
+
+  it("no regresiona: combo CON precio manual propio NO usa el derivado", async () => {
+    // Si el operador fijó precio manual en el combo, ese gana (igual que
+    // cualquier artículo). El derivado solo entra cuando no hay lista ni manual.
+    registerArticles({
+      "combo-man": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        useManualSalePrice: true,
+        salePrice: new D("9999"),
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("200") }),
+    });
+    mockResolveArticleCost.mockResolvedValue(costOf(100));
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-man" });
+
+    expect(res.priceSource).toBe("MANUAL_OVERRIDE");
+    expect(res.unitPrice?.toNumber()).toBe(9999);
+  });
+
+  // ── Shadow del override manual = 0 en combos (fix de precedencia) ─────────
+  // El "0" inicial de la línea (campo Precio editable) NO debe pisar el precio
+  // derivado del combo. Un override REAL del operador (> 0) sigue ganando.
+  it("Caso 1: combo + manualPriceOverride=0 → NO shadowea, queda COMBO_COMPONENTS", async () => {
+    registerArticles({
+      "combo-z": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        salePrice: new D("0"),
+        useManualSalePrice: false,
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("673") }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(300));
+
+    const res = await resolveFinalSalePrice("j1", {
+      articleId: "combo-z",
+      manualPriceOverride: 0,        // ← 0 inicial de la línea, NO override real
+    });
+
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.unitPrice?.toNumber()).toBe(673);
+    expect(res.totalWithTax?.toNumber()).toBeGreaterThan(0);
+  });
+
+  it("Caso 2: combo + manualPriceOverride=800000 → override REAL gana (MANUAL_OVERRIDE)", async () => {
+    registerArticles({
+      "combo-m": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        salePrice: new D("0"),
+        useManualSalePrice: false,
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("673") }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(300));
+
+    const res = await resolveFinalSalePrice("j1", {
+      articleId: "combo-m",
+      manualPriceOverride: 800000,
+    });
+
+    expect(res.priceSource).toBe("MANUAL_OVERRIDE");
+    expect(res.unitPrice?.toNumber()).toBe(800000);
+  });
+
+  it("Caso 3: artículo NORMAL + manualPriceOverride=0 → comportamiento intacto (MANUAL_OVERRIDE=0)", async () => {
+    // No combo (comboDerivedPrice=null) → el override 0 sigue siendo válido.
+    registerArticles({
+      "art-normal": makeDbArticle({ salePrice: new D("1000") }), // basePrice vía MANUAL_FALLBACK
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(400));
+
+    const res = await resolveFinalSalePrice("j1", {
+      articleId: "art-normal",
+      manualPriceOverride: 0,
+    });
+
+    expect(res.priceSource).toBe("MANUAL_OVERRIDE");
+    expect(res.unitPrice?.toNumber()).toBe(0);
+  });
+
+  // ── Caso real: lista/promo del combo resuelve basePrice=0 (no null) ───────
+  // Una PRICE_LIST en modo margen evalúa a 0 sobre el combo (costo agregado 0),
+  // dejando basePrice=0 y, antes del fix, bloqueando el branch COMBO_COMPONENTS
+  // (que exigía basePrice==null). El componente SÍ tiene precio → el combo debe
+  // resolver con el precio derivado, no quedar en 0.
+  it("combo con PRICE_LIST que deja basePrice=0 + componentes con precio → COMBO_COMPONENTS, unitPrice>0", async () => {
+    registerArticles({
+      "combo-pl0": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        categoryId: "cat-combo",                 // ← solo el combo tiene lista (por categoría)
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({
+        categoryId: null,
+        useManualSalePrice: true,
+        salePrice: new D("673289.37"),           // ← el componente SÍ tiene precio
+      }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(0)); // costo combo 0
+    // Lista SOLO para el combo (categoryId="cat-combo"); el componente no matchea.
+    mockResolvePriceList.mockImplementation(async (_jw: string, opts: any) =>
+      opts?.categoryId === "cat-combo"
+        ? { priceList: { id: "pl-combo", name: "Lista Combo", mode: "MARGIN_TOTAL" }, source: "CATEGORY" }
+        : null,
+    );
+    // La lista evalúa a 0 sobre el combo (margen sobre costo 0).
+    mockApplyPriceList.mockReturnValue({ value: new D("0"), partial: false });
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-pl0" });
+
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.basePrice?.toNumber()).toBeGreaterThan(0);
+    expect(res.unitPrice?.toNumber()).toBeGreaterThan(0);
+    expect(res.unitPrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    expect(res.totalWithTax?.toNumber()).toBeGreaterThan(0);
+    // La lista que resolvió 0 no debe quedar atribuida.
+    expect(res.appliedPriceListId).toBeNull();
+  });
+
+  // ── Opción A: base del combo INMUNE a promo del componente ────────────────
+  // Una promoción scope ALL pega al combo Y (recursivamente) a cada componente.
+  // El precio del combo debe derivar del BASE del componente (pre-promo), NO de
+  // su unitPrice (post-promo) → la promo se aplica UNA sola vez sobre la base
+  // real, sin doble conteo.
+  it("caso real: promo scope ALL + combo → base = precio BASE del componente (no post-promo), promo 1 sola vez", async () => {
+    mockPrisma.promotion.findMany.mockResolvedValue([{
+      id: "promo-all", name: "PROMO ALL",
+      type: "PERCENTAGE", value: new D("50"),
+      scope: "ALL",
+      validFrom: null, validTo: null,
+      isActive: true, deletedAt: null, priority: 1,
+    }]);
+    registerArticles({
+      "combo-promo": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [comp("comp-1", 1)],
+      }),
+      "comp-1": makeDbArticle({ useManualSalePrice: true, salePrice: new D("673289.37") }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(100000));
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-promo" });
+
+    // base = precio BASE del componente (673289.37), NO el post-promo (336644.685).
+    // Con el bug anterior (usar unitPrice) basePrice habría quedado en 336644.685.
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    // promo del combo aplicada UNA sola vez sobre la base real (50% off):
+    //   673289.37 × 0.5 = 336644.685   (NO 168322.34 = doble promo)
+    expect(res.unitPrice?.toNumber()).toBeCloseTo(336644.685, 2);
+    expect(res.unitPrice!.toNumber()).toBeGreaterThan(0);
+    expect(res.priceSource).toBe("PROMOTION");
+    expect(res.appliedPromotionId).toBe("promo-all");
+    expect(res.promotionDiscountAmount!.toNumber()).toBeGreaterThan(0);
+    expect(res.totalWithTax?.toNumber()).toBeGreaterThan(0);
+  });
+
+  // ── Propagación del contexto comercial a la recursión del componente ──────
+  // Root cause runtime: el componente deriva su precio de la LISTA. Resuelto
+  // "bare" (sin lista/cliente del documento) devolvía null → comboDerivedPrice
+  // colapsaba → basePrice=0. La recursión ahora propaga clientId/priceList del
+  // documento → el componente resuelve igual que individualmente (673289.37).
+  it("caso real: componente con precio SOLO por lista → la recursión propaga el contexto → combo > 0", async () => {
+    const comboList = { id: "pl-combo", name: "L combo", mode: "MARGIN_TOTAL",
+      marginTotal: null, marginMetal: null, marginHechura: null, costPerGram: null,
+      surcharge: null, minimumPrice: null, roundingTarget: "NONE", roundingMode: "NONE",
+      roundingDirection: "NEAREST", validFrom: null, validTo: null, isActive: true };
+    const compList = { ...comboList, id: "pl-comp", name: "L comp" };
+
+    registerArticles({
+      "combo-ctx": makeDbArticle({
+        commercialMode: "COMBO_COMMERCIAL",
+        categoryId: "cat-combo",
+        costComposition: [comp("comp-1", 1)],
+      }),
+      // El componente NO tiene precio propio (ni salePrice ni override): su
+      // precio sale exclusivamente de la lista resuelta por clientId.
+      "comp-1": makeDbArticle({ categoryId: null }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(100000));
+    // Lista del combo (por categoría) → 0. Lista del componente (por cliente) → 673289.37.
+    mockResolvePriceList.mockImplementation(async (_jw: string, opts: any) => {
+      if (opts?.categoryId === "cat-combo") return { priceList: comboList, source: "CATEGORY" };
+      if (opts?.clientId) return { priceList: compList, source: "CLIENT" };
+      return null; // bare (sin contexto) → el componente NO resolvía precio
+    });
+    mockApplyPriceList.mockImplementation((priceList: any) =>
+      priceList?.id === "pl-combo"
+        ? { value: new D("0"), partial: false }
+        : { value: new D("673289.37"), partial: false },
+    );
+
+    // El documento se resuelve CON clientId (contexto comercial real).
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo-ctx", clientId: "cli-1" });
+
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);  // = precio individual del componente
+    expect(res.unitPrice?.toNumber()).toBeGreaterThan(0);
+    expect(res.totalWithTax?.toNumber()).toBeGreaterThan(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMBO — ajuste interno del cost-line (lineAdj) en el precio base (Modelo A)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Fuente ÚNICA: cost-line del componente → lineAdj interno → margen → venta.
+//   costLineAdj  = applyAdjustment(unitValue × qty, lineAdj)
+//   marginFactor = componentResult.basePrice / componentResult.unitCost
+//   contribución = costLineAdj × marginFactor
+// Elimina la doble fuente de verdad (composición vs precio principal).
+// Caso BR000: unitValue=404378, unitCost=404378, basePrice=748099,30 → margen 1,85.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("Combo — lineAdj del cost-line afecta el precio base (Modelo A)", () => {
+  function registerArticles(map: Record<string, any>) {
+    mockPrisma.article.findFirst.mockImplementation(async (args: any) => map[args?.where?.id] ?? null);
+  }
+  /** Cost-line de componente con unitValue + ajuste interno opcional. */
+  function compAdj(
+    id: string, qty: number, unitValue: number,
+    adj?: { kind: string; type: string; value: number },
+    type: "PRODUCT" | "SERVICE" = "PRODUCT",
+  ) {
+    return {
+      type, catalogItemId: id, quantity: new D(String(qty)),
+      unitValue: new D(String(unitValue)),
+      lineAdjKind:  adj?.kind  ?? "",
+      lineAdjType:  adj?.type  ?? "",
+      lineAdjValue: adj?.value != null ? new D(String(adj.value)) : null,
+      catalogItem: { id, code: id.toUpperCase(), name: id },
+    };
+  }
+  // BR000-like: basePrice 748099,30 (manual), unitCost 404378 → margen 1,85.
+  const BR000 = { useManualSalePrice: true, salePrice: new D("748099.30") };
+
+  it("1) PERCENTAGE −10% → basePrice = costLineAdj × margen (673289,37)", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    // El subtotal del COMBO_PRICE (que alimenta basePrice) = venta ajustada → paridad con composición.
+    const step = res.steps.find((s) => s.key === "COMBO_PRICE");
+    expect((step?.meta as any)?.subtotal).toBeCloseTo(673289.37, 2);
+  });
+
+  it("2) sin lineAdj → basePrice = componentResult.basePrice (748099,30) — regresión", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 404378)] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(748099.30, 2);
+  });
+
+  it("3) FIXED_AMOUNT −$20.000 → Opción A (cost → fijo → margen): impacto venta = 20000×margen", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "FIXED_AMOUNT", value: 20000 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // (404378 − 20000) × 1,85 = 711099,30 ; impacto = 748099,30 − 711099,30 = 37000 = 20000 × 1,85
+    expect(res.basePrice?.toNumber()).toBeCloseTo(711099.30, 2);
+  });
+
+  it("4) recargo SURCHARGE +10% → basePrice = 748099,30 × 1,10 = 822909,23", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 404378, { kind: "SURCHARGE", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(822909.23, 2);
+  });
+
+  it("5) múltiples componentes con lineAdj y márgenes distintos → Σ contribuciones", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [
+          compAdj("a", 1, 100, { kind: "BONUS", type: "PERCENTAGE", value: 10 }), // 90 × (200/100=2) = 180
+          compAdj("b", 1, 100),                                                   // 100 × (300/100=3) = 300
+        ] }),
+      "a": makeDbArticle({ useManualSalePrice: true, salePrice: new D("200") }),
+      "b": makeDbArticle({ useManualSalePrice: true, salePrice: new D("300") }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(100));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(480, 2); // 180 + 300
+  });
+
+  it("6) componente SERVICE con lineAdj → aporta su contribución", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("svc", 1, 250, { kind: "BONUS", type: "PERCENTAGE", value: 10 }, "SERVICE")] }),
+      "svc": makeDbArticle({ useManualSalePrice: true, salePrice: new D("500") }),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(250));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // 250×0,9=225 × (500/250=2) = 450
+    expect(res.basePrice?.toNumber()).toBeCloseTo(450, 2);
+  });
+
+  it("7) ajuste propio del combo + lineAdj → orden: componente-adj, luego combo-adj", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        comboAdjustmentKind: "DISCOUNT_PERCENT", comboAdjustmentValue: new D("5"),
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // 673289,37 × 0,95 = 639624,90
+    expect(res.basePrice?.toNumber()).toBeCloseTo(639624.90, 2);
+  });
+
+  it("8) unitValue=0 legacy → fallback a venta standalone (748099,30)", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 0, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // unitValue=0 → bifurcación legacy → componentResult.basePrice × qty (ignora lineAdj)
+    expect(res.basePrice?.toNumber()).toBeCloseTo(748099.30, 2);
+  });
+
+  it("9) preview ↔ confirm: determinístico (mismo basePrice en 2 llamadas)", async () => {
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const a = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    const b = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(b.basePrice?.toNumber()).toBe(a.basePrice?.toNumber());
+    expect(b.unitPrice?.toNumber()).toBe(a.unitPrice?.toNumber());
+  });
+
+  it("10) combo + promo scope ALL → promo UNA vez sobre el basePrice ajustado (sin doble)", async () => {
+    mockPrisma.promotion.findMany.mockResolvedValue([{
+      id: "promo-all", name: "PROMO ALL", type: "PERCENTAGE", value: new D("10"),
+      scope: "ALL", validFrom: null, validTo: null, isActive: true, deletedAt: null, priority: 1,
+    }]);
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // basePrice (con lineAdj, inmune a la promo del componente) = 673289,37
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    // promo del combo 10% UNA vez → 673289,37 × 0,9 = 605960,43 (NO doble)
+    expect(res.unitPrice?.toNumber()).toBeCloseTo(605960.43, 2);
+    expect(res.priceSource).toBe("PROMOTION");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMBO — precedencia COMBO_COMPONENTS > PRICE_LIST (Modelo A)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Bug: la PRICE_LIST sobre comboCost (sin lineAdj) producía basePrice > 0 y el
+// gate viejo (solo ≤0) no lo reemplazaba. Ahora, si el combo se construyó desde
+// cost-lines reales (comboPriceUsedCostLines), comboDerivedPrice gana sobre la
+// lista; la lista conserva su atribución (priceListId/name/mode).
+// BR000: unitValue=404378, unitCost=404378, basePrice=748099,30 → margen 1,85.
+//   comboCost × margen (lista) = 748099,30 ; comboDerivedPrice = 673289,37.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("Combo — precedencia COMBO_COMPONENTS > PRICE_LIST", () => {
+  function registerArticles(map: Record<string, any>) {
+    mockPrisma.article.findFirst.mockImplementation(async (args: any) => map[args?.where?.id] ?? null);
+  }
+  function compAdj(id: string, qty: number, unitValue: number, adj?: { kind: string; type: string; value: number }) {
+    return {
+      type: "PRODUCT", catalogItemId: id, quantity: new D(String(qty)), unitValue: new D(String(unitValue)),
+      lineAdjKind: adj?.kind ?? "", lineAdjType: adj?.type ?? "",
+      lineAdjValue: adj?.value != null ? new D(String(adj.value)) : null,
+      catalogItem: { id, code: id.toUpperCase(), name: id },
+    };
+  }
+  const BR000 = { categoryId: null, useManualSalePrice: true, salePrice: new D("748099.30") };
+  const comboList = { id: "pl-combo", name: "Lista Unificada", mode: "MARGIN_TOTAL",
+    marginTotal: null, marginMetal: null, marginHechura: null, costPerGram: null, surcharge: null,
+    minimumPrice: null, roundingTarget: "NONE", roundingMode: "NONE", roundingDirection: "NEAREST",
+    validFrom: null, validTo: null, isActive: true };
+
+  /** Lista solo para el combo (categoryId="cat"); aplica margen 1,85 sobre el costo. */
+  function setupComboWithList(extra?: any, applyImpl?: any) {
+    mockResolvePriceList.mockImplementation(async (_jw: string, opts: any) =>
+      opts?.categoryId === "cat" ? { priceList: comboList, source: "CATEGORY" } : null);
+    mockApplyPriceList.mockImplementation(applyImpl ?? ((_pl: any, cost: any) =>
+      ({ value: new D(String(Number(cost?.value ?? 0) * 1.85)), partial: false })));
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL", categoryId: "cat",
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "PERCENTAGE", value: 10 })], ...extra }),
+      "br000": makeDbArticle(BR000),
+    });
+  }
+
+  it("1+2+7) caso real: el combo (673289,37) gana sobre la lista (748099,30) y conserva appliedPriceList*", async () => {
+    setupComboWithList();
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);     // combo gana
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.appliedPriceListId).toBe("pl-combo");                 // lista conservada
+    expect(res.appliedPriceListName).toBe("Lista Unificada");
+    const step = res.steps.find((s) => s.key === "COMBO_PRICE");
+    expect((step?.meta as any)?.subtotal).toBeCloseTo(673289.37, 2); // COMBO_PRICE.subtotal == basePrice
+  });
+
+  it("5) legacy unitValue=0 + lista → la lista pricea (combo NO la pisa)", async () => {
+    setupComboWithList({ costComposition: [compAdj("br000", 1, 0, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] });
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // comboPriceUsedCostLines=false → la lista (748099,30) gana → priceSource PRICE_LIST
+    expect(res.priceSource).toBe("PRICE_LIST");
+    expect(res.basePrice?.toNumber()).toBeCloseTo(748099.30, 2);
+  });
+
+  it("6) manual override REAL del artículo gana sobre el combo (priceSource MANUAL_OVERRIDE)", async () => {
+    // Sin lista → PRICE_LIST skipped → manual override del artículo fija basePrice.
+    mockResolvePriceList.mockResolvedValue(null);
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        useManualSalePrice: true, salePrice: new D("999999"),
+        costComposition: [compAdj("br000", 1, 404378, { kind: "BONUS", type: "PERCENTAGE", value: 10 })] }),
+      "br000": makeDbArticle(BR000),
+    });
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.priceSource).toBe("MANUAL_OVERRIDE");
+    expect(res.basePrice?.toNumber()).toBe(999999);
+  });
+
+  it("8) reset de rounding: la lista emitió appliedRounding sobre el valor viejo → null tras el override", async () => {
+    setupComboWithList(undefined, (_pl: any, cost: any) => ({
+      value: new D(String(Number(cost?.value ?? 0) * 1.85)),
+      partial: false,
+      preRounding: new D(String(Number(cost?.value ?? 0) * 1.85 + 5)), // fuerza appliedRounding en el bloque PRICE_LIST
+      roundingMode: "INTEGER", roundingDirection: "NEAREST",
+    }));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.appliedRounding).toBeNull(); // R1: reset del artefacto stale de la lista
+  });
+
+  it("9) margin warning: el caso real NO dispara bloqueo espurio (margen sano)", async () => {
+    setupComboWithList();
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // margen = (673289,37 − 404378) / 673289,37 ≈ 39,9% > umbral 15% → positivo, sin block
+    expect(res.marginPercent?.toNumber()).toBeGreaterThan(15);
+    expect(res.unitPrice?.toNumber()).toBeGreaterThan(0);
+  });
+
+  it("4) artículo normal con lista: sin cambios (regresión)", async () => {
+    mockResolvePriceList.mockResolvedValue({ priceList: comboList, source: "GENERAL" });
+    mockApplyPriceList.mockReturnValue({ value: new D("5000"), partial: false });
+    mockResolveArticleCost.mockImplementation(async () => costOf(2000));
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle()); // no combo
+    const res = await resolveFinalSalePrice("j1", { articleId: "a1" });
+    expect(res.priceSource).toBe("PRICE_LIST");   // combo no interviene
+    expect(res.basePrice?.toNumber()).toBe(5000);
+    expect(res.appliedPriceListId).toBe("pl-combo");
+  });
+
+  // ── FIX 2026-06-11 — combo conserva el Redondeo Comercial FINAL_PRICE/TOTAL ──
+  // El combo debe comportarse como un artículo monetario de lista unificada:
+  // `deferredRounding` (config de la lista) SOBREVIVE al override del combo y
+  // su `totalWithTax` se redondea fresco, igual que un artículo normal.
+
+  it("11) FIX combo en lista con redondeo TOTAL/HUNDRED: PRE → POST (deferredRounding sobrevive)", async () => {
+    setupComboWithList(undefined, (_pl: any, cost: any) => ({
+      value:    new D(String(Number(cost?.value ?? 0) * 1.85)),
+      partial:  false,
+      // La lista delega un redondeo FINAL_PRICE/TOTAL a HUNDRED.
+      roundingDeferred: { applyOn: "TOTAL", mode: "HUNDRED", direction: "NEAREST" },
+    }));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    // basePrice (comboDerivedPrice) NO cambia — el fix solo afecta totalWithTax.
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    // appliedRounding se RECALCULA fresco sobre el totalWithTax del combo.
+    expect(res.appliedRounding).not.toBeNull();
+    expect(res.appliedRounding!.applyOn).toBe("TOTAL");
+    expect(Number(res.appliedRounding!.preRounding)).toBeCloseTo(673289.37, 2);
+    expect(Number(res.appliedRounding!.postRounding)).toBe(673300);  // PRE 673289,37 → POST 673300
+    // totalWithTax pasa de PRE a POST.
+    expect(res.totalWithTax?.toNumber()).toBe(673300);
+  });
+
+  it("12) FIX combo SIN redondeo de lista: POST = PRE (no inventa impacto)", async () => {
+    setupComboWithList();   // applyPriceList default — sin roundingDeferred
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+    expect(res.appliedRounding).toBeNull();                 // sin redondeo → null
+    expect(res.totalWithTax?.toNumber()).toBeCloseTo(673289.37, 2); // POST == PRE
+  });
+
+  it("13) FIX artículo NORMAL en lista con redondeo TOTAL: sin regresión (redondea igual)", async () => {
+    mockResolvePriceList.mockResolvedValue({ priceList: comboList, source: "GENERAL" });
+    mockApplyPriceList.mockReturnValue({
+      value:   new D("5049"),
+      partial: false,
+      roundingDeferred: { applyOn: "TOTAL", mode: "HUNDRED", direction: "NEAREST" },
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(2000));
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle()); // no combo
+    const res = await resolveFinalSalePrice("j1", { articleId: "a1" });
+    expect(res.priceSource).toBe("PRICE_LIST");
+    expect(res.basePrice?.toNumber()).toBe(5049);
+    expect(res.appliedRounding).not.toBeNull();
+    expect(Number(res.appliedRounding!.postRounding)).toBe(5000);   // 5049 → nearest hundred
+  });
+
+  // ── FIX paridad Preview↔Confirm para líneas applyOn=TOTAL ──────────────────
+  // El redondeo TOTAL vive solo en `appliedRounding` (no se hornea en unitPrice).
+  // buildPricingSnapshot DEBE persistirlo para que confirmSale recupere el delta
+  // `(post−pre)×qty` (MISMA fórmula que preview) → Preview == Confirm.
+
+  it("14) FIX buildPricingSnapshot persiste appliedRounding cuando el motor lo aplicó (combo TOTAL)", async () => {
+    setupComboWithList(undefined, (_pl: any, cost: any) => ({
+      value:    new D(String(Number(cost?.value ?? 0) * 1.85)),
+      partial:  false,
+      roundingDeferred: { applyOn: "TOTAL", mode: "HUNDRED", direction: "NEAREST" },
+    }));
+    const res  = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    const snap = buildPricingSnapshot(res);
+    // El snapshot lleva el redondeo congelado (5 campos canónicos).
+    expect(snap.appliedRounding).toBeDefined();
+    expect(snap.appliedRounding).toMatchObject({
+      applyOn:   "TOTAL",
+      mode:      "HUNDRED",
+      direction: "NEAREST",
+    });
+    expect(snap.appliedRounding!.preRounding).toBeCloseTo(673289.37, 2);
+    expect(snap.appliedRounding!.postRounding).toBe(673300);
+    // Paridad por construcción: confirm computa (post−pre)×qty con estos valores.
+    const qty = 1;
+    const confirmDelta = (snap.appliedRounding!.postRounding - snap.appliedRounding!.preRounding) * qty;
+    expect(Math.round(confirmDelta * 100) / 100).toBeCloseTo(10.63, 2); // 673300 − 673289,37
+  });
+
+  it("15) FIX buildPricingSnapshot OMITE appliedRounding cuando no hubo redondeo (back-compat)", async () => {
+    setupComboWithList();   // applyPriceList default — sin roundingDeferred
+    const res  = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    const snap = buildPricingSnapshot(res);
+    // Snapshot viejo / sin redondeo → campo ausente → confirm cae a delta 0.
+    expect(snap.appliedRounding).toBeUndefined();
+  });
+
+  it("16) FIX snapshot persiste appliedRounding también para artículo NORMAL applyOn=TOTAL", async () => {
+    mockResolvePriceList.mockResolvedValue({ priceList: comboList, source: "GENERAL" });
+    mockApplyPriceList.mockReturnValue({
+      value:   new D("5049"),
+      partial: false,
+      roundingDeferred: { applyOn: "TOTAL", mode: "HUNDRED", direction: "NEAREST" },
+    });
+    mockResolveArticleCost.mockImplementation(async () => costOf(2000));
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle()); // no combo
+    const res  = await resolveFinalSalePrice("j1", { articleId: "a1" });
+    const snap = buildPricingSnapshot(res);
+    expect(snap.appliedRounding).toMatchObject({ applyOn: "TOTAL" });
+    expect(snap.appliedRounding!.postRounding).toBe(5000);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMBO — costLineOverrides recalculan comboDerivedPrice (edición en Factura)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Al editar la tabla de composición, el operador genera costLineOverrides por
+// costLineId. El branch combo debe usar los valores EFECTIVOS (qty/unitValue/
+// lineAdj) para reconstruir comboDerivedPrice → basePrice. Espejo de
+// calculateCostFromLines. BR000: unitCost 404378, basePrice 748099,30 → margen 1,85.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("Combo — costLineOverrides recalculan el precio", () => {
+  function registerArticles(map: Record<string, any>) {
+    mockPrisma.article.findFirst.mockImplementation(async (args: any) => map[args?.where?.id] ?? null);
+  }
+  /** Cost-line con id (para que el override matchee por costLineId). */
+  function compId(costLineId: string, articleId: string, qty: number, unitValue: number,
+    adj?: { kind: string; type: string; value: number }, type: "PRODUCT" | "SERVICE" = "PRODUCT") {
+    return {
+      id: costLineId, type, catalogItemId: articleId, quantity: new D(String(qty)),
+      unitValue: new D(String(unitValue)),
+      lineAdjKind: adj?.kind ?? "", lineAdjType: adj?.type ?? "",
+      lineAdjValue: adj?.value != null ? new D(String(adj.value)) : null,
+      catalogItem: { id: articleId, code: articleId.toUpperCase(), name: articleId },
+    };
+  }
+  const BR000 = { useManualSalePrice: true, salePrice: new D("748099.30") };
+  function setup(costComposition: any[]) {
+    mockResolveArticleCost.mockImplementation(async () => costOf(404378));
+    registerArticles({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL", costComposition }),
+      "br000": makeDbArticle(BR000),
+      "svc":   makeDbArticle({ useManualSalePrice: true, salePrice: new D("500") }),
+    });
+  }
+
+  it("1) override quantity → basePrice escala", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT", quantityOverride: 2 }] });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(1496198.60, 2);  // 404378×2 × 1,85
+  });
+
+  it("2) override unitValue → recalcula basePrice", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT", unitValueOverride: 500000 }] });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(925000, 2);  // 500000 × 1,85
+  });
+
+  it("3) override lineAdj PERCENTAGE → recalcula basePrice", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);  // sin lineAdj persistido
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT", adjustmentKind: "BONUS", adjustmentType: "PERCENTAGE", adjustmentValue: 10 }] });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(673289.37, 2);  // 404378×0,9 × 1,85
+  });
+
+  it("4) override lineAdj FIXED_AMOUNT → recalcula basePrice", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT", adjustmentKind: "BONUS", adjustmentType: "FIXED_AMOUNT", adjustmentValue: 20000 }] });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(711099.30, 2);  // (404378−20000) × 1,85
+  });
+
+  it("5) multi-componente: overrides por costLineId", async () => {
+    setup([compId("cl-1", "a", 1, 100), compId("cl-2", "b", 1, 100)]);
+    mockPrisma.article.findFirst.mockImplementation(async (args: any) => ({
+      "combo": makeDbArticle({ commercialMode: "COMBO_COMMERCIAL",
+        costComposition: [compId("cl-1", "a", 1, 100), compId("cl-2", "b", 1, 100)] }),
+      "a": makeDbArticle({ useManualSalePrice: true, salePrice: new D("200") }),  // margen 2
+      "b": makeDbArticle({ useManualSalePrice: true, salePrice: new D("300") }),  // margen 3
+    } as any)[args?.where?.id] ?? null);
+    mockResolveArticleCost.mockImplementation(async () => costOf(100));
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [
+        { costLineId: "cl-1", type: "PRODUCT", unitValueOverride: 150 },  // 150×2 = 300
+        { costLineId: "cl-2", type: "PRODUCT", quantityOverride: 2 },     // 100×2×3 = 600
+      ] });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(900, 2);  // 300 + 600
+  });
+
+  it("6) service dentro del combo: override aplica", async () => {
+    setup([compId("cl-1", "svc", 1, 250, undefined, "SERVICE")]);
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "SERVICE", unitValueOverride: 300 }] });
+    // svc: basePrice 500 / unitCost 404378... ojo: margen = 500/404378. Hagamos costo coherente.
+    // (acá unitCost del componente = costOf(404378) → margen chico). Validamos sólo que recalcula > 0.
+    expect(res.basePrice?.toNumber()).toBeGreaterThan(0);
+    expect(res.priceSource).toBe("COMBO_COMPONENTS");
+  });
+
+  it("7) paridad: COMBO_PRICE.subtotal === basePrice tras override", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT", unitValueOverride: 500000 }] });
+    const step = res.steps.find((s) => s.key === "COMBO_PRICE");
+    expect((step?.meta as any)?.subtotal).toBeCloseTo(res.basePrice!.toNumber(), 2);
+  });
+
+  it("8) preview ↔ confirm: determinístico con override", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);
+    const opts = { articleId: "combo", costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT" as const, unitValueOverride: 500000 }] };
+    const a = await resolveFinalSalePrice("j1", opts);
+    const b = await resolveFinalSalePrice("j1", opts);
+    expect(b.basePrice?.toNumber()).toBe(a.basePrice?.toNumber());
+  });
+
+  it("9) combo SIN override → basePrice persistido (regresión)", async () => {
+    setup([compId("cl-1", "br000", 1, 404378)]);
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo" });
+    expect(res.basePrice?.toNumber()).toBeCloseTo(748099.30, 2);  // 404378 × 1,85
+  });
+
+  it("10) legacy unitValue=0 + override unitValue>0 → entra al pipeline nuevo", async () => {
+    setup([compId("cl-1", "br000", 1, 0)]);  // unitValue=0 (legacy)
+    const res = await resolveFinalSalePrice("j1", { articleId: "combo",
+      costLineOverrides: [{ costLineId: "cl-1", type: "PRODUCT", unitValueOverride: 500000 }] });
+    // effectiveUnitValue=500000 > 0 → pipeline nuevo → 500000 × 1,85 = 925000 (NO fallback 748099,30)
+    expect(res.basePrice?.toNumber()).toBeCloseTo(925000, 2);
+  });
+
+  it("11) artículo normal con override → el branch combo no interviene", async () => {
+    mockResolvePriceList.mockResolvedValue(null);
+    mockResolveArticleCost.mockImplementation(async () => costOf(1000));
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({ useManualSalePrice: true, salePrice: new D("3000") }));
+    const res = await resolveFinalSalePrice("j1", { articleId: "a1",
+      costLineOverrides: [{ costLineId: "x", type: "PRODUCT", unitValueOverride: 999 }] });
+    expect(res.priceSource).toBe("MANUAL_OVERRIDE");  // no combo, sin cambio de path
+    expect(res.basePrice?.toNumber()).toBe(3000);
   });
 });
 

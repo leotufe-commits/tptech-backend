@@ -207,6 +207,10 @@ model Warehouse {
   jewelryId            String
   name                 String
   isActive             Boolean               @default(true)
+  // Favorito GENERAL de la joyería (compartido por todos los usuarios), igual
+  // que SalesChannel / PriceList / Seller. La preferencia PERSONAL del usuario
+  // vive en UserPreference.defaultWarehouseId y tiene prioridad (override).
+  isFavorite           Boolean               @default(false)
   createdAt            DateTime              @default(now())
   updatedAt            DateTime              @updatedAt
   deletedAt            DateTime?
@@ -243,6 +247,7 @@ model Warehouse {
   @@index([jewelryId])
   @@index([deletedAt])
   @@index([jewelryId, deletedAt])
+  @@index([jewelryId, isFavorite])
 }
 
 model WarehouseAttachment {

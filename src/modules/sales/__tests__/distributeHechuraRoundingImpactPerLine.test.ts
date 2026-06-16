@@ -213,3 +213,117 @@ describe("computeCommercialRoundingPerLineImpacts — orquestador metal + hechur
     expect(Math.round((hechuraPreSale + imp.hechuraImpact) * 100) / 100).toBeCloseTo(192500.0, 2);
   });
 });
+
+// ===========================================================================
+// R-COMMERCIAL-UNIFIED-PER-LINE — reparto del ajuste comercial UNIFICADO.
+//
+// Contrato: en UNIFICADO NO hay breakdown metal/hechura. El `unifiedAdjustment`
+// (= totalAdjustment documental, un único delta round(Σ) − Σ ya calculado por el
+// motor) se REPARTE entre líneas proporcional al `lineTotalWithTax` pre-redondeo,
+// con la última línea absorbiendo el residuo. Va a `hechuraImpact` (bucket
+// monetario); `metalImpact` SIEMPRE 0 (UNIFICADO no tiene metal físico).
+//
+// Invariante: Σ hechuraImpact ≡ unifiedAdjustment.
+// ===========================================================================
+describe("computeCommercialRoundingPerLineImpacts — UNIFICADO por línea", () => {
+  it("1 línea: cuota = totalAdjustment, metalImpact 0", () => {
+    const out = computeCommercialRoundingPerLineImpacts({
+      breakdown: null,
+      gramsPureByParentByLineIdx: new Map(),
+      hechuraSaleByLineIdx: new Map(),
+      lineCount: 1,
+      unifiedAdjustment: 12.75,
+      lineTotalWithTaxByLineIdx: new Map([[0, 525787.25]]),
+    });
+    expect(out.get(0)!.hechuraImpact).toBeCloseTo(12.75, 2);
+    expect(out.get(0)!.metalImpact).toBe(0);
+    expect(out.get(0)!.monetarySaldoPost).toBeNull();
+  });
+
+  it("varias líneas: prorrateo proporcional + última línea absorbe residuo", () => {
+    // 3 líneas con base igual (100 c/u) y delta +1,00 → 0,33 / 0,33 / 0,34.
+    const out = computeCommercialRoundingPerLineImpacts({
+      breakdown: null,
+      gramsPureByParentByLineIdx: new Map(),
+      hechuraSaleByLineIdx: new Map(),
+      lineCount: 3,
+      unifiedAdjustment: 1.0,
+      lineTotalWithTaxByLineIdx: new Map([[0, 100], [1, 100], [2, 100]]),
+    });
+    expect(out.get(0)!.hechuraImpact).toBeCloseTo(0.33, 2);
+    expect(out.get(1)!.hechuraImpact).toBeCloseTo(0.33, 2);
+    expect(out.get(2)!.hechuraImpact).toBeCloseTo(0.34, 2); // residuo
+    // Conservación exacta.
+    const sum = [0, 1, 2].reduce((s, i) => s + out.get(i)!.hechuraImpact, 0);
+    expect(Math.round(sum * 100) / 100).toBeCloseTo(1.0, 2);
+    // metalImpact 0 en todas.
+    for (const i of [0, 1, 2]) expect(out.get(i)!.metalImpact).toBe(0);
+  });
+
+  it("prorrateo proporcional a lineTotalWithTax dispar (100 vs 300, delta −10)", () => {
+    const out = computeCommercialRoundingPerLineImpacts({
+      breakdown: null,
+      gramsPureByParentByLineIdx: new Map(),
+      hechuraSaleByLineIdx: new Map(),
+      lineCount: 2,
+      unifiedAdjustment: -10,
+      lineTotalWithTaxByLineIdx: new Map([[0, 100000], [1, 300000]]),
+    });
+    expect(out.get(0)!.hechuraImpact).toBeCloseTo(-2.5, 2); // 25%
+    expect(out.get(1)!.hechuraImpact).toBeCloseTo(-7.5, 2); // 75% (residuo)
+    const sum = out.get(0)!.hechuraImpact + out.get(1)!.hechuraImpact;
+    expect(Math.round(sum * 100) / 100).toBeCloseTo(-10, 2);
+  });
+
+  it("invariante: Σ lineTotalWithTaxPostCommercialRounding = total comercial post", () => {
+    // Pre por línea [120, 80, 50] (Σ 250). Total post documento = 251 (delta +1).
+    const pre = new Map([[0, 120], [1, 80], [2, 50]]);
+    const out = computeCommercialRoundingPerLineImpacts({
+      breakdown: null,
+      gramsPureByParentByLineIdx: new Map(),
+      hechuraSaleByLineIdx: new Map(),
+      lineCount: 3,
+      unifiedAdjustment: 1.0,
+      lineTotalWithTaxByLineIdx: pre,
+    });
+    // Post por línea = pre + cuota (lo que compone el caller).
+    let sumPost = 0;
+    for (const i of [0, 1, 2]) {
+      const post = Math.round((pre.get(i)! + out.get(i)!.hechuraImpact) * 100) / 100;
+      sumPost += post;
+    }
+    const totalComercialPost = 250 + 1.0;
+    expect(Math.round(sumPost * 100) / 100).toBeCloseTo(totalComercialPost, 2);
+  });
+
+  it("delta 0 → sin impacto (todas las líneas en 0)", () => {
+    const out = computeCommercialRoundingPerLineImpacts({
+      breakdown: null,
+      gramsPureByParentByLineIdx: new Map(),
+      hechuraSaleByLineIdx: new Map(),
+      lineCount: 2,
+      unifiedAdjustment: 0,
+      lineTotalWithTaxByLineIdx: new Map([[0, 100], [1, 200]]),
+    });
+    expect(out.get(0)).toEqual({ metalImpact: 0, hechuraImpact: 0, monetarySaldoPost: null });
+    expect(out.get(1)).toEqual({ metalImpact: 0, hechuraImpact: 0, monetarySaldoPost: null });
+  });
+
+  it("REGRESIÓN DESGLOSADO: si hay breakdown, unifiedAdjustment se IGNORA", () => {
+    // Con breakdown presente, el path UNIFICADO no corre: el resultado sale del
+    // breakdown (hechura −6,46), no del unifiedAdjustment espurio (999).
+    const out = computeCommercialRoundingPerLineImpacts({
+      breakdown: {
+        metals:  [{ metalParentId: "oro", monetaryEquivalent: 0 }],
+        hechura: { deltaSaldoMonetario: -6.46 },
+      },
+      gramsPureByParentByLineIdx: new Map([["oro", new Map([[0, 1.2375]])]]),
+      hechuraSaleByLineIdx: new Map([[0, 192506.46]]),
+      lineCount: 1,
+      unifiedAdjustment: 999, // debe ser ignorado
+      lineTotalWithTaxByLineIdx: new Map([[0, 525787.71]]),
+    });
+    expect(out.get(0)!.hechuraImpact).toBeCloseTo(-6.46, 2);
+    expect(out.get(0)!.metalImpact).toBeCloseTo(0, 2);
+  });
+});

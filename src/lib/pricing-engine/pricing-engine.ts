@@ -108,6 +108,7 @@ export type { CostBreakdown, ResolvedPriceList, ApplyPriceListOptions } from "./
 export {
   buildDocumentPricingSnapshot,
   computeSaleDocumentTotals,
+  applyRoundingLayer,
   DOCUMENT_SNAPSHOT_VERSION,
 } from "./pricing-engine.document.js";
 export type {

@@ -24,6 +24,7 @@
 // =============================================================================
 
 import { prisma } from "./prisma.js";
+import type { EmailBranding } from "./mail-branding.js";
 
 /**
  * Contexto resuelto para componer un mail desde el tenant.
@@ -47,6 +48,10 @@ export type TenantMailContext = {
   senderName:   string | undefined;
   fromEmail:    string | undefined;
   emailEnabled: boolean;
+  /** Branding del tenant para el CUERPO del mail (firma, contacto, pie).
+   *  Lo consume `composeBrandedEmailHtml` (mail-branding.ts). Esta capa sigue
+   *  siendo la ÚNICA que lee la config de mail del Jewelry. */
+  branding:     EmailBranding;
 };
 
 /**
@@ -137,6 +142,18 @@ export async function resolveTenantMailContext(
       emailSenderName: true,
       emailReplyTo:    true,
       email:           true, // legacy / fallback de replyTo
+      // Branding del CUERPO del mail (Configuración → Correos). Lo consume
+      // `composeBrandedEmailHtml`. emailLogoUrl NO se incluye (el composer es
+      // text-only por ahora).
+      emailSignature:     true,
+      emailContact:       true,
+      emailPhone:         true,
+      emailWhatsapp:      true,
+      emailAddressLine:   true,
+      emailBusinessHours: true,
+      emailWebsite:       true,
+      emailInstagram:     true,
+      emailFooter:        true,
     },
   });
 
@@ -151,5 +168,16 @@ export async function resolveTenantMailContext(
     senderName,
     fromEmail,
     emailEnabled: tenant?.emailEnabled ?? true,
+    branding: {
+      signature:     tenant?.emailSignature     ?? null,
+      contact:       tenant?.emailContact        ?? null,
+      phone:         tenant?.emailPhone          ?? null,
+      whatsapp:      tenant?.emailWhatsapp       ?? null,
+      addressLine:   tenant?.emailAddressLine    ?? null,
+      businessHours: tenant?.emailBusinessHours  ?? null,
+      website:       tenant?.emailWebsite        ?? null,
+      instagram:     tenant?.emailInstagram      ?? null,
+      footer:        tenant?.emailFooter         ?? null,
+    },
   };
 }

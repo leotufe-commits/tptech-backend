@@ -18,16 +18,29 @@
 //   · No hay factor global único en mode METAL_HECHURA: cada bucket usa su
 //     margen literal.
 //
-// Si todas las aserciones pasan, el motor backend está CORRECTO y la
-// percepción de "bug" en el simulador es 100% un problema de UX visual,
-// resoluble en frontend sin tocar el pricing-engine.
+// ⚠️ REVISIÓN 2026-06-12 — La conclusión "el bug es 100% UX frontend" quedó
+// SUPERSEDIDA. Auditoría posterior detectó que el factor de venta PER-LÍNEA del
+// METAL (`computeMetalSaleFactor = metalSale/metalCost`, ambos POST) NO incluía
+// `adjFactor`, mientras `metals[i].lineCost` es PRE → `Σ lineSale_metal ≠
+// metalSale` (invariante violado) y el margen del metal no reflejaba el ajuste
+// global, asimétrico con HECHURA/PRODUCT/SERVICE. Fix backend mínimo aplicado:
+// los factores del metal multiplican `adjFactor` (helper `extractGlobalCost
+// AdjFactor`), igual que `computeHechuraSaleFactor`. Solo cambia el sale-side
+// per-línea de display; agregados/totales/snapshots/redondeo intactos. Tests
+// del fix en el bloque "6. FIX BACKEND" al final del archivo.
 // =============================================================================
 
 import { describe, it, expect } from "vitest";
 import { Prisma } from "@prisma/client";
 import { calculateCostFromLines } from "../pricing-engine.cost.js";
 import { applyPriceList } from "../pricing-engine.pricelist.js";
-import { computeHechuraSaleFactor, computeMetalSaleFactor } from "../../pricing-composition.js";
+import {
+  computeHechuraSaleFactor,
+  computeMetalSaleFactor,
+  computeMetalSaleFactorPre,
+  extractGlobalCostAdjFactor,
+  extractCompositionMetals,
+} from "../../pricing-composition.js";
 import type {
   CostLineInput,
   BatchCostContext,
@@ -218,7 +231,9 @@ describe("DIAGNÓSTICO — factor efectivo en hechura cuando hay adjFactor", () 
     expect(factor).not.toBeCloseTo(1.50, 1);
   });
 
-  it("computeMetalSaleFactor === metalSale / metalCost = 1.10 (margen literal sobre cost ajustado)", () => {
+  it("computeMetalSaleFactor SIN step COST_LINES_FINAL (adjFactor=1) === metalSale/metalCost = 1.10", () => {
+    // Sin el step, no hay ajuste detectable → adjFactor=1 → factor = 1.10.
+    // (El caso CON ajuste se valida en el bloque "6. FIX BACKEND".)
     const result: SalePriceResult = {
       steps: [],
       metalHechuraBreakdown: {
@@ -334,5 +349,91 @@ describe("DIAGNÓSTICO — confirmación: motor backend es la fuente de verdad",
     // operador configuró). Confirma que la causa raíz es la presentación,
     // no el cálculo.
     expect(sale.metalHechuraBreakdown!.hechuraMarginPct).toBe(50);
+  });
+});
+
+// =============================================================================
+// 6. FIX BACKEND (2026-06-12) — METAL incluye adjFactor igual que HECHURA
+//
+// REVISIÓN del diagnóstico anterior: el factor del METAL `metalSale/metalCost`
+// cancelaba el adjFactor (ambos POST), pero `metals[i].lineCost` es PRE → el
+// `lineSale` per-línea NO incluía el ajuste global → `Σ lineSale ≠ metalSale`
+// y el margen del metal no reflejaba la bonif/recargo (asimétrico con hechura).
+// Fix: `computeMetalSaleFactor`/`Pre` ahora multiplican por `adjFactor`.
+// =============================================================================
+describe("FIX BACKEND — computeMetalSaleFactor incluye el Ajuste Global", () => {
+  // adjFactor 0.75 (BONUS 25%): COST_LINES_FINAL value/sumLines = 712.5/950.
+  const stepFinal = { key: "COST_LINES_FINAL", value: 712.5, meta: { sumLines: "950" } } as any;
+  // metalCost POST 375 (= PRE 500 × 0.75); metalSale 412.5 (= 375 × 1.10).
+  const brk = { metalCost: 375, metalSale: 412.5, metalMarginPct: 10,
+                hechuraCost: 337.5, hechuraSale: 506.25, hechuraMarginPct: 50,
+                metalSalePreRounding: 412.5 } as any;
+  const withAdj: SalePriceResult = { steps: [stepFinal], metalHechuraBreakdown: brk } as any;
+
+  it("extractGlobalCostAdjFactor lee adjFactor de COST_LINES_FINAL (0.75); sin step → 1", () => {
+    expect(extractGlobalCostAdjFactor(withAdj)).toBeCloseTo(0.75, 6);
+    expect(extractGlobalCostAdjFactor({ steps: [], metalHechuraBreakdown: brk } as any)).toBe(1);
+  });
+
+  it("computeMetalSaleFactor = (metalSale/metalCost) × adjFactor = 1.10 × 0.75 = 0.825", () => {
+    expect(computeMetalSaleFactor(withAdj)).toBeCloseTo(0.825, 4);
+    // Espejo de hechura: ambos multiplican adjFactor.
+    expect(computeHechuraSaleFactor(withAdj)).toBeCloseTo(0.75 * 1.5, 4); // 1.125
+  });
+
+  it("computeMetalSaleFactorPre también incluye adjFactor", () => {
+    expect(computeMetalSaleFactorPre(withAdj)).toBeCloseTo(0.825, 4);
+  });
+
+  it("INVARIANTE restaurado: Σ metals[i].lineSale === metalSale (con ajuste global)", () => {
+    // Una cost-line METAL con lineCost PRE = 500 (= metalCost_PRE).
+    const result: SalePriceResult = {
+      steps: [
+        stepFinal,
+        { key: "COST_LINES_METAL", status: "ok", value: 500,
+          meta: { variantId: "mv-1", qty: 5, merma: 0, costLineId: "cl-m1", metalId: "oro" } } as any,
+      ],
+      metalHechuraBreakdown: brk,
+    } as any;
+    const metals = extractCompositionMetals(
+      result.steps, undefined,
+      computeMetalSaleFactor(result), computeMetalSaleFactorPre(result),
+    );
+    expect(metals).toHaveLength(1);
+    // lineSale = 500 × 0.825 = 412.5 === metalSale agregado.
+    expect(metals[0].lineSale).toBeCloseTo(412.5, 2);
+    const sumLineSale = metals.reduce((s, m) => s + (m.lineSale ?? 0), 0);
+    expect(sumLineSale).toBeCloseTo(brk.metalSale, 2);
+    // lineSalePreRounding idem.
+    expect(metals[0].lineSalePreRounding).toBeCloseTo(412.5, 2);
+  });
+
+  it("Margen visual del metal refleja el ajuste, igual que hechura", () => {
+    // Margen visual = (lineSale − lineCost_PRE) / lineCost_PRE.
+    // METAL:   (412.5 − 500)/500   = −17.5%   (bonif 25% > margen metal 10%).
+    // HECHURA: (506.25 − 450)/450  = +12.5%   (margen hechura 50% > bonif 25%).
+    // Lo clave: AMBOS comparan venta POST contra costo PRE → criterio uniforme.
+    const metalFactor   = computeMetalSaleFactor(withAdj)!;   // 0.825
+    const hechuraFactor = computeHechuraSaleFactor(withAdj)!; // 1.125
+    const metalMargenVisual   = metalFactor - 1;   // −0.175
+    const hechuraMargenVisual = hechuraFactor - 1; // +0.125
+    expect(metalMargenVisual).toBeCloseTo(-0.175, 4);
+    expect(hechuraMargenVisual).toBeCloseTo(0.125, 4);
+  });
+
+  it("Sin ajuste global (adjFactor=1) → factor metal = metalSale/metalCost (cero regresión)", () => {
+    const noAdj: SalePriceResult = {
+      steps: [{ key: "COST_LINES_FINAL", value: 950, meta: { sumLines: "950" } } as any],
+      metalHechuraBreakdown: { metalCost: 500, metalSale: 550, metalMarginPct: 10,
+                               hechuraCost: 450, hechuraSale: 675, hechuraMarginPct: 50,
+                               metalSalePreRounding: 550 } as any,
+    } as any;
+    expect(computeMetalSaleFactor(noAdj)).toBeCloseTo(1.10, 4);
+    expect(computeMetalSaleFactorPre(noAdj)).toBeCloseTo(1.10, 4);
+  });
+
+  it("Sin metalHechuraBreakdown (combo / MARGIN_TOTAL) → null (no impacta combos)", () => {
+    expect(computeMetalSaleFactor({ steps: [stepFinal] } as any)).toBeNull();
+    expect(computeMetalSaleFactorPre({ steps: [stepFinal] } as any)).toBeNull();
   });
 });

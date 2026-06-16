@@ -538,6 +538,41 @@ export interface SaleDocumentTotalsInput {
    */
   documentRounding?: DocumentRoundingInput | null;
 
+  /**
+   * DIFERIR la APLICACIÓN del redondeo financiero a una capa posterior
+   * (capa 16 — `applyDocumentPhysicalRounding`), SIN deshabilitar su efecto
+   * sobre `roundingAdjustment`.
+   *
+   * Motivación (fix regresión 2026-06-16): cuando el financiero se mueve a la
+   * capa 16 (PHYSICAL), el caller NO debe pasar `documentRounding: null` para
+   * lograrlo — hacerlo deja `docRoundingActive = false` y reactiva el bloque de
+   * aplicación del financiero EN la capa 15, que entonces lo re-aplicaría junto
+   * con la capa 16 → doble redondeo. La bandera mantiene `documentRounding`
+   * PRESENTE (para que la capa 15 NO aplique el financiero) y lo difiere a la
+   * capa 16.
+   *
+   * Semántica de la bandera (cuando `documentRounding` está activo y la bandera
+   * es `true`) — OPCIÓN B (decisión del operador 2026-06-16):
+   *   · El redondeo COMERCIAL diferido de la lista (`roundingAdjustment` del
+   *     caller, applyOn=TOTAL/NET) SE APLICA en la capa 15 y queda atribuido a
+   *     la LISTA (sourceTrace step `ROUNDING`). Ya NO se descarta — esa era la
+   *     opción A previa (descartar el comercial cuando coexistía con financiero).
+   *   · El bloque de APLICACIÓN del redondeo financiero NO corre acá:
+   *     `documentRoundingApplied = null` y el `total` (capa 15) incluye el
+   *     diferido comercial pero NO el delta financiero.
+   *   · La capa 16 (`applyDocumentPhysicalRounding`) ENCADENA el financiero
+   *     sobre el `total` YA post-comercial: misma config → delta 0; config
+   *     distinta → re-redondea el post-comercial. El anti-doble secuencial del
+   *     metal/saldo (post-comercial) se mantiene.
+   *
+   * Default `false` → comportamiento idéntico al legacy: con `documentRounding`
+   * activo, el diferido comercial se DESCARTA (=0) y el financiero se aplica en
+   * la capa 15. Solo `sales.service` setea la bandera a `true` cuando
+   * `financialPhysicalActive`. Otros callers (compras, cross-settlements,
+   * snapshot) la omiten → default false.
+   */
+  deferDocumentRoundingApplication?: boolean;
+
   // ── Etapa D' — Redondeo Comercial PER_DOCUMENT (POLICY §R-Rounding-15) ──
   /**
    * Configuración del redondeo comercial PER_DOCUMENT. Se aplica entre el
@@ -920,8 +955,12 @@ function roundingTraceNote(applied: DocumentRoundingApplied): string {
  * Aplica `applyRounding` sobre un monto y devuelve la capa completa
  * (pre, post, delta). Si el modo es NONE o el delta es 0, devuelve una
  * capa con `adjustment = 0` — el caller decide si la reporta.
+ *
+ * Exportado para que la capa 16 (`document-physical-rounding-apply.ts`)
+ * reutilice EXACTAMENTE la misma matemática de redondeo monetario cuando el
+ * redondeo financiero corre fuera del motor (modo PHYSICAL).
  */
-function applyRoundingLayer(
+export function applyRoundingLayer(
   amount:  number,
   cfg:     DocumentRoundingPartConfig,
   applyOn: DocumentRoundingLayerResult["applyOn"],
@@ -1044,11 +1083,21 @@ export function computeSaleDocumentTotals(
     amount: paymentAdjustmentAmount,
   });
   // Cuando la política doc está activa, el `roundingAdjustment` del caller
-  // se DESCARTA: la política es la única fuente de verdad del redondeo y
-  // sobreescribe este campo con el delta real calculado al final. Usa el
-  // helper que considera UNIFIED/BREAKDOWN/BOTH.
+  // (= redondeo COMERCIAL diferido de la lista, applyOn=TOTAL/NET) se trata
+  // según la coexistencia con el redondeo FINANCIERO:
+  //
+  //   · Financiero aplicado EN la capa 15 (default, `deferDocumentRoundingApplication`
+  //     ausente/false) → el diferido se DESCARTA (=0): el financiero es la única
+  //     autoridad del redondeo del comprobante y sobreescribe este campo con su
+  //     delta real al final. (Comportamiento legacy intacto.)
+  //   · Financiero DIFERIDO a la capa 16 (`deferDocumentRoundingApplication=true`,
+  //     config PHYSICAL del operador) → OPCIÓN B: el diferido comercial SE APLICA
+  //     acá (queda en `roundingAdjustment`, atribuido a la LISTA) y el financiero
+  //     ENCADENA encima en la capa 16, operando sobre el total YA post-comercial
+  //     (misma config → delta 0; config distinta → re-redondea el post-comercial).
+  //     Antes (opción A) se descartaba igual; se cambió por decisión del operador.
   const docRoundingActive = !!(input.documentRounding && isDocumentRoundingActive(input.documentRounding));
-  let   roundingAdjustment      = docRoundingActive
+  let   roundingAdjustment      = (docRoundingActive && !input.deferDocumentRoundingApplication)
     ? 0
     : round2(input.roundingAdjustment ?? 0);
 
@@ -1220,7 +1269,19 @@ export function computeSaleDocumentTotals(
   // refleja qué capas efectivamente movieron el número (delta != 0) y deja
   // constancia del fallback si no había datos para BREAKDOWN.
   let documentRoundingApplied: DocumentRoundingApplied | null = null;
-  if (input.documentRounding && isDocumentRoundingActive(input.documentRounding)) {
+  // `deferDocumentRoundingApplication` (fix regresión 2026-06-16, OPCIÓN B):
+  // cuando el caller (sales.service con `financialPhysicalActive`) movió el
+  // financiero a la capa 16, deja `documentRounding` PRESENTE y setea esta
+  // bandera para SALTEAR la APLICACIÓN del financiero acá (este bloque NO
+  // corre → `documentRoundingApplied = null`). A diferencia de la opción A
+  // previa, el `roundingAdjustment` diferido de la lista (comercial) NO se
+  // descarta: ya quedó APLICADO arriba (atribuido a la lista) y está sumado en
+  // `total`. La capa 16 financiera ENCADENA sobre ese `total` post-comercial.
+  if (
+    input.documentRounding &&
+    isDocumentRoundingActive(input.documentRounding) &&
+    !input.deferDocumentRoundingApplication
+  ) {
     const scope: DocumentRoundingScope = input.documentRounding.scope ?? "UNIFIED";
     const wantsBreakdown = scope === "BREAKDOWN" || scope === "BOTH";
     const wantsUnified   = scope === "UNIFIED"   || scope === "BOTH";

@@ -18,6 +18,9 @@ import { createDocumentEmailLog } from "../../lib/document-email-log.js";
 // con fallback al email legacy). Reutilizable por presupuestos / ordenes
 // / notas de credito / remitos en etapas futuras.
 import { resolveTenantMailContext } from "../../lib/tenantMailContext.js";
+// Composer ÚNICO del cuerpo HTML del mail (branding del tenant). Mismo helper
+// que usa el path draft → "lo configurado en Correos es lo enviado".
+import { composeBrandedEmailHtml } from "../../lib/mail-branding.js";
 import {
   buildManualAdjustmentSnapshot,
   type ManualAdjustmentSnapshot,
@@ -89,14 +92,16 @@ import {
 import {
   resolveDocumentCommercialContextForSale,
   resolvePerLineCommercialConfigs,
+  resolvePerLineApplyPriceListOptions,
   appliedPriceListsAreMixed,
   aggregateMetalsForCommercialDocRounding,
   computeCommercialRoundingPerLineImpacts,
   computeLineCommercialRoundingMetals,
   computeLineAutonomousCommercialMoney,
+  comboAwareMetalSaleSum,
   consolidateCommercialDocFromPerLine,
   buildLineCommercialSummary,
-  buildLineCommercialDisplaySummary,
+  cloneLineCommercialSummary,
   type LineCommercialRoundingMetal,
   type LineAutonomousCommercialMoney,
   type ResolvedLineForCommercialAgg,
@@ -1670,6 +1675,10 @@ async function _confirmSaleImpl(
     commission:      { base: number | null; amount: number };
     updateData:      Record<string, any> | null;
     breakdownSnapshot: any;
+    /** Identidad de combo para el blindaje del Redondeo Comercial (combo =
+     *  SALDO_UNIFICADO_MONETARIO: nunca aporta al dominio metal físico). */
+    priceSource:     string | null;
+    commercialMode:  string | null;
     /** Opción A — steps del motor cost (post enrich) para alimentar
      *  `extractMetalItemsFromSteps` en el balance breakdown. El
      *  `breakdown.metal.items[]` viene vacío en runtime; los steps son
@@ -1698,6 +1707,8 @@ async function _confirmSaleImpl(
           commission:        { base: null, amount: 0 },
           updateData:        null,
           breakdownSnapshot: null,
+          priceSource:       null,
+          commercialMode:    null,
           costSteps:         null,
           lineTotal:         new Prisma.Decimal(line.lineTotal.toString()),
           documentLine:      null,
@@ -1830,6 +1841,12 @@ async function _confirmSaleImpl(
         ...((snap as any).manualTaxAppliesTo != null
           ? { manualTaxAppliesTo: (snap as any).manualTaxAppliesTo }
           : {}),
+        // Preservar el redondeo de lista congelado del DRAFT en el snapshot
+        // CONFIRMED — re-confirm / recompute / lectura del comprobante reproducen
+        // el mismo POST (paridad preview↔confirm para líneas applyOn=TOTAL).
+        ...((snap as any).appliedRounding != null
+          ? { appliedRounding: (snap as any).appliedRounding }
+          : {}),
         resolvedAt,
       };
 
@@ -1903,6 +1920,10 @@ async function _confirmSaleImpl(
         lineId:          line.id,
         lineTaxAmtTotal: lineTaxAmt * qty,
         commission:      lineComm,
+        // Identidad de combo para el BLINDAJE del Redondeo Comercial (combo =
+        // SALDO_UNIFICADO_MONETARIO: NUNCA aporta al dominio metal físico).
+        priceSource:     (snap as any).priceSource ?? null,
+        commercialMode:  (artCost as any)?.commercialMode ?? null,
         updateData,
         breakdownSnapshot: hasCost ? (costResult.breakdown ?? null) : null,
         // Opción A — steps del motor (post enrichCostMetalSteps) para alimentar
@@ -2139,8 +2160,15 @@ async function _confirmSaleImpl(
   const confirmCommercialPerLineActive =
     (confirmCommercialDocCtx.mode === "PER_DOCUMENT" && confirmCommercialDocCtx.commercialDocumentRounding != null)
     || confirmCommercialDocCtx.mode === "MIXED_LIST_FALLBACK";
+  // Espejo EXACTO de previewSale — la capa 16 PHYSICAL (Redondeo Financiero del
+  // metal) necesita los agregados por metal padre aunque la lista no tenga
+  // redondeo comercial. Si la política del tenant es PHYSICAL, los computamos.
+  const confirmFinancialPhysicalActive =
+    docRoundingPolicy.metalDomain === "PHYSICAL" && docRoundingPolicy.physical.enabled;
+  const confirmCommercialAggregatesNeeded =
+    confirmCommercialPerLineActive || confirmFinancialPhysicalActive;
   const confirmCommercialMetalIds = new Set<string>();
-  if (confirmCommercialPerLineActive) {
+  if (confirmCommercialAggregatesNeeded) {
     for (const lr of lineResults as any[]) {
       if (Array.isArray(lr?.costSteps)) {
         for (const m of extractMetalItemsFromSteps(lr.costSteps)) {
@@ -2171,17 +2199,24 @@ async function _confirmSaleImpl(
   // re-agregar SOLO con líneas Desglosadas en MIXTO (fix anti-dilución, espejo
   // de previewSale), conservando índices.
   const confirmCommercialAggInputLines: ResolvedLineForCommercialAgg[] =
-    confirmCommercialPerLineActive
+    confirmCommercialAggregatesNeeded
       ? (lineResults as any[]).map((lr): ResolvedLineForCommercialAgg => {
             const metalItems = Array.isArray(lr?.costSteps)
               ? extractMetalItemsFromSteps(lr.costSteps)
               : [];
+            // BLINDAJE COMBO — un COMBO_COMMERCIAL NUNCA aporta metales al dominio
+            // físico del Redondeo Comercial (regla canónica COMBO = SALDO
+            // UNIFICADO MONETARIO). Hoy su metals[] ya es [] (no emite steps de
+            // metal); el guard lo vuelve EXPLÍCITO y permanente. Espejo del guard
+            // de previewSale → paridad. NO cambia números actuales.
+            const isCombo =
+              lr?.priceSource === "COMBO_COMPONENTS" || lr?.commercialMode === "COMBO_COMMERCIAL";
             return {
               quantity: lr?.quantity || 1,
               // R-COMMERCIAL-GRAMS-WITH-MERMA — `appliedGramsPerUnit` debe ser
               // `gramsFineEquivalent` (post pureza + post merma). Items sin
               // ese campo se excluyen + log (mismo contrato que preview).
-              metals: metalItems
+              metals: isCombo ? [] : metalItems
                 .filter((m) => {
                   if (!m.metalId) return false;
                   if (typeof m.gramsFineEquivalent !== "number" || !Number.isFinite(m.gramsFineEquivalent)) {
@@ -2206,7 +2241,7 @@ async function _confirmSaleImpl(
           })
       : [];
   const confirmCommercialAggregates =
-    confirmCommercialPerLineActive
+    confirmCommercialAggregatesNeeded
       ? aggregateMetalsForCommercialDocRounding(confirmCommercialAggInputLines)
       : { metalsByParent: [], metalValuationSum: 0, gramsPureByParentByLineIdx: new Map<string, Map<number, number>>() };
 
@@ -2262,8 +2297,11 @@ async function _confirmSaleImpl(
         (Number(dl?.lineTotal ?? 0) + Number(dl?.lineTaxAmount ?? 0) + Number(lr.appliedRoundingDelta ?? 0)) * 100,
       ) / 100;
       lineTotalWithTaxByIdx.set(i, pre);
-      // dl.metalSale ya viene × qty → no re-escalar.
-      metalSaleSumByIdx.set(i, dl ? Math.round(sale * 100) / 100 : 0);
+      // dl.metalSale ya viene × qty → no re-escalar. BLINDAJE COMBO: el combo es
+      // saldo monetario PURO → metalSaleSum 0 → saldo = lineTotalWithTax completo.
+      const isCombo =
+        lr.priceSource === "COMBO_COMPONENTS" || lr.commercialMode === "COMBO_COMMERCIAL";
+      metalSaleSumByIdx.set(i, comboAwareMetalSaleSum(isCombo, dl ? Math.round(sale * 100) / 100 : 0));
     }
     confirmLineMetalsByIdx = computeLineCommercialRoundingMetals({
       gramsPureByParentByLineIdx: confirmCommercialAggregates.gramsPureByParentByLineIdx,
@@ -2484,7 +2522,11 @@ async function _confirmSaleImpl(
         const ltw = clean ? clean.lineTotalWithTax : pre;
         lineTotalWithTaxByIdx.set(i, typeof ltw === "number" && Number.isFinite(ltw) ? ltw : 0);
         const metalSaleClean = clean ? clean.metalSale : (dl ? Math.round(sale * 100) / 100 : 0);
-        metalSaleSumByIdx.set(i, metalSaleClean);
+        // BLINDAJE COMBO — saldo monetario PURO también en MIXTO (su metalSale
+        // estimado no vive en el bucket metal → no se resta del saldo).
+        const isCombo =
+          lr.priceSource === "COMBO_COMPONENTS" || lr.commercialMode === "COMBO_COMMERCIAL";
+        metalSaleSumByIdx.set(i, comboAwareMetalSaleSum(isCombo, metalSaleClean));
       }
       confirmLineMetalsByIdx = computeLineCommercialRoundingMetals({
         // FIX anti-dilución — gramos por línea SOLO de las Desglosadas.
@@ -2531,7 +2573,10 @@ async function _confirmSaleImpl(
               (Number(dl?.lineTotal ?? 0) + Number(dl?.lineTaxAmount ?? 0) + Number(lr.appliedRoundingDelta ?? 0)) * 100,
             ) / 100;
         ownLineTotalWithTaxByIdx.set(i, ltwOwn);
-        ownMetalSaleSumByIdx.set(i, Math.round(saleOwn * 100) / 100);  // dl.metalSale* ya viene × qty
+        // BLINDAJE COMBO — saldo monetario PURO (metalSaleSum 0 para combos).
+        const isComboOwn =
+          lr.priceSource === "COMBO_COMPONENTS" || lr.commercialMode === "COMBO_COMMERCIAL";
+        ownMetalSaleSumByIdx.set(i, comboAwareMetalSaleSum(isComboOwn, Math.round(saleOwn * 100) / 100));  // dl.metalSale* ya viene × qty
       }
       const ownLineMetalsByIdx = computeLineCommercialRoundingMetals({
         gramsPureByParentByLineIdx: breakdownAgg.gramsPureByParentByLineIdx,
@@ -2619,7 +2664,16 @@ async function _confirmSaleImpl(
     // Opción B — deferred foldeado en el snapshot comercial → se descuenta para
     // no duplicarlo en `Sale.total` (espejo preview). 0 fuera de MIXTO.
     roundingAdjustment:      Math.round((docRoundingAdjustmentPreEngine - confirmMixedDeferredFoldedIntoSnapshot) * 100) / 100,
-    documentRounding:        docRoundingPolicy.documentRounding,
+    // Espejo EXACTO de previewSale: con `confirmFinancialPhysicalActive`, el
+    // redondeo financiero corre íntegro en la capa 16 (post metal sale-gram).
+    // FIX regresión 2026-06-16 (OPCIÓN B): NO pasamos `null` (eso reactivaría el
+    // financiero en la capa 15 → doble redondeo con la capa 16). Pasamos SIEMPRE
+    // la política + `deferDocumentRoundingApplication` para que el motor (a)
+    // APLIQUE el deferred COMERCIAL de la lista (queda en `roundingAdjustment`,
+    // atribuido a la lista) y (b) NO aplique el financiero (lo difiere a la capa
+    // 16, que encadena sobre el total post-comercial). Ver previewSale.
+    documentRounding:                 docRoundingPolicy.documentRounding,
+    deferDocumentRoundingApplication: confirmFinancialPhysicalActive,
     // Etapa D' — Redondeo Comercial PER_DOCUMENT.
     commercialDocumentRounding:             confirmCommercialDocCtx.commercialDocumentRounding,
     metalsByParentForCommercialRounding:    confirmCommercialAggregates.metalsByParent,
@@ -2638,16 +2692,50 @@ async function _confirmSaleImpl(
   //   Σ metalImpact   = Σ breakdown.metals[*].monetaryEquivalent
   //   Σ hechuraImpact = breakdown.hechura.deltaSaldoMonetario
   if (documentTotals.commercialDocumentRoundingApplied) {
+    // Base UNIFICADO — `lineTotalWithTax` pre-redondeo por línea (misma fórmula
+    // que `previewSale` → paridad). Se construye PRIMERO porque el combo la
+    // reutiliza como base del bucket monetario (Punto 2).
+    const lineTotalWithTaxByLineIdx = new Map<number, number>();
+    for (let i = 0; i < lineResults.length; i++) {
+      const lr: any = lineResults[i];
+      const dl = lr.documentLine;
+      const pre = dl
+        ? Math.round(
+            (Number(dl.lineTotal ?? 0) + Number(dl.lineTaxAmount ?? 0) + Number(lr.appliedRoundingDelta ?? 0)) * 100,
+          ) / 100
+        : 0;
+      lineTotalWithTaxByLineIdx.set(i, pre);
+    }
+    // Base de reparto del bucket MONETARIO (DESGLOSADO). Punto 2: para COMBO el
+    // peso es su valor comercial TOTAL (`lineTotalWithTax`), NO la porción
+    // hechura — el combo es saldo monetario puro. Resto de líneas: `hechuraSale`.
     const hechuraSaleByLineIdx = new Map<number, number>();
     for (let i = 0; i < lineResults.length; i++) {
-      const dl = (lineResults[i] as any).documentLine;
-      hechuraSaleByLineIdx.set(i, dl ? Number(dl.hechuraSale ?? 0) : 0);
+      const lr: any = lineResults[i];
+      const dl = lr.documentLine;
+      const isCombo =
+        lr.priceSource === "COMBO_COMPONENTS" || lr.commercialMode === "COMBO_COMMERCIAL";
+      hechuraSaleByLineIdx.set(
+        i,
+        isCombo
+          ? (lineTotalWithTaxByLineIdx.get(i) ?? 0)
+          : (dl ? Number(dl.hechuraSale ?? 0) : 0),
+      );
     }
+    const unifiedCommercialAdj =
+      (documentTotals.commercialDocumentRoundingApplied as any)?.scope === "UNIFIED"
+        ? Number(
+            (documentTotals.commercialDocumentRoundingApplied as any)?.unified?.adjustment ??
+            (documentTotals.commercialDocumentRoundingApplied as any)?.totalAdjustment ?? 0,
+          )
+        : 0;
     const impactsByLineIdx = computeCommercialRoundingPerLineImpacts({
       breakdown:                  (documentTotals.commercialDocumentRoundingApplied as any)?.breakdown,
       gramsPureByParentByLineIdx: confirmCommercialAggregates.gramsPureByParentByLineIdx,
       hechuraSaleByLineIdx,
       lineCount:                  lineResults.length,
+      unifiedAdjustment:          unifiedCommercialAdj,
+      lineTotalWithTaxByLineIdx,
     });
     for (let i = 0; i < lineResults.length; i++) {
       const lr: any = lineResults[i];
@@ -2791,58 +2879,27 @@ async function _confirmSaleImpl(
   // margen PRE redondeo, lista de la línea) → idéntico sin importar otras líneas
   // ni el modo. NO toca `Sale.total`. Convive con `lineCommercialSummary` legacy.
   if (confirmCommercialAggInputLines.length > 0) {
-    const DISPLAY_NONE: CommercialDocRoundingPartConfig = { mode: "NONE", direction: "NEAREST" };
-    const displayCfgByLine = await resolvePerLineCommercialConfigs({
-      jewelryId,
-      lineAppliedPriceListIds: sale.lines.map((l) => (l as any).appliedPriceListId ?? null),
-    });
     for (let i = 0; i < lineResults.length; i++) {
       const lr: any = lineResults[i];
       if (!lr.updateData || !lr.updateData.pricingSnapshot) continue;
-      const dl  = lr.documentLine;
-      const cfg = displayCfgByLine.get(i) ?? null;
-      const agg = confirmCommercialAggInputLines[i] ?? null;
-      const qty = agg?.quantity ?? (dl?.quantity || 1);
-      const isBd = cfg?.scope === "BREAKDOWN" && !!agg?.metals?.length;
-      const metalCost    = dl ? Number(dl.metalCost ?? 0) : 0;
-      const metalSalePre = dl ? Number(dl.metalSalePreRounding ?? dl.metalSale ?? 0) : 0;
-      const marginFactor = metalCost > 0 ? metalSalePre / metalCost : 1;
-      const metalSaleSum = Math.round(metalSalePre * 100) / 100;   // dl.metalSale* ya viene × qty
-      const ltw = Math.round(
-        (Number(dl?.lineTotal ?? 0) + Number(dl?.lineTaxAmount ?? 0) + Number(lr.appliedRoundingDelta ?? 0)) * 100,
-      ) / 100;
-      const displaySummary = buildLineCommercialDisplaySummary({
-        mode:             isBd ? "BREAKDOWN" : "UNIFIED",
-        lineMetals:       isBd ? (agg?.metals ?? []) : [],
-        quantity:         qty,
-        marginFactor,
-        metalCfg:         (cfg && cfg.scope === "BREAKDOWN") ? cfg.metal   : DISPLAY_NONE,
-        hechuraCfg:       (cfg && cfg.scope === "BREAKDOWN") ? cfg.hechura : DISPLAY_NONE,
-        lineTotalWithTax: ltw,
-        metalSaleSum,
-        source: {
-          strategy:           isBd ? "PER_LINE" : "NONE",
-          appliedListMode:    dl?.appliedPriceListMode ?? null,
-          appliedPriceListId: dl?.appliedPriceListId ?? null,
-          documentContext:    dl?.appliedPriceListId ? "SHARED_LIST" : "NO_LIST",
-        },
-      });
-      // ── Fix leak repriceLineClean (MIXED) — el "resumen comercial visible"
-      // (FASE 0 `lineCommercialSummary`) debe reflejar el metalSale PROPIO de la
-      // línea (`metalSalePreRounding`), no el `clean` que alimenta el snapshot/
-      // Sale.total. El display autónomo (FASE 1) ya lo computó. SOLO en MIXED y
-      // SOLO líneas con metal (desglosadas) reemplazamos `lineCommercialSummary`
-      // por el display, preservando su `source` (documentContext real). NO toca
-      // el snapshot documental ni `Sale.total`. Espejo exacto en previewSale.
-      const prevSummary = (lr.updateData.pricingSnapshot as any).lineCommercialSummary;
-      const overrideSummary =
-        confirmCommercialDocCtx.mode === "MIXED_LIST_FALLBACK" && displaySummary.metals && prevSummary;
+      const summary = (lr.updateData.pricingSnapshot as any).lineCommercialSummary;
+      if (!summary) continue;
+      const dl = lr.documentLine;
+      // FIX MONETARIO MIXED (espejo de previewSale) — el display autónomo ES el
+      // `lineCommercialSummary` (FASE 0, armado desde `confirmMoneyByIdx`/
+      // `confirmLineMetalsByIdx`, la MISMA fuente que produce los `lineOwn*`).
+      // Antes se recomputaba con `buildLineCommercialDisplaySummary` que en MIXED
+      // tomaba un refValue ya en display → DOBLE conversión (÷rate). Reutilizar el
+      // summary garantiza displaySummary === lineCommercialSummary === lineOwn*.
+      // Display-only: NO toca `Sale.total`/consolidación/footer.
+      // DEEP CLONE (espejo del fix de previewSale) — evita compartir
+      // `metals`/`monetary` por referencia con `lineCommercialSummary`.
       lr.updateData.pricingSnapshot = {
         ...lr.updateData.pricingSnapshot,
-        lineCommercialDisplaySummary: displaySummary,
-        ...(overrideSummary
-          ? { lineCommercialSummary: { ...displaySummary, source: prevSummary.source } }
-          : {}),
+        lineCommercialDisplaySummary: cloneLineCommercialSummary(summary, {
+          strategy:        summary.mode === "BREAKDOWN" ? "PER_LINE" : "NONE",
+          documentContext: dl?.appliedPriceListId ? "SHARED_LIST" : "NO_LIST",
+        }),
       };
     }
   }
@@ -3171,6 +3228,22 @@ async function _confirmSaleImpl(
     documentTotals,
     balanceBreakdown: confirmBalanceBreakdown,
     policy: docRoundingPolicy,
+    // Lado VENTA (espejo EXACTO de previewSale): misma fuente
+    // (`confirmCommercialAggregates.metalsByParent`) y mismo cómputo del
+    // marginFactor → paridad preview ↔ confirm por construcción.
+    commercial: {
+      metalsByParent: confirmCommercialAggregates.metalsByParent,
+      marginFactor:
+        documentTotals.metalCostSubtotal > 0
+          ? documentTotals.metalSaleSubtotal / documentTotals.metalCostSubtotal
+          : 1,
+    },
+    // Espejo EXACTO de previewSale: con `confirmFinancialPhysicalActive`, el
+    // redondeo financiero MONETARIO (saldo + total) corre acá, post metal sale-
+    // gram, como último paso automático. Determinismo del helper ⇒ paridad.
+    financialMonetary: confirmFinancialPhysicalActive && docRoundingPolicy.documentRounding
+      ? { config: docRoundingPolicy.documentRounding }
+      : null,
   });
 
   // ── ÚNICA transacción: todas las escrituras juntas ────────────────────────
@@ -3987,6 +4060,12 @@ export async function resolveDraftSaleLinesPricing(
     defaultPriceListIdInput: opts.priceListId ?? null,
   });
   assertCommercialDocRoundingConsistency(draftCommercialDocCtx);
+  // FASE 1 — espejo de previewSale: `applyPriceListOptions` PER-LÍNEA para que el
+  // snapshot persistido (que confirmSale relee) NO dependa del modo documental.
+  const draftApplyPriceListOptionsByLineIdx = await resolvePerLineApplyPriceListOptions({
+    jewelryId,
+    lineIntendedPriceListIds: lines.map((l) => l.priceListIdOverride ?? opts.priceListId ?? null),
+  });
 
   // ── Precarga de totales por categoría / marca / grupo ────────────────────
   // Se usan cuando un QuantityDiscount evalúa por CATEGORY_TOTAL / BRAND_TOTAL
@@ -4038,7 +4117,7 @@ export async function resolveDraftSaleLinesPricing(
   }
 
   return Promise.all(
-    lines.map(async (line): Promise<DraftSaleLineResolved> => {
+    lines.map(async (line, __draftIdx): Promise<DraftSaleLineResolved> => {
       const m       = metaMap.get(line.articleId);
       const lineGid = line.variantId ? variantGroupMap.get(line.variantId) : undefined;
 
@@ -4079,7 +4158,9 @@ export async function resolveDraftSaleLinesPricing(
         // Etapa D' — Propaga los flags PER_DOCUMENT al motor de lista.
         // Cuando PER_LINE_LEGACY, el objeto está vacío y el comportamiento
         // queda intacto.
-        applyPriceListOptions: draftCommercialDocCtx.applyPriceListOptions,
+        // FASE 1 — per-línea (espejo de preview). Fallback al documental si la
+        // lista de esta línea no se pudo resolver.
+        applyPriceListOptions: draftApplyPriceListOptionsByLineIdx.get(__draftIdx) ?? draftCommercialDocCtx.applyPriceListOptions,
       });
 
       const engineUnitPrice = result.unitPrice != null
@@ -4494,6 +4575,16 @@ export type SalePreviewStep = {
     promoId?:    string | null;
     discountId?: string | null;
     promoName?:  string | null;
+    // ── COMBO_PRICE (Modelo A) — trazabilidad del precio del combo ──────────
+    // El motor ya las calcula en `pricing-engine.sale.ts` (step COMBO_PRICE).
+    // Passthrough puro para que el frontend muestre "precio antes → ajuste →
+    // precio final" sin recalcular. NO son cálculo nuevo ni campos paralelos:
+    // son el `meta` del step que ya existía, ahora autorizado por la whitelist.
+    subtotal?:         number | null;   // precio PRE-ajuste (Σ componentes)
+    adjustmentKind?:   string | null;   // NONE | DISCOUNT_PERCENT | DISCOUNT_FIXED | SURCHARGE_PERCENT
+    adjustmentValue?:  number | null;   // % o monto configurado
+    adjustmentAmount?: number | null;   // monto del ajuste (magnitud)
+    finalPrice?:       number | null;   // precio POST-ajuste (= comboDerivedPrice)
   };
 };
 
@@ -5018,6 +5109,14 @@ async function _previewSaleImpl(
   // Fail-fast: si el contexto resultó inconsistente (flags+capa desincronizados
   // → DOBLE redondeo), lanza error explícito antes de tocar nada.
   assertCommercialDocRoundingConsistency(commercialDocCtx);
+  // FASE 1 — `applyPriceListOptions` PER-LÍNEA: cada línea usa el suppress de SU
+  // propia lista (como si estuviera sola), NO el documental. Desacopla el pricing
+  // per-línea del modo del documento (SHARED/MIXED) → la Línea 1 no se re-pricea
+  // al cambiar la lista de la Línea 2. `null` por línea ⇒ fallback al documental.
+  const applyPriceListOptionsByLineIdx = await resolvePerLineApplyPriceListOptions({
+    jewelryId,
+    lineIntendedPriceListIds: lines.map((l) => l.priceListIdOverride ?? input.priceListId ?? null),
+  });
   traceDocument("L00_DOC_COMMERCIAL_CONTEXT", {
     mode:                              commercialDocCtx.mode,
     documentActivePriceList:           commercialDocCtx.documentActivePriceList,
@@ -5324,7 +5423,9 @@ async function _previewSaleImpl(
         // redondeo PER_LINE de hechura y/o metal físico en applyPriceList
         // (gate anti-doble). Cuando es PER_LINE_LEGACY, el objeto está
         // vacío y el motor mantiene comportamiento legacy intacto.
-        applyPriceListOptions: commercialDocCtx.applyPriceListOptions,
+        // FASE 1 — per-línea (independiente de otras líneas). Fallback al
+        // documental solo si la lista de esta línea no se pudo resolver.
+        applyPriceListOptions: applyPriceListOptionsByLineIdx.get(__lineIdx) ?? commercialDocCtx.applyPriceListOptions,
       });
 
       const n2 = (v: any) =>
@@ -5719,6 +5820,10 @@ async function _previewSaleImpl(
             "MANUAL_PRICE_OVERRIDE",
             "QUANTITY_DISCOUNT", "PROMOTION", "ENTITY_COMMERCIAL_RULE",
             "MANUAL_DISCOUNT_OVERRIDE",
+            // COMBO_PRICE — trazabilidad del precio del combo (Modelo A). El
+            // motor ya lo calcula; sin esto su `meta` (subtotal/adjustmentAmount/
+            // finalPrice) se perdía en la serialización. Passthrough, no cálculo.
+            "COMBO_PRICE",
           ]);
           const toNum = (v: unknown): number | null => {
             if (v == null) return null;
@@ -5758,6 +5863,13 @@ async function _previewSaleImpl(
                   // PROMOTION ya emite el nombre en el label (`Promoción: X`),
                   // pero igual viajamos un campo dedicado para el frontend.
                   promoName: pricing.appliedPromotionName ?? null,
+                  // COMBO_PRICE — passthrough del `meta` que el motor ya pobló
+                  // (null para los demás steps). Sin recalcular nada.
+                  subtotal:         n2(toNum(m.subtotal)),
+                  adjustmentKind:   typeof m.adjustmentKind === "string" ? m.adjustmentKind : null,
+                  adjustmentValue:  toNum(m.adjustmentValue),
+                  adjustmentAmount: n2(toNum(m.adjustmentAmount)),
+                  finalPrice:       n2(toNum(m.finalPrice)),
                 },
               };
             });
@@ -6016,8 +6128,17 @@ async function _previewSaleImpl(
   const commercialPerLineActive =
     (commercialDocCtx.mode === "PER_DOCUMENT" && commercialDocCtx.commercialDocumentRounding != null)
     || commercialDocCtx.mode === "MIXED_LIST_FALLBACK";
+  // El Redondeo Financiero del metal (capa 16) PHYSICAL necesita los mismos
+  // agregados por metal padre que el comercial (gramsPure agregado +
+  // referenceValue) para redondear el gramo de VENTA. Por eso, si la política
+  // del tenant es PHYSICAL, computamos los agregados AUNQUE la lista no tenga
+  // redondeo comercial. Armar los agregados NO dispara el redondeo comercial
+  // (eso se decide por `commercialDocCtx.commercialDocumentRounding`/config).
+  const financialPhysicalActive =
+    docRoundingPolicy.metalDomain === "PHYSICAL" && docRoundingPolicy.physical.enabled;
+  const commercialAggregatesNeeded = commercialPerLineActive || financialPhysicalActive;
   const commercialMetalIds = new Set<string>();
-  if (commercialPerLineActive) {
+  if (commercialAggregatesNeeded) {
     for (let idx = 0; idx < resolvedLines.length; idx++) {
       const steps = lineCostStepsByIdx.get(idx);
       if (!steps) continue;
@@ -6049,7 +6170,7 @@ async function _previewSaleImpl(
   // extrae a una variable para poder re-agregar en MIXTO usando SOLO las líneas
   // Desglosadas (ver fix anti-dilución más abajo), conservando los índices.
   const commercialAggInputLines: ResolvedLineForCommercialAgg[] =
-    commercialPerLineActive
+    commercialAggregatesNeeded
       ? resolvedLines.map((l, idx): ResolvedLineForCommercialAgg => {
             // FIX (auditoría diff-commercial-rounding-by-quantity) — usar los
             // steps del MOTOR DE VENTA (post `costLineOverrides`) como fuente
@@ -6060,6 +6181,14 @@ async function _previewSaleImpl(
               linePricingStepsByIdx.get(idx)
               ?? lineCostStepsByIdx.get(idx);
             const metalItems = steps ? extractMetalItemsFromSteps(steps) : [];
+            // BLINDAJE COMBO — un COMBO_COMMERCIAL NUNCA aporta metales al dominio
+            // físico del Redondeo Comercial (regla canónica COMBO = SALDO
+            // UNIFICADO MONETARIO). Hoy su metals[] ya es [] (no emite steps de
+            // metal); el guard lo vuelve EXPLÍCITO y permanente. Identidad:
+            // priceSource COMBO_COMPONENTS o costMode COMBO (= commercialMode
+            // COMBO_COMMERCIAL). Espejo del guard de confirmSale → paridad.
+            const isCombo =
+              (l as any).priceSource === "COMBO_COMPONENTS" || (l as any).costMode === "COMBO";
             return {
               quantity: l.quantity || 1,
               // R-COMMERCIAL-GRAMS-WITH-MERMA (REGLA ABSOLUTA) — el agregado
@@ -6073,7 +6202,7 @@ async function _previewSaleImpl(
               // (caso anómalo: purity ausente / step legacy / variante sin
               // pureza) descartamos la entry — preferimos no redondear a
               // redondear sin merma. La anomalía se loguea para auditoría.
-              metals: metalItems
+              metals: isCombo ? [] : metalItems
                 .filter((m) => {
                   if (!m.metalId) return false;
                   if (typeof m.gramsFineEquivalent !== "number" || !Number.isFinite(m.gramsFineEquivalent)) {
@@ -6100,7 +6229,7 @@ async function _previewSaleImpl(
           })
       : [];
   const commercialDocAggregates =
-    commercialPerLineActive
+    commercialAggregatesNeeded
       ? aggregateMetalsForCommercialDocRounding(commercialAggInputLines)
       : { metalsByParent: [], metalValuationSum: 0, gramsPureByParentByLineIdx: new Map<string, Map<number, number>>() };
 
@@ -6161,7 +6290,12 @@ async function _previewSaleImpl(
       marginFactorByLineIdx.set(i, cost > 0 ? sale / cost : 1);
       const ltw = resolvedLines[i].lineTotalWithTax;
       lineTotalWithTaxByIdx.set(i, typeof ltw === "number" && Number.isFinite(ltw) ? ltw : 0);
-      metalSaleSumByIdx.set(i, mhb ? Math.round(sale * q * 100) / 100 : 0);
+      // BLINDAJE COMBO — saldo monetario PURO → metalSaleSum 0 → el redondeo
+      // comercial cae sobre `lineTotalWithTax` COMPLETO (post-impuestos).
+      const isCombo =
+        (resolvedLines[i] as any).priceSource === "COMBO_COMPONENTS" ||
+        (resolvedLines[i] as any).costMode === "COMBO";
+      metalSaleSumByIdx.set(i, comboAwareMetalSaleSum(isCombo, mhb ? Math.round(sale * q * 100) / 100 : 0));
     }
     previewLineMetalsByIdx = computeLineCommercialRoundingMetals({
       gramsPureByParentByLineIdx: commercialDocAggregates.gramsPureByParentByLineIdx,
@@ -6364,7 +6498,11 @@ async function _previewSaleImpl(
         const ltw = clean ? clean.lineTotalWithTax : resolvedLines[i].lineTotalWithTax;
         lineTotalWithTaxByIdx.set(i, typeof ltw === "number" && Number.isFinite(ltw) ? ltw : 0);
         const metalSaleClean = clean ? clean.metalSale : (mhb ? Math.round(sale * q * 100) / 100 : 0);
-        metalSaleSumByIdx.set(i, metalSaleClean);
+        // BLINDAJE COMBO — saldo monetario PURO también en MIXTO.
+        const isCombo =
+          (resolvedLines[i] as any).priceSource === "COMBO_COMPONENTS" ||
+          (resolvedLines[i] as any).costMode === "COMBO";
+        metalSaleSumByIdx.set(i, comboAwareMetalSaleSum(isCombo, metalSaleClean));
       }
       previewLineMetalsByIdx = computeLineCommercialRoundingMetals({
         // FIX anti-dilución — gramos por línea SOLO de las Desglosadas (la
@@ -6411,7 +6549,11 @@ async function _previewSaleImpl(
         const cleanOwn = cleanByIdx.get(i) ?? null;
         const ltwOwn = cleanOwn ? cleanOwn.lineTotalWithTax : resolvedLines[i].lineTotalWithTax;
         ownLineTotalWithTaxByIdx.set(i, typeof ltwOwn === "number" && Number.isFinite(ltwOwn) ? ltwOwn : 0);
-        ownMetalSaleSumByIdx.set(i, Math.round(saleOwn * qOwn * 100) / 100);
+        // BLINDAJE COMBO — saldo monetario PURO (metalSaleSum 0 para combos).
+        const isComboOwn =
+          (resolvedLines[i] as any).priceSource === "COMBO_COMPONENTS" ||
+          (resolvedLines[i] as any).costMode === "COMBO";
+        ownMetalSaleSumByIdx.set(i, comboAwareMetalSaleSum(isComboOwn, Math.round(saleOwn * qOwn * 100) / 100));
       }
       const ownLineMetalsByIdx = computeLineCommercialRoundingMetals({
         gramsPureByParentByLineIdx: breakdownAgg.gramsPureByParentByLineIdx,
@@ -6511,7 +6653,25 @@ async function _previewSaleImpl(
     // hechura del snapshot comercial → se descuenta acá para no duplicarlo en
     // `Sale.total`. Fuera de MIXTO `mixedDeferredFoldedIntoSnapshot = 0`.
     roundingAdjustment:   Math.round((docRoundingAdjustmentPreEngine - mixedDeferredFoldedIntoSnapshot) * 100) / 100,
-    documentRounding:     docRoundingPolicy.documentRounding,
+    // ── Orden del Redondeo Financiero (PHYSICAL) ──────────────────────────────
+    // Cuando `financialPhysicalActive`, TODO el redondeo financiero (metal sale-
+    // gram + saldo + total unificado) corre en la capa 16 como ÚLTIMO paso
+    // automático, DESPUÉS de que el metal de venta se redondea. La config viaja
+    // a la capa 16 vía `financialMonetary`.
+    //
+    // FIX regresión 2026-06-16 (OPCIÓN B): ANTES pasábamos `documentRounding:
+    // null` para diferir el financiero. Eso dejaba `docRoundingActive=false` y,
+    // peor, reactivaba el financiero en la capa 15 → doble redondeo con la capa
+    // 16. Ahora pasamos SIEMPRE la política + `deferDocumentRoundingApplication`
+    // para que el motor (a) APLIQUE el deferred COMERCIAL de la lista (queda en
+    // `roundingAdjustment`, atribuido a la LISTA, sumado al total pre-financiero)
+    // y (b) NO aplique el financiero (documentRoundingApplied=null). La capa 16
+    // ENCADENA el financiero sobre el total YA post-comercial (misma config →
+    // delta 0; distinta → re-redondea). Cuando NO está activo, `defer=false` →
+    // todo queda como hoy (motor descarta el deferred y aplica el financiero,
+    // capa 15).
+    documentRounding:                 docRoundingPolicy.documentRounding,
+    deferDocumentRoundingApplication: financialPhysicalActive,
     // Etapa D' — Redondeo Comercial PER_DOCUMENT (POLICY §R-Rounding-15).
     // `null` cuando PER_LINE_LEGACY o MIXED_LIST_FALLBACK → la capa no actúa
     // (back-compat total). Cuando PER_DOCUMENT, alimenta la capa nueva.
@@ -6828,6 +6988,24 @@ async function _previewSaleImpl(
     documentTotals,
     balanceBreakdown,
     policy: docRoundingPolicy,
+    // Lado VENTA: la capa 16 PHYSICAL redondea el gramo de VENTA
+    // (`gramsPure × marginFactor`) con el precio de VENTA (referenceValue),
+    // igual que el Redondeo Comercial. Misma fuente y mismo cómputo que confirm.
+    commercial: {
+      metalsByParent: commercialDocAggregates.metalsByParent,
+      marginFactor:
+        documentTotals.metalCostSubtotal > 0
+          ? documentTotals.metalSaleSubtotal / documentTotals.metalCostSubtotal
+          : 1,
+    },
+    // Cuando `financialPhysicalActive`, el redondeo financiero MONETARIO (saldo
+    // BREAKDOWN + total UNIFIED) NO lo hizo el motor (capa 15) → corre acá, post
+    // metal sale-gram, como último paso automático. La capa 16 construye el
+    // `documentRoundingApplied` completo. Si no está activo → undefined (la capa
+    // 15 ya lo hizo, comportamiento histórico).
+    financialMonetary: financialPhysicalActive && docRoundingPolicy.documentRounding
+      ? { config: docRoundingPolicy.documentRounding }
+      : null,
   });
 
   // ── Etapa D' (cierre conceptual) — Vista del Redondeo Comercial por línea
@@ -6876,20 +7054,47 @@ async function _previewSaleImpl(
     //   METAL Comercial post     = Σ metalSale + metalImpact
     //   MONETARIO Comercial post = totalPost − METAL Comercial post
     //   TOTAL LÍNEA post         = lineTotalWithTaxPostCommercialRounding
+    // Base UNIFICADO — `lineTotalWithTax` pre-redondeo de cada línea. Se usa en
+    // UNIFICADO (reparto del ajuste documental) y como base del bucket monetario
+    // del COMBO en DESGLOSADO (Punto 2). Se construye PRIMERO.
+    const lineTotalWithTaxByLineIdx = new Map<number, number>();
+    for (let i = 0; i < resolvedLines.length; i++) {
+      const pre = resolvedLines[i].lineTotalWithTax;
+      lineTotalWithTaxByLineIdx.set(
+        i,
+        typeof pre === "number" && Number.isFinite(pre) ? pre : 0,
+      );
+    }
+    // Base de reparto del bucket MONETARIO (DESGLOSADO). Punto 2: para COMBO el
+    // peso es su valor comercial TOTAL (`lineTotalWithTax`), NO la porción
+    // hechura — el combo es saldo monetario puro. Resto de líneas: `hechuraSale`.
     const hechuraSaleByLineIdx = new Map<number, number>();
     for (let i = 0; i < resolvedLines.length; i++) {
-      const mhb = (resolvedLines[i] as any).metalHechuraBreakdown ?? null;
-      const q   = resolvedLines[i].quantity || 1;
+      const l = resolvedLines[i];
+      const isCombo =
+        (l as any).priceSource === "COMBO_COMPONENTS" || (l as any).costMode === "COMBO";
+      if (isCombo) {
+        hechuraSaleByLineIdx.set(i, lineTotalWithTaxByLineIdx.get(i) ?? 0);
+        continue;
+      }
+      const mhb = (l as any).metalHechuraBreakdown ?? null;
+      const q   = l.quantity || 1;
       hechuraSaleByLineIdx.set(
         i,
         mhb ? Math.round(Number(mhb.hechuraSale ?? 0) * q * 100) / 100 : 0,
       );
     }
+    const unifiedCommercialAdj =
+      (ctxBase as any)?.scope === "UNIFIED"
+        ? Number((ctxBase as any)?.unified?.adjustment ?? (ctxBase as any)?.totalAdjustment ?? 0)
+        : 0;
     const impactsByLineIdx = computeCommercialRoundingPerLineImpacts({
       breakdown:                  (ctxBase as any)?.breakdown,
       gramsPureByParentByLineIdx: commercialDocAggregates.gramsPureByParentByLineIdx,
       hechuraSaleByLineIdx,
       lineCount:                  resolvedLines.length,
+      unifiedAdjustment:          unifiedCommercialAdj,
+      lineTotalWithTaxByLineIdx,
     });
     for (let i = 0; i < resolvedLines.length; i++) {
       const imp = impactsByLineIdx.get(i) ?? { metalImpact: 0, hechuraImpact: 0, monetarySaldoPost: null };
@@ -7055,59 +7260,27 @@ async function _previewSaleImpl(
   // `documentTotals`/footer. El card del artículo lo consume con prioridad sobre
   // `lineCommercialSummary` (legacy). Espejo exacto en confirmSale.
   if (commercialAggInputLines.length > 0) {
-    const DISPLAY_NONE: CommercialDocRoundingPartConfig = { mode: "NONE", direction: "NEAREST" };
-    const displayCfgByLine = await resolvePerLineCommercialConfigs({
-      jewelryId,
-      lineAppliedPriceListIds: resolvedLines.map((l) => l.appliedPriceListId ?? null),
-    });
     for (let i = 0; i < resolvedLines.length; i++) {
       const line: any = resolvedLines[i];
-      const cfg   = displayCfgByLine.get(i) ?? null;
-      const agg   = commercialAggInputLines[i] ?? null;
-      const mhb   = line.metalHechuraBreakdown ?? null;
-      const qty   = line.quantity || 1;
-      const isBd  = cfg?.scope === "BREAKDOWN" && !!agg?.metals?.length;
-      const metalCost    = mhb ? Number(mhb.metalCost ?? 0) : 0;
-      const metalSalePre = mhb ? Number(mhb.metalSalePreRounding ?? mhb.metalSale ?? 0) : 0;
-      const marginFactor = metalCost > 0 ? metalSalePre / metalCost : 1;
-      const metalSaleSum = Math.round(metalSalePre * qty * 100) / 100;
-      const ltw = typeof line.lineTotalWithTax === "number" && Number.isFinite(line.lineTotalWithTax)
-        ? line.lineTotalWithTax : 0;
-      const displaySummary = buildLineCommercialDisplaySummary({
-        mode:             isBd ? "BREAKDOWN" : "UNIFIED",
-        lineMetals:       isBd ? (agg?.metals ?? []) : [],
-        quantity:         qty,
-        marginFactor,
-        metalCfg:         (cfg && cfg.scope === "BREAKDOWN") ? cfg.metal   : DISPLAY_NONE,
-        hechuraCfg:       (cfg && cfg.scope === "BREAKDOWN") ? cfg.hechura : DISPLAY_NONE,
-        lineTotalWithTax: ltw,
-        metalSaleSum,
-        source: {
-          strategy:           isBd ? "PER_LINE" : "NONE",
-          appliedListMode:    line.appliedPriceListMode ?? line.pricingMeta?.appliedPriceListMode ?? null,
-          appliedPriceListId: line.appliedPriceListId ?? null,
-          documentContext:    line.appliedPriceListId ? "SHARED_LIST" : "NO_LIST",
-        },
+      const summary = line.lineCommercialSummary;
+      if (!summary) continue;
+      // FIX MONETARIO MIXED — el display autónomo ES el `lineCommercialSummary`
+      // (FASE 0, armado desde `previewMoneyByIdx`/`previewLineMetalsByIdx`, la
+      // MISMA fuente que produce los `lineOwn*` correctos). Antes se recomputaba
+      // con `buildLineCommercialDisplaySummary` (agregado de 1 línea) que en MIXED
+      // tomaba un refValue ya en moneda DISPLAY → DOBLE conversión (÷rate) → el
+      // MONETARIO/metal del card quedaba dividido por la cotización. Reutilizar el
+      // summary garantiza `lineCommercialDisplaySummary === lineCommercialSummary
+      // === lineOwn*`. Display-only: NO toca `Sale.total`/consolidación/footer.
+      // Espejo exacto en confirmSale.
+      // DEEP CLONE (fix doble conversión) — no compartir `metals`/`monetary` por
+      // referencia con `lineCommercialSummary`: la conversión de moneda convierte
+      // AMBOS resúmenes y un sub-objeto compartido quedaría ÷rate². Ver
+      // `cloneLineCommercialSummary`.
+      line.lineCommercialDisplaySummary = cloneLineCommercialSummary(summary, {
+        strategy:        summary.mode === "BREAKDOWN" ? "PER_LINE" : "NONE",
+        documentContext: line.appliedPriceListId ? "SHARED_LIST" : "NO_LIST",
       });
-      line.lineCommercialDisplaySummary = displaySummary;
-      // ── Fix leak repriceLineClean (MIXED) — el "resumen comercial visible"
-      // (FASE 0 `lineCommercialSummary`) debe reflejar el metalSale PROPIO de la
-      // línea (`metalSalePreRounding`), no el `clean` que alimenta el snapshot/
-      // Sale.total. El display autónomo (FASE 1) ya lo computó. SOLO en MIXED y
-      // SOLO líneas con metal (desglosadas) reemplazamos `lineCommercialSummary`
-      // por el display, preservando su `source` (documentContext real). NO toca
-      // `previewLineMetalsByIdx` ni `commercialDocPrecomputed` → snapshot/
-      // Sale.total intactos. (Single/PER_DOCUMENT ya daba el valor propio.)
-      if (
-        commercialDocCtx.mode === "MIXED_LIST_FALLBACK" &&
-        displaySummary.metals &&
-        line.lineCommercialSummary
-      ) {
-        line.lineCommercialSummary = {
-          ...displaySummary,
-          source: line.lineCommercialSummary.source,
-        };
-      }
     }
   }
 
@@ -7351,7 +7524,9 @@ export async function sendSaleByEmail(
   // documentos en etapas futuras (presupuestos / ordenes / NC / remitos).
   const mailCtx = await resolveTenantMailContext(jewelryId);
 
-  const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;
+  // El cuerpo = mensaje del operador (intacto) ENVUELTO con el branding del
+  // tenant (firma/contacto/pie) provisto por el SSOT tenantMailContext.
+  const html = composeBrandedEmailHtml({ message: input.message, branding: mailCtx.branding });
 
   // E2 — envoltura para capturar messageId y errores del provider,
   // luego persistir el log documental. El log NUNCA rompe el envío
@@ -7401,13 +7576,4 @@ export async function sendSaleByEmail(
   if (sendError) throw sendError;
 
   return { messagedRecipient: input.to, filename };
-}
-
-function escapeHtmlForMail(s: string): string {
-  return String(s ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }

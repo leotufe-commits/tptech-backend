@@ -1147,4 +1147,98 @@ describe("computeSaleDocumentTotals — Rounding deferred de lista en input.roun
   });
 });
 
+describe("computeSaleDocumentTotals — deferDocumentRoundingApplication (fix regresión 2026-06-16)", () => {
+  // Escenario base: lista UNIFICADA con rounding COMERCIAL DIFERIDO ≠ 0
+  // (applyOn=TOTAL, PER_LINE) que el caller pasa vía `roundingAdjustment`, +
+  // política financiera de comprobante activa.
+  //
+  // OPCIÓN B (decisión del operador 2026-06-16): cuando coexisten comercial
+  // diferido + financiero, el COMERCIAL se APLICA en capa 15 (atribuido a la
+  // lista) y el FINANCIERO ENCADENA en capa 16. Ya NO se descarta el comercial
+  // (eso era la opción A previa). El descarte solo sobrevive cuando el
+  // financiero corre EN la capa 15 (defer=false).
+  const DEFERRED = 26.03;   // rounding deferred de la lista (≠ 0)
+  const financialPolicy: DocumentRoundingInput = { mode: "HUNDRED", direction: "NEAREST" };
+  const baseLine = () => line({ lineTotal: 1000, lineTaxAmount: 100 }); // total pre-round = 1100
+
+  it("defer=true (OPCIÓN B): APLICA el diferido comercial (roundingAdjustment=DEFERRED) y NO aplica el financiero acá (documentRoundingApplied=null → lo encadena la capa 16)", () => {
+    const out = computeSaleDocumentTotals({
+      lines:   [baseLine()],
+      channel: null,
+      coupon:  null,
+      roundingAdjustment: DEFERRED,           // diferido COMERCIAL de la lista (UNIFICADA)
+      documentRounding:   financialPolicy,    // política financiera PRESENTE
+      deferDocumentRoundingApplication: true, // financiero diferido a capa 16
+    });
+    // OPCIÓN B: el diferido comercial SE APLICA (queda atribuido a la lista).
+    expect(out.roundingAdjustment).toBeCloseTo(DEFERRED, 2);
+    // El financiero NO se aplica acá → lo encadena la capa 16 sobre el total
+    // ya post-comercial (misma config → delta 0; distinta → re-redondea).
+    expect(out.documentRoundingApplied).toBeNull();
+    // total = 1100 + 26.03 (comercial aplicado). El financiero encadena en capa 16.
+    expect(out.total).toBeCloseTo(1100 + DEFERRED, 2);
+    // El step ROUNDING del trace lleva el comercial (para el display "Redondeo comercial").
+    const roundingStep = out.sourceTrace.find((s) => s.step === "ROUNDING");
+    expect(roundingStep?.amount).toBeCloseTo(DEFERRED, 2);
+  });
+
+  it("defer=false (default): aplica el financiero en capa 15 y descarta el diferido", () => {
+    const out = computeSaleDocumentTotals({
+      lines:   [baseLine()],
+      channel: null,
+      coupon:  null,
+      roundingAdjustment: DEFERRED,
+      documentRounding:   financialPolicy,    // política financiera activa
+      // sin deferDocumentRoundingApplication → default false
+    });
+    // El diferido se descarta igual (docRoundingActive=true).
+    expect(out.roundingAdjustment).not.toBe(DEFERRED);
+    // El financiero SÍ se aplica acá (capa 15): HUNDRED NEAREST sobre 1100 = 1100.
+    // Forzamos un total que SÍ se mueva para verificar la aplicación.
+    const moved = computeSaleDocumentTotals({
+      lines:   [line({ lineTotal: 1000, lineTaxAmount: 149 })], // pre-round = 1149
+      channel: null, coupon: null,
+      roundingAdjustment: DEFERRED,
+      documentRounding:   financialPolicy,
+    });
+    expect(moved.documentRoundingApplied).not.toBeNull();
+    expect(moved.documentRoundingApplied?.totalAdjustment).toBeCloseTo(-49, 2); // 1149 → 1100
+    expect(moved.total).toBeCloseTo(1100, 2);
+    // Sanity del caso 1100 (ya redondo): no se reporta capa fantasma, pero el
+    // diferido tampoco se aplica.
+    expect(out.total).toBeCloseTo(1100, 2);
+  });
+
+  it("defer=true (OPCIÓN B): el diferido comercial SE APLICA aunque el financiero (capa 16) no mueva el total — el financiero encadena con delta 0", () => {
+    // Total pre-comercial = 1100. El diferido comercial (26.03) ahora SÍ se
+    // aplica en capa 15 → total = 1126.03. El financiero (HUNDRED) encadenaría
+    // en capa 16 sobre 1126.03 → 1100 (delta -26.03), pero ese paso vive en la
+    // capa 16, fuera de este test. Acá verificamos solo la capa 15.
+    const out = computeSaleDocumentTotals({
+      lines:   [baseLine()],
+      channel: null, coupon: null,
+      roundingAdjustment: DEFERRED,
+      documentRounding:   financialPolicy,
+      deferDocumentRoundingApplication: true,
+    });
+    // Capa 15: el comercial se aplica (1100 + 26.03), el financiero NO corre acá.
+    expect(out.total).toBeCloseTo(1100 + DEFERRED, 2);
+    expect(out.roundingAdjustment).toBeCloseTo(DEFERRED, 2);
+  });
+
+  it("sin política financiera + defer ausente: el diferido de la lista SÍ se aplica (comercial unificado)", () => {
+    // Caso operador: sin financiero → documentRounding null/inerte →
+    // docRoundingActive=false → el diferido de la lista se aplica normalmente.
+    const out = computeSaleDocumentTotals({
+      lines:   [baseLine()],
+      channel: null, coupon: null,
+      roundingAdjustment: DEFERRED,
+      documentRounding:   null,
+    });
+    expect(out.roundingAdjustment).toBeCloseTo(DEFERRED, 2);
+    expect(out.documentRoundingApplied).toBeNull();
+    expect(out.total).toBeCloseTo(1100 + DEFERRED, 2);
+  });
+});
+
 

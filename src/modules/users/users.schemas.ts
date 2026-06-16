@@ -45,9 +45,26 @@ export const createUserSchema = z.object({
 });
 
 /* =========================
+   THEME PREFERENCE (ME)
+   PATCH /users/me/theme
+
+   SSOT (backend) de la lista de temas válidos. El frontend mantiene su propia
+   copia en `ThemeContext.tsx` (THEME_DEFS) — no se comparte por paquete porque
+   `tptech-shared` no se compila a JS y `node dist` (producción) no resuelve el
+   alias `@tptech/shared`. ⚠️ Si se agrega/quita un tema, actualizar AMBAS
+   listas (FE + BE).
+========================= */
+export const THEME_NAMES = ["classic", "dark", "blue", "gray", "emerald"] as const;
+export const themeSchema = z.object({
+  theme: z.enum(THEME_NAMES),
+});
+export type ThemeName = (typeof THEME_NAMES)[number];
+
+/* =========================
    TYPES
 ========================= */
 export type UpdateUserStatusInput = z.infer<typeof updateUserStatusSchema>;
+export type UpdateThemeInput = z.infer<typeof themeSchema>;
 export type AssignRolesInput = z.infer<typeof assignRolesSchema>;
 export type UserOverrideInput = z.infer<typeof userOverrideSchema>;
 export type CreateUserInput = z.infer<typeof createUserSchema>;

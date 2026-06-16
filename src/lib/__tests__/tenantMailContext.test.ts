@@ -217,7 +217,7 @@ describe("resolveTenantMailContext", () => {
     expect(ctx.from).toBe("no-reply@tptech.local");
   });
 
-  it("query usa select MINIMO (solo 4 campos email-related, multi-tenant + perf movil)", async () => {
+  it("query usa select EXPLÍCITO (header + branding del cuerpo, multi-tenant + perf movil)", async () => {
     process.env.MAIL_FROM = "no-reply@tptech.local";
     mockPrisma.jewelry.findUnique.mockResolvedValueOnce({
       emailEnabled:    true,
@@ -230,11 +230,22 @@ describe("resolveTenantMailContext", () => {
     expect(mockPrisma.jewelry.findUnique).toHaveBeenCalledTimes(1);
     const args = mockPrisma.jewelry.findUnique.mock.calls[0]![0]!;
     expect(args.where).toEqual({ id: "jw-1" });
+    // Select explícito (sin over-fetch): 4 campos del header (From/Reply-To)
+    // + los campos de branding que consume composeBrandedEmailHtml (B-lite).
     expect(args.select).toEqual({
-      emailEnabled:    true,
-      emailSenderName: true,
-      emailReplyTo:    true,
-      email:           true,
+      emailEnabled:       true,
+      emailSenderName:    true,
+      emailReplyTo:       true,
+      email:              true,
+      emailSignature:     true,
+      emailContact:       true,
+      emailPhone:         true,
+      emailWhatsapp:      true,
+      emailAddressLine:   true,
+      emailBusinessHours: true,
+      emailWebsite:       true,
+      emailInstagram:     true,
+      emailFooter:        true,
     });
   });
 });

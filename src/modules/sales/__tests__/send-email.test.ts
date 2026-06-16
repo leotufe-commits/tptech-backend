@@ -265,4 +265,58 @@ describe("sendSaleByEmail — pivot funcional (sellos, no bloqueos)", () => {
     expect(call.html).toContain("&lt;script&gt;");
     expect(call.html).toContain("&amp;");
   });
+
+  // ─── B-lite — branding del tenant en el correo enviado ─────────────────────
+
+  it("B-lite: el branding del tenant (firma/contacto/pie) se inyecta en el HTML enviado", async () => {
+    mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale());
+    mockPrisma.jewelry.findUnique
+      .mockReset()
+      // 1ª: generateSalePdf (emisor del PDF).
+      .mockResolvedValueOnce(makeJewelry())
+      // 2ª: resolveTenantMailContext (header + branding del cuerpo).
+      .mockResolvedValueOnce({
+        emailEnabled:       true,
+        emailSenderName:    "Joyería Tuport",
+        emailReplyTo:       "ventas@jt.com",
+        email:              "info@jt.com",
+        emailSignature:     "Equipo de Joyería Tuport",
+        emailContact:       "contacto@jt.com",
+        emailPhone:         "+54 11 1234-5678",
+        emailWhatsapp:      "+54 9 11 8765-4321",
+        emailAddressLine:   "Florida 123, CABA",
+        emailBusinessHours: "Lun-Vie 9-18h",
+        emailWebsite:       "https://jt.com",
+        emailInstagram:     "@joyeriatuport",
+        emailFooter:        "Mensaje legal de cierre.",
+      });
+
+    await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    const call = mockSendMail.mock.calls[0]![0]!;
+
+    // El mensaje del operador sigue intacto (en <pre> + text plano).
+    expect(call.html).toContain("<pre");
+    expect(call.text).toBe(HAPPY_INPUT.message);
+    // El branding configurado AHORA viaja en el HTML real.
+    for (const txt of [
+      "Equipo de Joyería Tuport", "contacto@jt.com", "+54 11 1234-5678",
+      "Florida 123, CABA", "Mensaje legal de cierre.",
+    ]) {
+      expect(call.html).toContain(txt);
+    }
+  });
+
+  it("B-lite: sin branding configurado, el HTML es solo el mensaje (sin secciones extra)", async () => {
+    mockPrisma.sale.findFirst.mockResolvedValueOnce(makeSale());
+    mockPrisma.jewelry.findUnique
+      .mockReset()
+      .mockResolvedValueOnce(makeJewelry())
+      .mockResolvedValueOnce({ emailEnabled: true, emailSenderName: "", emailReplyTo: "", email: "" });
+
+    await sendSaleByEmail("sale-1", "jw-1", HAPPY_INPUT);
+    const call = mockSendMail.mock.calls[0]![0]!;
+    expect(call.html).toContain("<pre");
+    // sin branding → no se agregan secciones (que usan border-top)
+    expect(call.html).not.toContain("border-top");
+  });
 });

@@ -33,20 +33,14 @@ router.patch("/me", requireCompanyEdit, updateMyJewelry);
 router.post("/me/logo", requireCompanyEdit, ...uploadJewelryFiles, uploadMyJewelryLogo);
 router.delete("/me/logo", requireCompanyEdit, deleteMyJewelryLogo);
 
-/**
- * ✅ ALIAS para frontend viejo/otro hook:
- * (si tu hook usa /company/logo con PUT/DELETE)
- */
-router.put("/logo", requireCompanyEdit, ...uploadJewelryFiles, uploadMyJewelryLogo);
-router.delete("/logo", requireCompanyEdit, deleteMyJewelryLogo);
-
 /* =========================
    ATTACHMENTS
 ========================= */
 
-/**
- * ✅ RUTAS “OFICIALES” actuales del backend (me/attachments)
- */
+// Rutas canónicas (me/attachments). El frontend (usePerfilJoyeria.ts) usa
+// SOLO estas variantes `/me/*`. Las antiguas alias sin `/me`
+// (`PUT /logo`, `PUT|POST /attachments`, `DELETE /attachments/:id`) se
+// eliminaron por estar sin consumidores — ver auditoría Configuración rápida.
 router.post(
   "/me/attachments",
   requireCompanyEdit,
@@ -55,26 +49,5 @@ router.post(
 );
 
 router.delete("/me/attachments/:id", requireCompanyEdit, deleteMyJewelryAttachment);
-
-/**
- * ✅ ALIAS para tu FRONTEND actual (usePerfilJoyeria.ts):
- *   PUT /company/attachments
- *   DELETE /company/attachments/:id
- */
-router.put(
-  "/attachments",
-  requireCompanyEdit,
-  ...uploadJewelryFiles,
-  uploadMyJewelryAttachments
-);
-
-router.post(
-  "/attachments",
-  requireCompanyEdit,
-  ...uploadJewelryFiles,
-  uploadMyJewelryAttachments
-);
-
-router.delete("/attachments/:id", requireCompanyEdit, deleteMyJewelryAttachment);
 
 export default router;

@@ -18,9 +18,10 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma.js";
 import { resolvePriceList, resolvePriceListById, applyPriceList, applyRounding, type MetalHechuraDetail } from "./pricing-engine.pricelist.js";
-import { calculateCostFromLines, enrichCostMetalSteps, buildBatchCostContext, getArticleMetalVariantIds } from "./pricing-engine.cost.js";
+import { calculateCostFromLines, enrichCostMetalSteps, buildBatchCostContext, getArticleMetalVariantIds, applyAdjustment } from "./pricing-engine.cost.js";
 // F1.4 G5 #11-A — helper para unificar overrides legacy + explicit.
 import { unifyCostLineOverrides } from "./pricing-engine.cost-line-overrides.js";
+import { applyComboAdjustment, type ComboAdjustmentKind } from "../combo.utils.js";
 import type {
   SalePriceResult,
   SalePriceOpts,
@@ -1277,6 +1278,20 @@ export async function resolveFinalSalePrice(
   // El precio NO se calcula en este branch — lo aplica el flujo estándar como
   // cualquier artículo. Si el combo no tiene lista ni salePrice manual → precio = null.
   let comboCostStep: any = null;
+  // Combo comercial — PRECIO derivado de los componentes (Opción A).
+  //   precio combo = Σ(precio de venta del componente × cantidad) ± ajuste propio
+  // Se consume más abajo, en la resolución de precio base, con
+  // priceSource="COMBO_COMPONENTS", cuando no hubo lista ni precio manual.
+  // El COSTO del combo (Σ costo componente × cantidad) ya lo resuelve este
+  // mismo branch sobre `costResult.value`.
+  let comboDerivedPrice: Prisma.Decimal | null = null;
+  let comboPricePartial = false;
+  let comboPriceStep: any = null;
+  // true cuando AL MENOS un componente usó el pipeline nuevo (cost-line con
+  // unitValue > 0 → costLineAdj × margen). Habilita la precedencia
+  // COMBO_COMPONENTS > PRICE_LIST. Para combos legacy (todos unitValue=0) queda
+  // false → la lista sobre comboCost sigue priceando (comportamiento histórico).
+  let comboPriceUsedCostLines = false;
   if (article.commercialMode === "COMBO_COMMERCIAL") {
     const comboCtx = opts._comboContext ?? { depth: 0, visited: new Set<string>() };
     const MAX_DEPTH = 5;
@@ -1312,6 +1327,13 @@ export async function resolveFinalSalePrice(
       );
 
       let comboCost = new Prisma.Decimal(0);
+      // PRECIO — subtotal de la suma de precios de venta de los componentes
+      // (× cantidad). Independiente del costo: un componente puede tener precio
+      // aunque su costo no resuelva, y viceversa. Si falta precio en algún
+      // componente → parcial, pero no rompe el combo si otros sí tienen.
+      let comboPriceSubtotal = new Prisma.Decimal(0);
+      let comboPriceResolved = 0;
+      let comboPriceMissing  = 0;
       // FASE 1 — acumulamos costos por componente (metal vs hechura) para que
       // el combo tenga `metalCost`/`hechuraCost` y pueda armar
       // `metalHechuraBreakdown` con `source = "COMBO_COMPONENTS"`.
@@ -1331,6 +1353,17 @@ export async function resolveFinalSalePrice(
       }> = [];
       const missingComponents: Array<{ articleId: string; reason: string }> = [];
 
+      // Overrides del operador (edición de "Composición del costo" en Factura).
+      // MISMO conjunto que consume `calculateCostFromLines` → el combo recalcula
+      // su precio con los valores EFECTIVOS, no los persistidos. Lookup O(1) por
+      // costLineId. NO toca `comboCost` (sigue con qty/unitValue persistidos —
+      // deuda técnica aprobada). Espejo de cost.ts:148-328.
+      const comboOverrideMap = new Map(
+        (unifiedCostLineOverrides ?? [])
+          .filter((o) => typeof o?.costLineId === "string" && o.costLineId.length > 0)
+          .map((o) => [o.costLineId, o] as const),
+      );
+
       for (const line of componentLines) {
         const componentId = line.catalogItemId as string;
         const qty = parseFloat(String(line.quantity ?? 0));
@@ -1342,9 +1375,100 @@ export async function resolveFinalSalePrice(
             articleId: componentId,
             quantity:  1,
             _comboContext: childCtx,
+            // CONTEXTO COMERCIAL del documento — el componente debe resolver con
+            // la MISMA lista/cliente que cuando se vende individualmente. Sin
+            // esto, el componente se resolvía "bare" y, si su precio deriva de
+            // una lista de precios, devolvía basePrice/unitPrice/unitCost = null
+            // → comboDerivedPrice colapsaba a 0/null. No se inventa contexto:
+            // se reenvían los MISMOS `opts` que recibió el documento principal.
+            clientId:              opts.clientId,
+            priceListIdOverride:   opts.priceListIdOverride,
+            applyPriceListOptions: opts.applyPriceListOptions,
+            quantityDiscountIds:   opts.quantityDiscountIds,
           });
         } catch {
           missingComponents.push({ articleId: componentId, reason: "Error al resolver el componente." });
+        }
+
+        // PRECIO del componente DENTRO del combo (Modelo A — fuente ÚNICA).
+        // Pipeline canónico: cost-line del combo → lineAdj interno → margen →
+        // venta. Es la MISMA fuente que `composition.products[].lineSale`
+        // (cost-line ajustado × margen), eliminando la doble fuente de verdad.
+        //
+        //   costLineAdj   = applyAdjustment(unitValue × qty, lineAdjKind/Type/Value)
+        //   marginFactor  = componentResult.basePrice / componentResult.unitCost
+        //   contribución  = costLineAdj × marginFactor
+        //
+        // El `lineAdj` interno (Bonif/Recargo del cost-line del combo) es dominio
+        // comercial del combo (capa de construcción), por eso forma parte del
+        // precio base. `basePrice` es PRE-promo/descuento de factura (inmune a
+        // una promo scope-ALL recursiva); la promo del combo se aplica una sola
+        // vez más abajo, sobre el subtotal ya ajustado por componente.
+        //
+        // Bifurcación legacy: si `unitValue = 0/null` (combos viejos donde "el
+        // motor resuelve el costo") o no hay costo del componente, se cae al
+        // comportamiento previo (venta standalone × cantidad). `comboCost` NO se
+        // reconcilia en esta etapa (fuera de alcance aprobado).
+        // Valores EFECTIVOS = persistido pisado por el override del operador
+        // (edición de la tabla de composición en Factura). Espejo exacto de
+        // cost.ts:148-328. Si el operador edita cantidad/valor/ajuste del
+        // componente, el precio del combo se recalcula con estos valores.
+        const ov = (typeof line.id === "string" && line.id.length > 0)
+          ? comboOverrideMap.get(line.id)
+          : undefined;
+        const effectiveQty = ov?.quantityOverride != null ? ov.quantityOverride : qty;
+        const effectiveUnitValueN = ov?.unitValueOverride != null
+          ? Number(ov.unitValueOverride)
+          : ((line as any).unitValue != null ? Number(String((line as any).unitValue)) : 0);
+        let effAdjKind:  unknown = (line as any).lineAdjKind;
+        let effAdjType:  unknown = (line as any).lineAdjType;
+        let effAdjValue: unknown = (line as any).lineAdjValue;
+        if (ov && (
+          ov.adjustmentKind  !== undefined ||
+          ov.adjustmentType  !== undefined ||
+          ov.adjustmentValue !== undefined
+        )) {
+          if (ov.adjustmentKind === null) {
+            effAdjKind = null; effAdjType = null; effAdjValue = null;
+          } else {
+            if (ov.adjustmentKind  !== undefined) effAdjKind  = ov.adjustmentKind;
+            if (ov.adjustmentType  !== undefined) effAdjType  = ov.adjustmentType;
+            if (ov.adjustmentValue !== undefined) effAdjValue = ov.adjustmentValue;
+          }
+        }
+
+        const compBaseSale = componentResult?.basePrice ?? componentResult?.unitPrice ?? null;
+        const compUnitCostN = componentResult?.unitCost != null
+          ? Number(componentResult.unitCost.toString())
+          : null;
+
+        let saleContribution: Prisma.Decimal | null = null;
+        if (
+          compBaseSale != null &&
+          Number.isFinite(effectiveUnitValueN) && effectiveUnitValueN > 0 &&
+          compUnitCostN != null && Number.isFinite(compUnitCostN) && compUnitCostN > 0
+        ) {
+          // Pipeline nuevo (unitValue efectivo > 0): cost-line ajustado × margen.
+          const costLineRaw = new Prisma.Decimal(String(effectiveUnitValueN)).mul(effectiveQty);
+          const costLineAdj = applyAdjustment(
+            costLineRaw,
+            effAdjKind  as Parameters<typeof applyAdjustment>[1],
+            effAdjType  as Parameters<typeof applyAdjustment>[2],
+            effAdjValue as Parameters<typeof applyAdjustment>[3],
+          );
+          const marginFactor = new Prisma.Decimal(String(compBaseSale)).div(compUnitCostN);
+          saleContribution = costLineAdj.mul(marginFactor);
+          comboPriceUsedCostLines = true;   // habilita precedencia COMBO_COMPONENTS > PRICE_LIST
+        } else if (compBaseSale != null) {
+          // Fallback legacy: venta standalone del componente × cantidad efectiva.
+          saleContribution = new Prisma.Decimal(String(compBaseSale)).mul(effectiveQty);
+        }
+
+        if (saleContribution != null) {
+          comboPriceSubtotal = comboPriceSubtotal.add(saleContribution);
+          comboPriceResolved += 1;
+        } else {
+          comboPriceMissing += 1;
         }
 
         const compCost = componentResult?.unitCost != null
@@ -1420,12 +1544,52 @@ export async function resolveFinalSalePrice(
           ...(missingComponents.length > 0 ? { missingComponents } : {}),
         },
       };
+
+      // ── PRECIO del combo (canónico) — Σ precios componente ± ajuste ────────
+      // Reutiliza el SSOT `applyComboAdjustment` (combo.utils.ts). Solo se arma
+      // si al menos un componente resolvió precio; si faltan otros, marca
+      // parcial pero no rompe el combo.
+      if (comboPriceResolved > 0) {
+        const subtotal = parseFloat(comboPriceSubtotal.toString());
+        const adjKind  = ((article as any).comboAdjustmentKind ?? "NONE") as ComboAdjustmentKind;
+        const adjValue = (article as any).comboAdjustmentValue != null
+          ? parseFloat(String((article as any).comboAdjustmentValue))
+          : null;
+        const { final, adjustmentAmount } = applyComboAdjustment(subtotal, adjKind, adjValue);
+        comboDerivedPrice = new Prisma.Decimal(String(final));
+        comboPricePartial = comboPriceMissing > 0;
+        comboPriceStep = {
+          key: "COMBO_PRICE",
+          label: "Precio del combo (suma de componentes)",
+          status: comboPricePartial ? "partial" : "ok",
+          value: comboDerivedPrice,
+          meta: {
+            subtotal,
+            adjustmentKind:  adjKind,
+            adjustmentValue: adjValue,
+            adjustmentAmount,
+            finalPrice:      final,
+            componentsWithPrice: comboPriceResolved,
+            ...(comboPriceMissing > 0 ? { componentsMissingPrice: comboPriceMissing } : {}),
+          },
+        };
+      } else {
+        // Ningún componente resolvió precio → no hay precio derivable.
+        comboPriceStep = {
+          key: "COMBO_PRICE",
+          label: "Precio del combo (suma de componentes)",
+          status: "missing",
+          value: null,
+          message: "Ningún componente del combo tiene precio de venta resuelto.",
+        };
+      }
     }
   }
 
   // Agregar pasos del costo al trace
   steps.push(...costResult.steps);
   if (comboCostStep) steps.push(comboCostStep);
+  if (comboPriceStep) steps.push(comboPriceStep);
 
   steps.push({
     key: "COSTO_REAL",
@@ -1796,7 +1960,77 @@ export async function resolveFinalSalePrice(
     });
   }
 
-  // 1d. Fallback salePrice
+  // 1d. Combo comercial — precio derivado de los componentes (canónico).
+  // DEBE evaluarse ANTES del fallback `salePrice`: un combo puede tener
+  // `salePrice` residual (típicamente 0) persistido, y ese fallback lo
+  // resolvería como MANUAL_FALLBACK=0 antes de llegar acá, dejando el precio
+  // del combo en 0. Orden correcto: PRICE_LIST → MANUAL_OVERRIDE explícito →
+  // COMBO_COMPONENTS → MANUAL_FALLBACK → noPrice.
+  //
+  // El precio "normal" (lista de precios / override del artículo) puede haber
+  // quedado en `null` O en `0`: una PRICE_LIST en modo margen evalúa a 0 sobre
+  // un combo cuyo costo agregado es 0, dejando `basePrice = 0` (NO null) y
+  // bloqueando este branch. Por eso disparamos cuando el precio normal es
+  // null O <= 0, siempre que el combo tenga un precio derivado REAL (> 0):
+  // el 0 de la lista NO debe shadowear el precio de los componentes.
+  // `comboDerivedPrice` es null para no-combos (no los afecta).
+  // El precio canónico de un COMBO_COMMERCIAL es `comboDerivedPrice` (Modelo A:
+  // componentes → lineAdj interno → margen → venta → ajuste propio). Debe ganar
+  // sobre el `basePrice` que la PRICE_LIST produjo sobre `comboCost` SIN ajustar.
+  // Dispara cuando:
+  //   · la lista/manual dejó `basePrice` null o ≤ 0  (caso histórico), O
+  //   · el combo se construyó desde cost-lines reales (`comboPriceUsedCostLines`)
+  //     y la lista lo priceó > 0 (NUEVO — la lista NO debe sobrescribir el combo).
+  // NUNCA pisa un override manual REAL del artículo (`priceSource==="MANUAL_OVERRIDE"`).
+  // `comboDerivedPrice` es null para no-combos (no los afecta). Combos legacy
+  // (unitValue=0) → `comboPriceUsedCostLines=false` → sólo el caso ≤0 (intacto).
+  const comboPriceWins =
+    comboDerivedPrice != null &&
+    comboDerivedPrice.greaterThan(0) &&
+    priceSource !== "MANUAL_OVERRIDE" &&
+    (
+      basePrice == null ||
+      basePrice.lessThanOrEqualTo(0) ||
+      comboPriceUsedCostLines
+    );
+  if (comboPriceWins) {
+    // ¿La lista SÍ priceó el combo (>0)? Entonces conserva su atribución
+    // (priceListId/name/mode = contexto comercial). Si dio 0/null, NO pricció →
+    // limpia la atribución (no mostrar una lista que no aplicó). Se evalúa con el
+    // `basePrice` AÚN viejo (antes de pisarlo con `comboDerivedPrice`).
+    const listPricedCombo =
+      priceSource === "PRICE_LIST" && basePrice != null && basePrice.greaterThan(0);
+    basePrice = comboDerivedPrice;
+    priceSource = "COMBO_COMPONENTS";
+    if (!listPricedCombo) {
+      appliedPriceListId = null;
+      appliedPriceListName = null;
+      appliedPriceListMode = null;
+    }
+    // Salvaguarda R1 (ajustada 2026-06-11) — solo se resetea `appliedRounding`,
+    // que es el artefacto con valores pre/post calculados sobre el `basePrice`
+    // viejo (comboCost × margen). Se RECALCULA fresco más abajo sobre el
+    // `totalWithTax` REAL del combo en la capa "REDONDEO DIFERIDO TOTAL".
+    //
+    // `deferredRounding` (config de la lista: applyOn / mode / direction) se
+    // CONSERVA: el combo debe recibir el Redondeo Comercial FINAL_PRICE/TOTAL
+    // igual que un artículo monetario de lista unificada (regla canónica
+    // COMBO_COMERCIAL = SALDO UNIFICADO). El `if (deferredRounding?.applyOn ===
+    // "TOTAL")` posterior redondea el total ACTUAL del combo (no el basePrice
+    // viejo). El redondeo doc-level (documentRoundingSnapshot /
+    // commercialRoundingContext) sigue siendo independiente y NO se toca.
+    appliedRounding = null;
+    if (comboPricePartial) partial = true;
+    steps.push({
+      key: "BASE_PRICE",
+      label: "Precio base (combo)",
+      status: comboPricePartial ? "partial" : "ok",
+      value: basePrice,
+      meta: { priceSource: "COMBO_COMPONENTS", listContext: listPricedCombo ? appliedPriceListId : null },
+    });
+  }
+
+  // 1e. Fallback salePrice (no-combos, o combo sin precio derivable).
   if (basePrice == null && article.salePrice != null) {
     basePrice = new D(article.salePrice.toString());
     priceSource = "MANUAL_FALLBACK";
@@ -1867,10 +2101,18 @@ export async function resolveFinalSalePrice(
   // precio final neto). Mantenemos `basePrice` para que la UI muestre la
   // lista original.
   let manualPriceApplied = false;
+  // Combo comercial: un `manualPriceOverride === 0` NO es un precio manual
+  // explícito — es el 0 inicial de la línea (precio derivado de componentes).
+  // No debe pisar el `comboDerivedPrice` (priceSource="COMBO_COMPONENTS").
+  // Un override REAL del operador (> 0) sigue ganando normalmente. Para
+  // artículos NO combo el comportamiento queda idéntico (>= 0 sigue valiendo).
+  const comboZeroOverrideShadow =
+    comboDerivedPrice != null && opts.manualPriceOverride === 0;
   if (
     opts.manualPriceOverride != null &&
     Number.isFinite(opts.manualPriceOverride) &&
-    opts.manualPriceOverride >= 0
+    opts.manualPriceOverride >= 0 &&
+    !comboZeroOverrideShadow
   ) {
     manualPriceApplied = true;
     priceSource = "MANUAL_OVERRIDE";
@@ -3381,6 +3623,22 @@ export function buildPricingSnapshot(
     appliedPromotionId:   result.appliedPromotionId,
     appliedPromotionName: result.appliedPromotionName,
     appliedDiscountId:    result.appliedDiscountId,
+
+    // Redondeo de lista congelado — confirmSale recupera el delta del redondeo
+    // TOTAL desde acá (paridad preview↔confirm para líneas applyOn=TOTAL, p.ej.
+    // combos y artículos/servicios con lista MARGIN_TOTAL). Solo se persiste
+    // cuando el motor lo emitió; si no, se omite (back-compat: confirm → delta 0).
+    ...(result.appliedRounding
+      ? {
+          appliedRounding: {
+            applyOn:      result.appliedRounding.applyOn,
+            mode:         result.appliedRounding.mode,
+            direction:    result.appliedRounding.direction,
+            preRounding:  result.appliedRounding.preRounding.toNumber(),
+            postRounding: result.appliedRounding.postRounding.toNumber(),
+          },
+        }
+      : {}),
 
     metalHechuraBreakdown: mhb
       ? {

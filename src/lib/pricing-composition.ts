@@ -1066,16 +1066,45 @@ export function extractCompositionCostAdjustment(
  *   (tolerancia ≤ 0.01 por redondeo Decimal interno).
  */
 /**
- * F1.5 #A++ — calcula el factor que convierte `lineCost` de METAL en
- * `lineSale` per fila. Passthrough exacto del breakdown agregado:
+ * Factor del Ajuste Global de costo (`adjFactor = COST_LINES_FINAL.value /
+ * meta.sumLines`). Sin ajuste, `adjusted === sumLines` → `adjFactor = 1`.
+ * Es el MISMO valor que el cost-engine usó para escalar `metalCost`/`hechuraCost`
+ * agregados (`pricing-engine.cost.ts`). Helper puro, passthrough — no recalcula.
+ */
+export function extractGlobalCostAdjFactor(
+  result: SalePriceResult | null | undefined,
+): number {
+  const finalStep = (result?.steps ?? []).find(s => s && s.key === "COST_LINES_FINAL");
+  if (!finalStep) return 1;
+  const meta = (finalStep.meta ?? {}) as Record<string, unknown>;
+  const adjusted = finalStep.value != null ? Number(finalStep.value) : null;
+  const sumLines = meta.sumLines != null ? Number(meta.sumLines) : null;
+  if (adjusted != null && sumLines != null && Number.isFinite(adjusted)
+      && Number.isFinite(sumLines) && sumLines !== 0) {
+    return adjusted / sumLines;
+  }
+  return 1;
+}
+
+/**
+ * F1.5 #A++ — calcula el factor que convierte `lineCost` de METAL (PRE-ajuste,
+ * = `COST_LINES_METAL.value`) en `lineSale` per fila:
  *
- *   `lineSale = lineCost × (metalSale / metalCost)`
+ *   `lineSale = lineCost_PRE × (metalSale / metalCost) × adjFactor`
  *
- * El motor ya aplicó margen + ajuste global al bucket METAL completo (todas
- * las cost-lines comparten metalMarginPct); este factor distribuye el
- * sale-side per línea sin matemática nueva. La paridad
- * `Σ metals[i].lineSale === metalSale` se garantiza por construcción
- * (factor uniforme).
+ * ⚠️ FIX (2026-06-12) — incluir `adjFactor` (= Ajuste Global). `metalSale` y
+ * `metalCost` del breakdown son agregados POST-ajuste (`metalCost = Σlineas ×
+ * adjFactor`), por lo que `metalSale / metalCost` da el margen LITERAL del metal
+ * SIN el ajuste global (se cancela). Pero `metals[i].lineCost` es PRE-ajuste, así
+ * que el factor DEBE reintroducir `adjFactor` para que:
+ *   (1) `Σ metals[i].lineSale === metalSale` (POST) — invariante restaurado; y
+ *   (2) el margen visible refleje la bonif/recargo global, IGUAL que
+ *       HECHURA/PRODUCT/SERVICE (cuyo `computeHechuraSaleFactor` ya multiplica
+ *       `adjFactor`). Antes del fix, con ajuste global, `Σ lineSale_metal =
+ *       metalSale / adjFactor ≠ metalSale` y el margen del metal NO reflejaba el
+ *       ajuste. Sin ajuste, `adjFactor = 1` → comportamiento idéntico (cero
+ *       regresión). NO toca agregados/totales/snapshots/redondeo — solo el
+ *       sale-side per línea de la tabla "Composición del costo".
  *
  * Retorna `null` cuando:
  *   · no hay `metalHechuraBreakdown` (lista MARGIN_TOTAL sin desglose).
@@ -1094,7 +1123,7 @@ export function computeMetalSaleFactor(
   const metalSale = br.metalSale;
   if (metalCost == null || !Number.isFinite(metalCost) || metalCost === 0) return null;
   if (metalSale == null || !Number.isFinite(metalSale)) return null;
-  return metalSale / metalCost;
+  return (metalSale / metalCost) * extractGlobalCostAdjFactor(result);
 }
 
 /**
@@ -1115,7 +1144,9 @@ export function computeMetalSaleFactorPre(
   const metalSalePre = (br as { metalSalePreRounding?: number | null }).metalSalePreRounding;
   if (metalCost == null || !Number.isFinite(metalCost) || metalCost === 0) return null;
   if (metalSalePre == null || !Number.isFinite(metalSalePre)) return null;
-  return Number(metalSalePre) / metalCost;
+  // Mismo fix que `computeMetalSaleFactor`: incluir `adjFactor` (el lineCost al
+  // que se aplica es PRE-ajuste). Sin ajuste → adjFactor=1 → sin cambio.
+  return (Number(metalSalePre) / metalCost) * extractGlobalCostAdjFactor(result);
 }
 
 export function computeHechuraSaleFactor(
@@ -1123,21 +1154,9 @@ export function computeHechuraSaleFactor(
 ): number | null {
   const hechuraMarginPct = result?.metalHechuraBreakdown?.hechuraMarginPct;
   if (hechuraMarginPct == null || !Number.isFinite(hechuraMarginPct)) return null;
-
-  // adjFactor desde el step COST_LINES_FINAL. Cuando no hay ajuste global,
-  // adjusted === sumLines → adjFactor = 1.
-  const finalStep = (result?.steps ?? []).find(s => s && s.key === "COST_LINES_FINAL");
-  let adjFactor = 1;
-  if (finalStep) {
-    const meta = (finalStep.meta ?? {}) as Record<string, unknown>;
-    const adjusted = finalStep.value != null ? Number(finalStep.value) : null;
-    const sumLines = meta.sumLines != null ? Number(meta.sumLines) : null;
-    if (adjusted != null && sumLines != null && Number.isFinite(adjusted)
-        && Number.isFinite(sumLines) && sumLines !== 0) {
-      adjFactor = adjusted / sumLines;
-    }
-  }
-  return adjFactor * (1 + hechuraMarginPct / 100);
+  // adjFactor desde el step COST_LINES_FINAL (helper compartido con METAL).
+  // Sin ajuste global → adjFactor = 1.
+  return extractGlobalCostAdjFactor(result) * (1 + hechuraMarginPct / 100);
 }
 
 /**

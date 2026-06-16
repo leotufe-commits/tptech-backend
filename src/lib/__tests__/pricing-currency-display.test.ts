@@ -22,6 +22,7 @@ import {
   convertFromBase,
   convertSalesPreviewInputInPlace,
 } from "../pricing-currency-display.js";
+import { cloneLineCommercialSummary } from "../../modules/sales/commercial-doc-rounding-wiring.js";
 
 // `convertFromBase` divide por `rate`. Para tener números exactos en el test,
 // usamos rate = 100 → cada valor convertido = original / 100.
@@ -542,5 +543,202 @@ describe("T42 — convertSalesLineInPlace convierte pricingSteps[].meta + .value
     expect(a.value).toBeCloseTo(s.value, 4);
     expect(a.meta.discountBase  ).toBeCloseTo(s.meta.discountBase,   4);
     expect(a.meta.discountAmount).toBeCloseTo(s.meta.discountAmount, 4);
+  });
+});
+
+// ============================================================================
+// COMBO comercial — Bug FX: la columna "Venta total" y los "Totales" del combo
+// en "Composición del costo del artículo" leen `pricingSteps[COMBO_PRICE].meta`
+// (`finalPrice`/`subtotal`/`adjustmentAmount` vía `extractComboPriceMeta`), NO
+// `step.value`. Esos campos son monetarios en BASE; sin convertir quedaban en
+// moneda base con símbolo de display al actualizar la cotización.
+//
+// `convertPricingStepsInPlace` ahora convierte, SOLO para el step COMBO_PRICE:
+//   · meta.subtotal · meta.finalPrice · meta.adjustmentAmount
+//   · meta.adjustmentValue → SOLO cuando adjustmentKind === "DISCOUNT_FIXED"
+// Sin tocar adjustmentKind ni los contadores componentsWithPrice/MissingPrice.
+// ============================================================================
+
+/** Step COMBO_PRICE sintético. `kind` controla si adjustmentValue es monetario
+ *  (DISCOUNT_FIXED) o porcentaje (DISCOUNT_PERCENT / SURCHARGE_PERCENT). */
+function makeComboPriceStep(kind: string, adjustmentValue: number) {
+  return {
+    key:    "COMBO_PRICE",
+    label:  "Precio del combo (suma de componentes)",
+    status: "ok",
+    value:  900, // = finalPrice (comboDerivedPrice) — ya cubierto por step.value
+    meta:   {
+      subtotal:            1000,   // Σ componentes (monetario)
+      adjustmentKind:      kind,   // discriminador (NO se convierte)
+      adjustmentValue,             // % o monto según kind
+      adjustmentAmount:    100,    // magnitud del ajuste (monetario)
+      finalPrice:          900,    // precio POST-ajuste (monetario)
+      componentsWithPrice: 2,      // contador (NO monetario)
+    },
+  };
+}
+
+describe("COMBO_PRICE — convertSalesLineInPlace convierte la meta del combo", () => {
+  it("convierte meta.subtotal, finalPrice y adjustmentAmount con RATE", () => {
+    const line: any = { pricingSteps: [makeComboPriceStep("SURCHARGE_PERCENT", 10)] };
+    convertSalesLineInPlace(line, RATE);
+    const m = line.pricingSteps[0].meta;
+    expect(m.subtotal        ).toBeCloseTo(1000 / RATE, 4);
+    expect(m.finalPrice      ).toBeCloseTo(900  / RATE, 4);
+    expect(m.adjustmentAmount).toBeCloseTo(100  / RATE, 4);
+    // step.value también (= finalPrice) — ya cubierto por la conversión general.
+    expect(line.pricingSteps[0].value).toBeCloseTo(900 / RATE, 4);
+  });
+
+  it("adjustmentValue: convierte SOLO en DISCOUNT_FIXED (monto); NO en % kinds", () => {
+    // DISCOUNT_FIXED → adjustmentValue es monto → se convierte.
+    const fixed: any = { pricingSteps: [makeComboPriceStep("DISCOUNT_FIXED", 100)] };
+    convertSalesLineInPlace(fixed, RATE);
+    expect(fixed.pricingSteps[0].meta.adjustmentValue).toBeCloseTo(100 / RATE, 4);
+
+    // SURCHARGE_PERCENT → adjustmentValue es % → NO se convierte.
+    const pct: any = { pricingSteps: [makeComboPriceStep("SURCHARGE_PERCENT", 10)] };
+    convertSalesLineInPlace(pct, RATE);
+    expect(pct.pricingSteps[0].meta.adjustmentValue).toBe(10);
+
+    // DISCOUNT_PERCENT → % → NO se convierte.
+    const pctD: any = { pricingSteps: [makeComboPriceStep("DISCOUNT_PERCENT", 5)] };
+    convertSalesLineInPlace(pctD, RATE);
+    expect(pctD.pricingSteps[0].meta.adjustmentValue).toBe(5);
+  });
+
+  it("NO toca adjustmentKind ni los contadores componentsWithPrice", () => {
+    const line: any = { pricingSteps: [makeComboPriceStep("DISCOUNT_FIXED", 100)] };
+    convertSalesLineInPlace(line, RATE);
+    expect(line.pricingSteps[0].meta.adjustmentKind).toBe("DISCOUNT_FIXED");
+    expect(line.pricingSteps[0].meta.componentsWithPrice).toBe(2);
+  });
+
+  it("rate === 1 → no-op (combo queda en BASE)", () => {
+    const line: any = { pricingSteps: [makeComboPriceStep("DISCOUNT_FIXED", 100)] };
+    convertSalesLineInPlace(line, 1);
+    const m = line.pricingSteps[0].meta;
+    expect(m.subtotal).toBe(1000);
+    expect(m.finalPrice).toBe(900);
+    expect(m.adjustmentAmount).toBe(100);
+    expect(m.adjustmentValue).toBe(100);
+  });
+
+  it("PARIDAD articles ↔ sales: la meta del COMBO_PRICE se convierte igual", () => {
+    const articleRes: any = { pricingSteps: [makeComboPriceStep("DISCOUNT_FIXED", 100)] };
+    const salesRes:   any = { lines: [{ pricingSteps: [makeComboPriceStep("DISCOUNT_FIXED", 100)] }] };
+    convertArticlePreviewResponseInPlace(articleRes, RATE);
+    convertSalesPreviewResponseInPlace(salesRes, RATE);
+    const a = articleRes.pricingSteps[0].meta;
+    const s = salesRes.lines[0].pricingSteps[0].meta;
+    expect(a.finalPrice      ).toBeCloseTo(s.finalPrice,       4);
+    expect(a.subtotal        ).toBeCloseTo(s.subtotal,         4);
+    expect(a.adjustmentAmount).toBeCloseTo(s.adjustmentAmount, 4);
+    expect(a.adjustmentValue ).toBeCloseTo(s.adjustmentValue,  4);
+  });
+});
+
+describe("Descuentos qty/promo/cliente — bases y montos en multimoneda", () => {
+  it("convierte montos y bases; VALUE solo si FIXED_AMOUNT; % y discriminadores intactos", () => {
+    const line: any = {
+      quantityDiscountAmount:     100,
+      promotionDiscountAmount:    50,
+      customerDiscountAmount:     30,
+      quantityDiscountBase:       1000,
+      promotionDiscountBase:      2000,
+      customerDiscountBase:       3000,
+      quantityDiscountValue:      80,           // FIXED_AMOUNT → se convierte
+      quantityDiscountValueType:  "FIXED_AMOUNT",
+      promotionDiscountValue:     10,           // PERCENTAGE → NO se convierte
+      promotionDiscountValueType: "PERCENTAGE",
+    };
+    convertSalesLineInPlace(line, RATE);
+    // Montos (todos monetarios → divididos por RATE).
+    expect(line.quantityDiscountAmount ).toBeCloseTo(100 / RATE, 4);
+    expect(line.promotionDiscountAmount).toBeCloseTo(50  / RATE, 4);
+    expect(line.customerDiscountAmount ).toBeCloseTo(30  / RATE, 4);
+    // Bases (siempre monetarias).
+    expect(line.quantityDiscountBase ).toBeCloseTo(1000 / RATE, 4);
+    expect(line.promotionDiscountBase).toBeCloseTo(2000 / RATE, 4);
+    expect(line.customerDiscountBase ).toBeCloseTo(3000 / RATE, 4);
+    // VALUE: FIXED_AMOUNT convertido; PERCENTAGE intacto (es un %, no un monto).
+    expect(line.quantityDiscountValue ).toBeCloseTo(80 / RATE, 4);
+    expect(line.promotionDiscountValue).toBe(10);
+    // Discriminadores no se tocan.
+    expect(line.quantityDiscountValueType ).toBe("FIXED_AMOUNT");
+    expect(line.promotionDiscountValueType).toBe("PERCENTAGE");
+  });
+
+  it("rate === 1 → no-op (queda en BASE)", () => {
+    const line: any = { quantityDiscountBase: 1000, customerDiscountAmount: 30 };
+    convertSalesLineInPlace(line, 1);
+    expect(line.quantityDiscountBase).toBe(1000);
+    expect(line.customerDiscountAmount).toBe(30);
+  });
+
+  it("campos ausentes / null → no rompe (defensivo)", () => {
+    expect(() => convertSalesLineInPlace({ quantityDiscountBase: null } as any, RATE)).not.toThrow();
+    expect(() => convertSalesLineInPlace({} as any, RATE)).not.toThrow();
+  });
+});
+
+describe("lineCommercialDisplaySummary — fix doble conversión (deep clone)", () => {
+  // Reproduce el bug real: el display summary se derivaba con spread superficial
+  // `{ ...summary }`, compartiendo `metals`/`monetary` por referencia. La
+  // conversión convertía AMBOS resúmenes → el sub-objeto compartido quedaba
+  // ÷rate². En moneda no-base el redondeo del metal se iba a ~0.
+  it("display summary clonado se convierte UNA sola vez (no ÷rate²)", () => {
+    const summary: any = {
+      mode: "BREAKDOWN",
+      metals: {
+        visibleGrams:   2.3,
+        monetaryAmount: 343.41 * RATE,    // BASE
+        roundingImpact: 1.7667 * RATE,    // BASE — el campo del bug
+        byParent: [{
+          metalParentId: "oro", metalParentName: "Oro",
+          visibleGrams: 2.3, monetaryAmount: 343.41 * RATE, roundingImpact: 1.7667 * RATE,
+        }],
+      },
+      monetary:        { amount: 133.93 * RATE, roundingImpact: 0 },
+      totalLineAmount: 479.11 * RATE,
+      source:          { generatedBy: "test" },
+    };
+    const line: any = {
+      lineCommercialSummary:        summary,
+      lineCommercialDisplaySummary: cloneLineCommercialSummary(summary, { strategy: "PER_LINE" }),
+    };
+    convertSalesLineInPlace(line, RATE);
+    // Cada resumen ÷rate UNA vez (no ÷rate²). El redondeo del metal queda en su
+    // valor display real, no en ~0.
+    expect(line.lineCommercialSummary.metals.roundingImpact).toBeCloseTo(1.7667, 3);
+    expect(line.lineCommercialDisplaySummary.metals.roundingImpact).toBeCloseTo(1.7667, 3);
+    expect(line.lineCommercialDisplaySummary.metals.byParent[0].roundingImpact).toBeCloseTo(1.7667, 3);
+    // Guard explícito contra la regresión del ÷rate² (daría ~0.0118 con RATE=100).
+    expect(line.lineCommercialDisplaySummary.metals.roundingImpact).toBeGreaterThan(1);
+  });
+
+  it("cloneLineCommercialSummary NO comparte sub-objetos anidados con el original", () => {
+    const summary: any = {
+      mode: "BREAKDOWN",
+      metals: { roundingImpact: 10, byParent: [{ roundingImpact: 10 }] },
+      monetary: { amount: 5 },
+      source: {},
+    };
+    const clone = cloneLineCommercialSummary(summary, { strategy: "PER_LINE" });
+    expect(clone.metals).not.toBe(summary.metals);
+    expect(clone.monetary).not.toBe(summary.monetary);
+    expect(clone.metals.byParent).not.toBe(summary.metals.byParent);
+    expect(clone.metals.byParent[0]).not.toBe(summary.metals.byParent[0]);
+    expect(clone.source.strategy).toBe("PER_LINE");
+    // Mutar el clon no afecta al original.
+    clone.metals.roundingImpact = 999;
+    expect(summary.metals.roundingImpact).toBe(10);
+  });
+
+  it("clone defensivo: null / metals null / sin byParent → no rompe", () => {
+    expect(cloneLineCommercialSummary(null)).toBeNull();
+    expect(cloneLineCommercialSummary({ mode: "UNIFIED", metals: null, monetary: { amount: 1 }, source: {} }).metals).toBeNull();
+    const noByParent = cloneLineCommercialSummary({ mode: "BREAKDOWN", metals: { roundingImpact: 1 }, source: {} });
+    expect(noByParent.metals.roundingImpact).toBe(1);
   });
 });

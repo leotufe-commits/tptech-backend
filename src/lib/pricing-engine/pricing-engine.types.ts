@@ -250,6 +250,11 @@ export type PriceSource =
   //   · Priority 8 — paridad de líneas manuales: requisito previo a que el
   //     motor formal procese MANUAL_LINE (Gap G2 / Fase 1.3).
   | "MANUAL_LINE"
+  // Combo comercial — precio derivado de la suma de precios de venta de los
+  // componentes ± ajuste propio del combo (comboAdjustmentKind/Value). Es la
+  // fuente canónica de precio de un COMBO_COMMERCIAL cuando no hubo lista de
+  // precios ni precio manual. Σ(precio componente × cantidad) ± ajuste.
+  | "COMBO_COMPONENTS"
   | "NONE";
 
 /**
@@ -1090,6 +1095,22 @@ export interface PricingLineSnapshot {
    *  congelada en DRAFT. confirmSale la reusa para recomputar el impuesto
    *  sobre la MISMA base (paridad preview↔confirm). null = sin override. */
   manualTaxAppliesTo?: "TOTAL" | "METAL" | "HECHURA" | "METAL_Y_HECHURA" | "SUBTOTAL_AFTER_DISCOUNT" | "SUBTOTAL_BEFORE_DISCOUNT" | "PRODUCT" | "SERVICE" | null;
+
+  /** Redondeo de lista aplicado a ESTA línea (applyOn PRICE/NET/TOTAL/METAL),
+   *  congelado para que confirmSale recupere el delta del redondeo TOTAL sin
+   *  recalcular ni derivarlo de otros campos. Garantiza la paridad
+   *  preview↔confirm para líneas con `applyOn === "TOTAL"`: ese redondeo NO se
+   *  hornea en `unitPrice` (rondea `totalWithTax`), así que sin este campo
+   *  confirm lo perdía (`appliedRoundingDelta = 0` → total PRE). Optional para
+   *  back-compat: snapshots viejos sin el campo → confirm cae al comportamiento
+   *  actual (delta 0). */
+  appliedRounding?: {
+    applyOn:      string;
+    mode:         string;
+    direction:    string;
+    preRounding:  number;
+    postRounding: number;
+  } | null;
 
   // ── Fuente del precio ─────────────────────────────────────────────────────
   priceSource: string;

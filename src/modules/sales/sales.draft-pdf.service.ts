@@ -38,6 +38,9 @@ import { sendMail } from "../../lib/mail.service.js";
 // Mismo modulo que usa `sendSaleByEmail` (sales.service.ts) — garantiza
 // que ambos flujos componen From/Reply-To identicos.
 import { resolveTenantMailContext } from "../../lib/tenantMailContext.js";
+// Composer ÚNICO del cuerpo HTML del mail (branding del tenant). Mismo helper
+// que `sendSaleByEmail` → ambos flujos envuelven el mensaje con el branding.
+import { composeBrandedEmailHtml } from "../../lib/mail-branding.js";
 // Etapa 2 (PDF unico canonico) — provider fachada que sirve tanto al
 // flujo legacy (Sale persistido) como al draft. Aca usamos solo el path
 // `renderFromDraft`. Si en un futuro queremos consolidar ambos flujos en
@@ -119,7 +122,7 @@ export async function sendSaleDraftByEmail(
   // misma resolucion de branding del tenant.
   const mailCtx = await resolveTenantMailContext(jewelryId);
 
-  const html = `<pre style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap;margin:0;">${escapeHtmlForMail(input.message)}</pre>`;
+  const html = composeBrandedEmailHtml({ message: input.message, branding: mailCtx.branding });
 
   let mailResult: { messageId: string | null } = { messageId: null };
   let sendError:  Error | null = null;
@@ -163,12 +166,4 @@ export async function sendSaleDraftByEmail(
   if (sendError) throw sendError;
 
   return { messagedRecipient: input.to, filename };
-}
-
-function escapeHtmlForMail(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }

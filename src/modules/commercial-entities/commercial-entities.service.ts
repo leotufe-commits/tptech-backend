@@ -1,5 +1,5 @@
 import { prisma } from "../../lib/prisma.js";
-import type { EntityType, BalanceType, AddressType } from "@prisma/client";
+import type { EntityType, BalanceType, BalanceMode, AddressType } from "@prisma/client";
 import { aggregateEntityBalance } from "./balance.utils.js";
 
 function s(v: any) {
@@ -86,6 +86,9 @@ const ENTITY_LIST_SELECT = {
   taxExempt: true,
   taxApplyOnOverride: true,
   balanceType: true,
+  // Campo canónico del nivel "Cliente" de la jerarquía R11.4 (nullable).
+  // `null` = "sin preferencia" → el cliente delega en el resto de la cadena.
+  balanceMode: true,
   isActive: true,
   sourceType: true,
   mergedIntoEntityId: true,
@@ -393,8 +396,15 @@ export async function createEntity(jewelryId: string, data: any) {
   const displayName = calcDisplayName(entityType, firstName, lastName, tradeName, companyName);
   const code = await generateCode(jewelryId);
 
-  const balanceType: BalanceType =
-    data?.balanceType === "BREAKDOWN" ? "BREAKDOWN" : "UNIFIED";
+  // Cliente = NIVEL DE SUGERENCIA (R11.4). El campo canónico es `balanceMode`
+  // (nullable): `null` = "sin preferencia" → delega en la jerarquía. El legacy
+  // `balanceType` (no-null) se mantiene en ESPEJO para el Estado de Cuenta
+  // legacy: al crear refleja el modo elegido, o UNIFIED si no hay preferencia.
+  const balanceMode: BalanceMode | null =
+    data?.balanceMode === "UNIFIED" || data?.balanceMode === "BREAKDOWN"
+      ? data.balanceMode
+      : null;
+  const balanceType: BalanceType = balanceMode ?? "UNIFIED";
 
   const creditLimitClient =
     data?.creditLimitClient != null && data.creditLimitClient !== ""
@@ -425,6 +435,7 @@ export async function createEntity(jewelryId: string, data: any) {
       documentNumber: s(data?.documentNumber),
       ivaCondition: s(data?.ivaCondition),
       balanceType,
+      balanceMode,
       creditLimitClient,
       creditLimitSupplier,
       priceListId: data?.priceListId || null,
@@ -481,8 +492,15 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
 
   const displayName = calcDisplayName(entityType, firstName, lastName, tradeName, companyName);
 
-  const balanceType: BalanceType =
-    data?.balanceType === "BREAKDOWN" ? "BREAKDOWN" : "UNIFIED";
+  // Cliente = nivel de SUGERENCIA. Persistimos el canónico `balanceMode`
+  // (nullable). El legacy `balanceType` SOLO se actualiza cuando el operador
+  // elige un modo explícito; con "sin preferencia" (null) se PRESERVA el valor
+  // histórico para no alterar el Estado de Cuenta legacy (que aún lo lee).
+  const balanceMode: BalanceMode | null =
+    data?.balanceMode === "UNIFIED" || data?.balanceMode === "BREAKDOWN"
+      ? data.balanceMode
+      : null;
+  const balanceTypePatch = balanceMode ? { balanceType: balanceMode as BalanceType } : {};
 
   const creditLimitClient =
     data?.creditLimitClient != null && data.creditLimitClient !== ""
@@ -515,7 +533,8 @@ export async function updateEntity(id: string, jewelryId: string, data: any) {
       documentType: s(data?.documentType),
       documentNumber: s(data?.documentNumber),
       ivaCondition: s(data?.ivaCondition),
-      balanceType,
+      balanceMode,
+      ...balanceTypePatch,
       creditLimitClient,
       creditLimitSupplier,
       priceListId: data?.priceListId || null,

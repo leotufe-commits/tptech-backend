@@ -28,9 +28,10 @@ describe("G1 — PriceSource incluye MANUAL_LINE", () => {
       "PRICE_LIST",
       "MANUAL_FALLBACK",
       "MANUAL_LINE",
+      "COMBO_COMPONENTS",
       "NONE",
     ];
-    expect(valid).toHaveLength(7);
+    expect(valid).toHaveLength(8);
   });
 
   it("baseline correct: PriceSource permite asignación discriminada en switch", () => {
@@ -42,6 +43,7 @@ describe("G1 — PriceSource incluye MANUAL_LINE", () => {
         case "PRICE_LIST":        return "price-list";
         case "MANUAL_FALLBACK":   return "fallback";
         case "MANUAL_LINE":       return "manual-line";
+        case "COMBO_COMPONENTS":  return "combo-components";
         case "NONE":              return "none";
       }
     }
