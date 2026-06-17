@@ -1494,7 +1494,14 @@ export async function resolveFinalSalePrice(
           continue;
         }
 
-        const lineCost = compCost.mul(qty);
+        // FIX (2026-06-17) — el COSTO/metal/hechura del combo sigue la cantidad
+        // EDITADA (`effectiveQty`), igual que el PRECIO (que ya usaba
+        // `effectiveQty` arriba). Antes usaban `qty` (cantidad original), por lo
+        // que editar la Cantidad de un componente movía el precio pero NO el
+        // costo/margen (inconsistencia documentada como "fuera de alcance"). Con
+        // los combos parcialmente editables (Cantidad + Merma/Ajuste), costo y
+        // precio ahora usan el mismo número → margen y total coherentes.
+        const lineCost = compCost.mul(effectiveQty);
         comboCost = comboCost.add(lineCost);
         // FASE 1 — propagar metalCost/hechuraCost desde el breakdown del
         // componente. Si el componente no tiene breakdown (ej. componente
@@ -1502,8 +1509,8 @@ export async function resolveFinalSalePrice(
         // aproximación más segura para componentes service-like).
         const compMHB = componentResult?.metalHechuraBreakdown ?? null;
         if (compMHB) {
-          comboMetalCost   = comboMetalCost.add(  new Prisma.Decimal(String(compMHB.metalCost   ?? 0)).mul(qty));
-          comboHechuraCost = comboHechuraCost.add(new Prisma.Decimal(String(compMHB.hechuraCost ?? 0)).mul(qty));
+          comboMetalCost   = comboMetalCost.add(  new Prisma.Decimal(String(compMHB.metalCost   ?? 0)).mul(effectiveQty));
+          comboHechuraCost = comboHechuraCost.add(new Prisma.Decimal(String(compMHB.hechuraCost ?? 0)).mul(effectiveQty));
         } else {
           // Sin breakdown del componente — todo a hechura.
           comboHechuraCost = comboHechuraCost.add(lineCost);
@@ -1512,7 +1519,7 @@ export async function resolveFinalSalePrice(
           articleId: componentId,
           code: line.catalogItem?.code ?? null,
           name: line.catalogItem?.name ?? null,
-          quantity: qty,
+          quantity: effectiveQty,
           unitCost: parseFloat(compCost.toString()),
           lineCost: parseFloat(lineCost.toString()),
           unitPrice: componentResult?.unitPrice != null ? parseFloat(componentResult.unitPrice.toString()) : null,
