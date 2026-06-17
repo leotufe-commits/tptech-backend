@@ -178,7 +178,29 @@ export function applyDocumentPhysicalRounding(args: {
   //
   // BACK-COMPAT: sin `commercial`, redondea el gramo PURO físico del balance
   // (`gramsPure`) con el precio de COSTO (`quotePriceSnapshot`).
-  const useCommercial = !!commercial && commercial.metalsByParent.length > 0;
+  // ── GATE POR SCOPE EFECTIVO (metal sale-gram solo si BREAKDOWN) ───────────
+  // El redondeo del METAL de VENTA (path `commercial`) pertenece al dominio
+  // DESGLOSADO del Redondeo Financiero: solo aplica cuando el scope efectivo
+  // INCLUYE BREAKDOWN. En UNIFIED el financiero redondea ÚNICAMENTE el TOTAL
+  // crudo (no descompone metal/saldo), así que el metal NO debe redondearse por
+  // separado — si corriera, su `metalMonetaryEquivalent` CONTAMINARÍA el total
+  // que entra al paso `unified` (ej. 715.986,32 → 718.636,32 → 718.600 en vez
+  // de 715.986,32 → 716.000).
+  //
+  // Gate SOLO cuando el caller comercial pasó `financialMonetary` (lado venta
+  // con `financialPhysicalActive`): ahí el scope efectivo es la autoridad.
+  //   · scope === "UNIFIED" → suprimir el metal sale-gram (no redondear, no
+  //     emitir metalPhysical, no mover el total). El paso `unified` de
+  //     `financialMonetary` redondea el total crudo (pre-metal).
+  //   · scope incluye BREAKDOWN ("BREAKDOWN"/"BOTH") → metal corre como hoy.
+  //
+  // BACK-COMPAT: sin `financialMonetary` (callers legacy / no-sales) el metal
+  // corre según `metalDomain` (comportamiento histórico intacto).
+  const suppressCommercialMetalByScope =
+    !!financialMonetary && (financialMonetary.config.scope ?? "UNIFIED") === "UNIFIED";
+
+  const useCommercial =
+    !!commercial && commercial.metalsByParent.length > 0 && !suppressCommercialMetalByScope;
   const marginFactor =
     useCommercial && Number.isFinite(commercial!.marginFactor) && commercial!.marginFactor > 0
       ? commercial!.marginFactor
@@ -252,7 +274,14 @@ export function applyDocumentPhysicalRounding(args: {
         configByMetalParentId: policy.physical.configByMetalParentId,
         fallbackConfig:        policy.physical.fallbackConfig,
       };
-  const result = roundDocumentMetalGrams(helperInput);
+  // Cuando el scope efectivo del financiero es UNIFIED (gate de arriba), el
+  // metal NO se redondea por separado: cortocircuitamos el helper a un resultado
+  // vacío (metalEq=0, metals=[]). NO caemos al path back-compat del balance —
+  // si lo hiciéramos, el metal se redondearía igual y volvería a contaminar el
+  // total. El paso `unified` de `financialMonetary` redondeará el total crudo.
+  const result: RoundDocumentMetalGramsResult = suppressCommercialMetalByScope
+    ? { metals: [], metalMonetaryEquivalent: 0, fallback: "NO_METALS_TO_ROUND" }
+    : roundDocumentMetalGrams(helperInput);
 
   // 2. Mutar balanceBreakdown.metals[i] con los gramos post-redondeo.
   //    SOLO en el path back-compat: ahí el `postGrams` ES gramo puro físico, y

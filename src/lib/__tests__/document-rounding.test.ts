@@ -18,7 +18,11 @@ const mockPrisma = vi.hoisted(() => ({
 }));
 vi.mock("../prisma.js", () => ({ prisma: mockPrisma }));
 
-import { loadDocumentRoundingConfig } from "../document-rounding.js";
+import {
+  loadDocumentRoundingConfig,
+  resolveEffectiveDocumentRounding,
+} from "../document-rounding.js";
+import type { DocumentRoundingInput } from "../pricing-engine/pricing-engine.js";
 
 const TENANT_ID = "j1";
 
@@ -203,5 +207,54 @@ describe("loadDocumentRoundingConfig — BOTH", () => {
     expect(cfg.scope).toBe("BOTH");
     expect(cfg.documentRounding?.breakdown?.metal.mode).toBe("TEN");
     expect(cfg.documentRounding?.breakdown?.hechura.mode).toBe("NONE");
+  });
+});
+
+// =============================================================================
+// resolveEffectiveDocumentRounding — scope efectivo del "Ambos" (BOTH) en SALES.
+// Regla del operador (2026-06-17): BOTH NUNCA se aplica en cascada; se resuelve
+// a UNIFIED o BREAKDOWN según el balanceMode resuelto del documento.
+// =============================================================================
+describe("resolveEffectiveDocumentRounding — scope efectivo de BOTH por balanceMode", () => {
+  const BOTH: DocumentRoundingInput = {
+    scope:     "BOTH",
+    mode:      "HUNDRED",
+    direction: "NEAREST",
+    breakdown: {
+      metal:   { mode: "NONE",    direction: "NEAREST" },
+      hechura: { mode: "HUNDRED", direction: "NEAREST" },
+    },
+  };
+
+  it("BOTH + balanceMode BREAKDOWN → scope BREAKDOWN (conserva breakdown)", () => {
+    const eff = resolveEffectiveDocumentRounding(BOTH, "BREAKDOWN");
+    expect(eff?.scope).toBe("BREAKDOWN");
+    // El breakdown (metal/hechura) sigue presente — el override reutiliza el
+    // campo que el loader ya armó para BOTH.
+    expect(eff?.breakdown?.hechura.mode).toBe("HUNDRED");
+    // mode/direction unified intactos (no se usan en BREAKDOWN, pero se preservan).
+    expect(eff?.mode).toBe("HUNDRED");
+  });
+
+  it("BOTH + balanceMode UNIFIED → scope UNIFIED (conserva mode/direction)", () => {
+    const eff = resolveEffectiveDocumentRounding(BOTH, "UNIFIED");
+    expect(eff?.scope).toBe("UNIFIED");
+    expect(eff?.mode).toBe("HUNDRED");
+    expect(eff?.direction).toBe("NEAREST");
+  });
+
+  it("scope ya concreto (UNIFIED / BREAKDOWN) → se devuelve sin cambios", () => {
+    const unified: DocumentRoundingInput = { scope: "UNIFIED", mode: "TEN", direction: "UP" };
+    expect(resolveEffectiveDocumentRounding(unified, "BREAKDOWN")).toBe(unified);
+    const breakdown: DocumentRoundingInput = {
+      scope: "BREAKDOWN", mode: "NONE", direction: "NEAREST",
+      breakdown: { metal: { mode: "NONE", direction: "NEAREST" }, hechura: { mode: "TEN", direction: "UP" } },
+    };
+    expect(resolveEffectiveDocumentRounding(breakdown, "UNIFIED")).toBe(breakdown);
+  });
+
+  it("documentRounding null → null (política inerte)", () => {
+    expect(resolveEffectiveDocumentRounding(null, "BREAKDOWN")).toBeNull();
+    expect(resolveEffectiveDocumentRounding(null, "UNIFIED")).toBeNull();
   });
 });

@@ -20,6 +20,7 @@
 import { describe, it, expect } from "vitest";
 import { applyDocumentPhysicalRounding } from "../document-physical-rounding-apply.js";
 import type { DocumentRoundingPolicy } from "../document-rounding.js";
+import { resolveEffectiveDocumentRounding } from "../document-rounding.js";
 
 const ORO = "oro-fino";
 const PLATA = "plata-925";
@@ -914,6 +915,131 @@ describe("applyDocumentPhysicalRounding — financiero monetario en capa 16 (K)"
 const round = (n: number) => Math.round(n * 100) / 100;
 
 // ──────────────────────────────────────────────────────────────────────────
+// N. GATE POR SCOPE EFECTIVO — el metal sale-gram (path comercial/PHYSICAL) solo
+//    corre cuando el scope efectivo del financiero INCLUYE BREAKDOWN. En UNIFIED
+//    el financiero redondea ÚNICAMENTE el TOTAL crudo (no descompone metal), así
+//    que el metal NO debe redondearse por separado (contaminaría el total).
+//
+//    Evidencia real (lista DESGLOSADA sin redondeo comercial, footer UNIFICADO):
+//      · Línea (con IVA) = 715.986,32.
+//      · Metal gramo 2,2894 → 2,3 = +2.650 (ref 250.000).
+//      · UNIFICADO config centena.
+//    ESPERADO en UNIFIED: metal NO redondea → unificado redondea 715.986,32 →
+//    716.000 (sin el +2.650 del metal). En BREAKDOWN: metal corre (+2.650).
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("applyDocumentPhysicalRounding — gate del metal por scope efectivo (N)", () => {
+  // Metal de VENTA: gramsPure 2,2894 × marginFactor 1 = 2,2894 → DECIMAL_1
+  // NEAREST → 2,3 → deltaSale +0,0106 g × 250000 ≈ +2650.
+  const ORO_REF = 250000;
+  const makeArgsScope = (scope: "UNIFIED" | "BREAKDOWN") => {
+    const dt: any = { total: 715986.32, metalCostSubtotal: 250000, metalSaleSubtotal: 250000 };
+    const bb = fixtureBalance({
+      metals: [
+        { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 2.2894, gramsOriginal: 2.2894, purity: 1, quotePriceSnapshot: ORO_REF, valuationMonetary: 572350 },
+      ],
+    });
+    const policy = policyPhysical();
+    policy.physical.configByMetalParentId = { [ORO]: { mode: "DECIMAL_1", direction: "NEAREST" } };
+    const financialMonetary =
+      scope === "UNIFIED"
+        ? { config: { scope: "UNIFIED" as const, mode: "HUNDRED" as const, direction: "NEAREST" as const } }
+        : {
+            config: {
+              scope: "BREAKDOWN" as const,
+              mode: "NONE" as const,
+              direction: "NEAREST" as const,
+              breakdown: {
+                metal:   { mode: "NONE" as const, direction: "NEAREST" as const },
+                hechura: { mode: "NONE" as const, direction: "NEAREST" as const }, // aislamos el metal
+              },
+            },
+          };
+    return {
+      documentTotals: dt,
+      balanceBreakdown: bb,
+      policy,
+      commercial: {
+        metalsByParent: [
+          { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 2.2894, metalPricePerGram: ORO_REF, metalReferenceValue: ORO_REF },
+        ],
+        marginFactor: 1,
+      },
+      financialMonetary,
+    };
+  };
+
+  it("UNIFIED: el metal NO se redondea (sin +metalEq, sin metalPhysical); el unified redondea el total crudo", () => {
+    const args = makeArgsScope("UNIFIED");
+    const result = applyDocumentPhysicalRounding(args);
+
+    // Metal NO redondea: result vacío, eq 0.
+    expect(result!.metals).toHaveLength(0);
+    expect(result!.metalMonetaryEquivalent).toBe(0);
+
+    const dt = args.documentTotals as any;
+    const dra = dt.documentRoundingApplied;
+    // El unified redondea el TOTAL CRUDO (pre-metal) 715.986,32 → 716.000.
+    expect(dra.scope).toBe("UNIFIED");
+    expect(dra.unified.preRounding).toBeCloseTo(715986.32, 2);
+    expect(dra.unified.postRounding).toBeCloseTo(716000, 2);
+    expect(dt.total).toBeCloseTo(716000, 2);
+    // metalPhysical vacío — el metal no se redondeó por separado.
+    expect(dra.breakdown.metalPhysical.metals).toHaveLength(0);
+    expect(dra.breakdown.metalPhysical.metalMonetaryEquivalent).toBe(0);
+    expect(dra.totals.metalMonetaryEquivalent).toBe(0);
+    // El +2.650 del metal NO se aplicó.
+    expect(dt.total).not.toBeCloseTo(718600, 2);
+  });
+
+  it("BREAKDOWN: el metal SÍ se redondea (+2.650), como hoy", () => {
+    const args = makeArgsScope("BREAKDOWN");
+    const result = applyDocumentPhysicalRounding(args);
+
+    // Metal redondea: 2,2894 → 2,3 → +2650.
+    const oroEntry = result!.metals.find((m) => m.metalParentId === ORO)!;
+    expect(oroEntry.postGrams).toBeCloseTo(2.3, 4);
+    expect(oroEntry.monetaryEquivalent).toBeCloseTo(2650, 0);
+    expect(result!.metalMonetaryEquivalent).toBeCloseTo(2650, 0);
+
+    const dt = args.documentTotals as any;
+    const dra = dt.documentRoundingApplied;
+    // total = 715.986,32 + 2.650 (saldo en NONE → sin más cambios).
+    expect(dt.total).toBeCloseTo(718636.32, 0);
+    expect(dra.breakdown.metalPhysical.metalMonetaryEquivalent).toBeCloseTo(2650, 0);
+  });
+
+  it("BACK-COMPAT: sin financialMonetary el metal corre según metalDomain (gate no aplica)", () => {
+    // Mismo metal, SIN financialMonetary → comportamiento histórico: el metal
+    // sale-gram se redondea (el gate solo actúa cuando viene financialMonetary).
+    const dt: any = { total: 715986.32, metalCostSubtotal: 250000, metalSaleSubtotal: 250000 };
+    const bb = fixtureBalance({
+      metals: [
+        { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 2.2894, gramsOriginal: 2.2894, purity: 1, quotePriceSnapshot: ORO_REF, valuationMonetary: 572350 },
+      ],
+    });
+    const policy = policyPhysical();
+    policy.physical.configByMetalParentId = { [ORO]: { mode: "DECIMAL_1", direction: "NEAREST" } };
+
+    const result = applyDocumentPhysicalRounding({
+      documentTotals: dt,
+      balanceBreakdown: bb,
+      policy,
+      commercial: {
+        metalsByParent: [
+          { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 2.2894, metalPricePerGram: ORO_REF, metalReferenceValue: ORO_REF },
+        ],
+        marginFactor: 1,
+      },
+      // sin financialMonetary
+    });
+
+    expect(result!.metalMonetaryEquivalent).toBeCloseTo(2650, 0);
+    expect(dt.total).toBeCloseTo(718636.32, 0);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
 // M. ANTI-DOBLE SECUENCIAL DEL SALDO — comercial ya redondeó el saldo monetario.
 //    El financiero (capa 16) debe ENCADENAR sobre `postRoundingSaldoMonetario`
 //    comercial, no re-redondear desde `total − metalSale` (que infla el saldo
@@ -1216,5 +1342,98 @@ describe("applyDocumentPhysicalRounding — multimoneda (I)", () => {
     expect(oro.monetaryEquivalent).toBeCloseTo(9.2, 4);
     // Totals convertidos.
     expect(res.documentTotals.documentRoundingApplied.totals.totalRoundingAdjustment).toBeCloseTo(9.32, 4);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// J. "Ambos" (BOTH) — SCOPE EFECTIVO por balanceMode (regla SALES 2026-06-17).
+//    El wiring de SALES resuelve BOTH → UNIFIED|BREAKDOWN con
+//    `resolveEffectiveDocumentRounding` y pasa ESE config a la capa 16. Acá
+//    verificamos la CONSECUENCIA numérica de pasar uno U otro (no cascada).
+// ──────────────────────────────────────────────────────────────────────────
+
+describe("applyDocumentPhysicalRounding — BOTH resuelto a scope efectivo (J)", () => {
+  // Config del tenant: "Ambos" (BOTH) HUNDRED. El loader la arma con `breakdown`
+  // (hechura HUNDRED) + `mode`/`direction` (unified HUNDRED).
+  const tenantBOTH = {
+    scope:     "BOTH",
+    mode:      "HUNDRED",
+    direction: "NEAREST",
+    breakdown: {
+      metal:   { mode: "NONE",    direction: "NEAREST" },
+      hechura: { mode: "HUNDRED", direction: "NEAREST" },
+    },
+  } as const;
+
+  // Política PHYSICAL pero SIN config de metal (delta metal = 0) → aislamos el
+  // comportamiento saldo/unified, igual que una lista SIN redondeo comercial.
+  function policyPhysicalNoMetalCfg(): DocumentRoundingPolicy {
+    const p = policyPhysical();
+    p.physical.configByMetalParentId = {};
+    p.physical.fallbackConfig = null;
+    return p;
+  }
+
+  it("balanceMode BREAKDOWN → SOLO desglose: saldo 200.875,21 → 200.900, total SIN unified", () => {
+    // total 718.634,59 ; metalSale 517.759,38 ⇒ saldoPre = 200.875,21.
+    const dt: any = { total: 718634.59, metalCostSubtotal: 1, metalSaleSubtotal: 517759.38 };
+    const bb = fixtureBalance({
+      metals: [
+        { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 1, gramsOriginal: 1, purity: 1, quotePriceSnapshot: 1, valuationMonetary: 1 },
+      ],
+    });
+
+    // SALES wiring: BOTH + BREAKDOWN → effective BREAKDOWN.
+    const effective = resolveEffectiveDocumentRounding(tenantBOTH as any, "BREAKDOWN");
+    expect(effective?.scope).toBe("BREAKDOWN");
+
+    applyDocumentPhysicalRounding({
+      documentTotals: dt,
+      balanceBreakdown: bb,
+      policy: policyPhysicalNoMetalCfg(),
+      commercial: { metalsByParent: [], marginFactor: 1 },
+      financialMonetary: { config: effective as any },
+    });
+
+    const dra = dt.documentRoundingApplied;
+    expect(dra.scope).toBe("BREAKDOWN");
+    // Saldo redondeado LIMPIO a la centena (sin contaminación del unified).
+    expect(dra.breakdown.hechura.preRounding).toBeCloseTo(200875.21, 2);
+    expect(dra.breakdown.hechura.postRounding).toBeCloseTo(200900, 2);
+    expect(dra.breakdown.hechura.adjustment).toBeCloseTo(24.79, 2);
+    // NO hay paso unified (scope BREAKDOWN).
+    expect(dra.unified).toBeUndefined();
+    // Total = total + delta saldo (NO se redondea el total a centena además).
+    expect(dt.total).toBeCloseTo(718659.38, 2);
+  });
+
+  it("balanceMode UNIFIED → SOLO unificado: total 718.634,59 → 718.600, sin desglose", () => {
+    const dt: any = { total: 718634.59, metalCostSubtotal: 1, metalSaleSubtotal: 517759.38 };
+    const bb = fixtureBalance({
+      metals: [
+        { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 1, gramsOriginal: 1, purity: 1, quotePriceSnapshot: 1, valuationMonetary: 1 },
+      ],
+    });
+
+    // SALES wiring: BOTH + UNIFIED → effective UNIFIED.
+    const effective = resolveEffectiveDocumentRounding(tenantBOTH as any, "UNIFIED");
+    expect(effective?.scope).toBe("UNIFIED");
+
+    applyDocumentPhysicalRounding({
+      documentTotals: dt,
+      balanceBreakdown: bb,
+      policy: policyPhysicalNoMetalCfg(),
+      commercial: { metalsByParent: [], marginFactor: 1 },
+      financialMonetary: { config: effective as any },
+    });
+
+    const dra = dt.documentRoundingApplied;
+    expect(dra.scope).toBe("UNIFIED");
+    // Total redondeado a la centena.
+    expect(dra.unified.preRounding).toBeCloseTo(718634.59, 2);
+    expect(dra.unified.postRounding).toBeCloseTo(718600, 2);
+    expect(dt.total).toBeCloseTo(718600, 2);
+    // NO hay desglose saldo/metal (scope UNIFIED) — hechura no movió.
+    expect(dra.breakdown.hechura).toBeNull();
   });
 });

@@ -61,6 +61,42 @@ export const DOC_ROUNDING_INERT: DocumentRoundingPolicy = {
   },
 };
 
+/**
+ * Redondeo financiero "Ambos" (`scope = BOTH`) — SCOPE EFECTIVO por balanceMode.
+ *
+ * Redefinición del operador (2026-06-17): en VENTAS, cuando la config del tenant
+ * es `documentRoundingScope = BOTH`, el redondeo financiero NO se aplica en
+ * cascada (desglose metal+saldo Y unificado sobre el total). Se aplica SOLO UNO,
+ * según el `balanceMode` RESUELTO del documento:
+ *   · `BREAKDOWN` → solo el redondeo financiero DESGLOSADO (metal + saldo).
+ *                   El total NO se redondea además (= idéntico al comercial:
+ *                   total = metal + saldo redondeados).
+ *   · `UNIFIED`   → solo el redondeo financiero UNIFICADO (redondea el total).
+ *                   Sin desglose metal+saldo.
+ *
+ * Para cualquier otro `scope` (UNIFIED / BREAKDOWN ya concretos, o `null`) el
+ * valor se devuelve sin cambios. El loader (`loadDocumentRoundingConfig`) ya
+ * arma `breakdown` (metal/hechura) y `mode`/`direction` (unified) para BOTH, por
+ * lo que el override de scope a UNIFIED/BREAKDOWN reutiliza los campos ya
+ * presentes — no falta nada.
+ *
+ * SOLO el wiring de SALES llama a esta función. El motor (`computeSaleDocumentTotals`)
+ * y la capa 16 (`applyDocumentPhysicalRounding`) siguen soportando `BOTH` en
+ * cascada para otros callers (compras, cross-settlements).
+ *
+ * Función PURA y determinística — sin DB, sin async.
+ */
+export function resolveEffectiveDocumentRounding(
+  documentRounding: DocumentRoundingInput | null,
+  resolvedBalanceMode: "UNIFIED" | "BREAKDOWN",
+): DocumentRoundingInput | null {
+  if (!documentRounding || documentRounding.scope !== "BOTH") return documentRounding;
+  return {
+    ...documentRounding,
+    scope: resolvedBalanceMode === "BREAKDOWN" ? "BREAKDOWN" : "UNIFIED",
+  };
+}
+
 export async function loadDocumentRoundingConfig(
   jewelryId: string,
 ): Promise<DocumentRoundingPolicy> {

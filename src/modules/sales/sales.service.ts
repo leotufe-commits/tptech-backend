@@ -146,7 +146,7 @@ import { getCheckoutPreview } from "../payments/payments.service.js";
 import { validateCoupon } from "../coupons/coupons.service.js";
 import { applyMovementImpact, reverseMovementImpact } from "../../lib/stock-engine.js";
 import { onSaleConfirmed, onSaleCancelled } from "../../lib/document-hooks/sale.hook.js";
-import { loadDocumentRoundingConfig } from "../../lib/document-rounding.js";
+import { loadDocumentRoundingConfig, resolveEffectiveDocumentRounding } from "../../lib/document-rounding.js";
 import { applyDocumentPhysicalRounding } from "../../lib/document-physical-rounding-apply.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -167,6 +167,29 @@ function err(msg: string, status = 400): never {
 //         diferido (NET/TOTAL) de las listas (anti doble redondeo).
 //       - `documentRounding = { mode, direction }` → se pasa a
 //         `computeSaleDocumentTotals` para redondear el total del comprobante.
+
+// ─── Base efectiva por línea para `computeSaleDocumentTotals` ───────────────
+// `subtotalBeforeDiscounts` del documento (la fila "Precio" del footer) suma
+// `(basePrice ?? unitPrice) × qty` por línea. El motor de venta mantiene
+// `basePrice` SIEMPRE en el precio de LISTA a propósito (la UI lo lee para el
+// default del input y la traza del descuento). Pero cuando el operador fija un
+// precio MANUAL (`priceSource === "MANUAL_OVERRIDE"`), ese precio neto va a
+// `unitPrice` y se saltean qty/promo discount → `unitPrice === manualPrice`.
+// En ese caso la base EFECTIVA del documento es el manual (no la lista), para
+// que "Precio" = manual × qty, el descuento de línea quede 0 y la cadena del
+// footer reconcilie. Para líneas SIN manual, comportamiento intacto (lista).
+//
+// Passthrough puro (cero matemática nueva): solo elige qué campo ya calculado
+// por el motor representa la base del documento. NO toca `pricing.basePrice`
+// ni `pricingMeta.basePrice` (esos siguen siendo la lista para el line-card).
+function effectiveDocumentBasePrice(
+  priceSource: string | null | undefined,
+  basePrice: number | null | undefined,
+  unitPrice: number | null | undefined,
+): number {
+  if (priceSource === "MANUAL_OVERRIDE") return unitPrice ?? 0;
+  return basePrice ?? unitPrice ?? 0;
+}
 
 async function nextSaleCode(jewelryId: string): Promise<string> {
   const last = await prisma.sale.findFirst({
@@ -1935,7 +1958,12 @@ async function _confirmSaleImpl(
         appliedRoundingDelta,
         documentLine: {
           quantity:      qty,
-          basePrice:     basePriceNum,
+          // Base EFECTIVA del documento (manual → unitPrice; lista → basePrice).
+          // Espejo EXACTO del preview → paridad. `basePriceNum` (lista) sigue
+          // intacto en el pricingSnapshot persistido (line-card / traza).
+          basePrice:     effectiveDocumentBasePrice(
+            (snap as any).priceSource, basePriceNum, unitPriceNum,
+          ),
           unitPrice:     unitPriceNum,
           lineTotal:     parseFloat(lineTotalDec.toString()),
           lineTaxAmount: lineTaxAmt * qty,
@@ -2165,6 +2193,59 @@ async function _confirmSaleImpl(
   // redondeo comercial. Si la política del tenant es PHYSICAL, los computamos.
   const confirmFinancialPhysicalActive =
     docRoundingPolicy.metalDomain === "PHYSICAL" && docRoundingPolicy.physical.enabled;
+
+  // ── Balance Mode resolución (HOISTED 2026-06-17) ─────────────────────────
+  // Se resuelve ANTES de `computeSaleDocumentTotals` / capa 16 para derivar el
+  // SCOPE EFECTIVO del redondeo financiero "Ambos" (BOTH) — espejo EXACTO de
+  // previewSale. Más abajo (proyección de balance) se REUTILIZA esta misma
+  // `confirmBalanceResolution` (no se recalcula).
+  const confirmDocumentOverride: BalanceMode | null =
+    (sale as any).balanceModeOverride === "UNIFIED" ||
+    (sale as any).balanceModeOverride === "BREAKDOWN"
+      ? (sale as any).balanceModeOverride
+      : null;
+  const confirmPriceListIds = new Set(
+    sale.lines.map((l) => l.appliedPriceListId).filter((id): id is string => !!id),
+  );
+  let confirmPriceListDefault: BalanceMode | null = null;
+  let confirmPriceListMode:    string       | null = null;
+  if (confirmPriceListIds.size === 1) {
+    const onlyId = [...confirmPriceListIds][0]!;
+    try {
+      const pl = await prisma.priceList.findFirst({
+        where:  { id: onlyId, jewelryId, deletedAt: null },
+        select: { balanceMode: true, mode: true },
+      });
+      confirmPriceListDefault = (pl?.balanceMode ?? null) as BalanceMode | null;
+      confirmPriceListMode    = (pl?.mode        ?? null) as string       | null;
+    } catch { /* defensive — tests con prisma parcial */ }
+  }
+  let confirmTenantDefault: BalanceMode | null = null;
+  try {
+    const confirmJewelryRow = await prisma.jewelry.findUnique({
+      where:  { id: jewelryId },
+      select: { defaultBalanceMode: true },
+    });
+    confirmTenantDefault = (confirmJewelryRow?.defaultBalanceMode ?? null) as BalanceMode | null;
+  } catch { /* defensive */ }
+  const confirmUserPreferenceBalanceMode = await loadUserDefaultBalanceMode(userId);
+  const confirmBalanceResolution = resolveSaleBalanceMode({
+    documentOverride:        confirmDocumentOverride,
+    entityBalanceMode:       (sale.client as any)?.balanceMode ?? null,
+    entityBalanceTypeLegacy: sale.client?.balanceType ?? null,
+    userPreferenceDefault:   confirmUserPreferenceBalanceMode,
+    priceListDefault:        confirmPriceListDefault,
+    priceListMode:           confirmPriceListMode,
+    tenantDefault:           confirmTenantDefault,
+  });
+
+  // SCOPE EFECTIVO del redondeo financiero "Ambos" (BOTH) — uno U otro según
+  // el balanceMode resuelto, NUNCA en cascada (idéntico a previewSale).
+  const confirmEffectiveDocumentRounding = resolveEffectiveDocumentRounding(
+    docRoundingPolicy.documentRounding,
+    confirmBalanceResolution.mode,
+  );
+
   const confirmCommercialAggregatesNeeded =
     confirmCommercialPerLineActive || confirmFinancialPhysicalActive;
   const confirmCommercialMetalIds = new Set<string>();
@@ -2495,7 +2576,11 @@ async function _confirmSaleImpl(
         const mhb = pricing.metalHechuraBreakdown as any;
         const metalSale   = mhb ? r2(Number(mhb.metalSale   ?? 0) * qty) : 0;
         const hechuraSale = mhb ? r2(Number(mhb.hechuraSale ?? 0) * qty) : 0;
-        return { unitPrice, basePrice: basePrice ?? unitPrice, lineTotal, lineTaxAmount, lineTotalWithTax, metalSale, hechuraSale };
+        // Base EFECTIVA del documento (manual → unitPrice; lista → basePrice).
+        const effBasePrice = effectiveDocumentBasePrice(
+          (pricing as any).priceSource, basePrice, unitPrice,
+        );
+        return { unitPrice, basePrice: effBasePrice, lineTotal, lineTaxAmount, lineTotalWithTax, metalSale, hechuraSale };
       };
 
       // Re-pricear SOLO las líneas BREAKDOWN (las Unificadas no se tocan).
@@ -2678,7 +2763,7 @@ async function _confirmSaleImpl(
     // APLIQUE el deferred COMERCIAL de la lista (queda en `roundingAdjustment`,
     // atribuido a la lista) y (b) NO aplique el financiero (lo difiere a la capa
     // 16, que encadena sobre el total post-comercial). Ver previewSale.
-    documentRounding:                 docRoundingPolicy.documentRounding,
+    documentRounding:                 confirmEffectiveDocumentRounding,
     deferDocumentRoundingApplication: confirmFinancialPhysicalActive,
     // Etapa D' — Redondeo Comercial PER_DOCUMENT.
     commercialDocumentRounding:             confirmCommercialDocCtx.commercialDocumentRounding,
@@ -3059,57 +3144,11 @@ async function _confirmSaleImpl(
       })
     : [];
 
-  // ── T55 (Fase 3B.5) — Balance Mode resolución + breakdown ────────────────
-  // Mismo flujo que `previewSale`, pero leyendo desde el DRAFT persistido:
-  //   · documentOverride  → sale.balanceModeOverride
-  //   · entityDefault     → sale.client.balanceMode ?? mapBalanceTypeToMode(balanceType)
-  //   · priceListDefault  → única lista consolidada de las líneas (si única)
-  //   · tenantDefault     → jewelry.defaultBalanceMode
-  // El modo se congela acá y persiste en Sale.balanceMode/balanceModeSource —
-  // NUNCA se recalcula después (POLICY.md §11 R11.1, R11.5).
-  const confirmDocumentOverride: BalanceMode | null =
-    (sale as any).balanceModeOverride === "UNIFIED" ||
-    (sale as any).balanceModeOverride === "BREAKDOWN"
-      ? (sale as any).balanceModeOverride
-      : null;
-  // Lista única consolidada (si todas las líneas usan la misma).
-  const confirmPriceListIds = new Set(
-    sale.lines.map((l) => l.appliedPriceListId).filter((id): id is string => !!id),
-  );
-  let confirmPriceListDefault: BalanceMode | null = null;
-  let confirmPriceListMode:    string       | null = null;
-  if (confirmPriceListIds.size === 1) {
-    const onlyId = [...confirmPriceListIds][0]!;
-    try {
-      const pl = await prisma.priceList.findFirst({
-        where:  { id: onlyId, jewelryId, deletedAt: null },
-        select: { balanceMode: true, mode: true },
-      });
-      confirmPriceListDefault = (pl?.balanceMode ?? null) as BalanceMode | null;
-      confirmPriceListMode    = (pl?.mode        ?? null) as string       | null;
-    } catch { /* defensive — tests con prisma parcial */ }
-  }
-  let confirmTenantDefault: BalanceMode | null = null;
-  try {
-    const confirmJewelryRow = await prisma.jewelry.findUnique({
-      where:  { id: jewelryId },
-      select: { defaultBalanceMode: true },
-    });
-    confirmTenantDefault = (confirmJewelryRow?.defaultBalanceMode ?? null) as BalanceMode | null;
-  } catch { /* defensive */ }
-  // Preferencia del usuario que confirma (paridad con previewSale). Nivel
-  // R11.4 entre cliente y lista; solo influye cuando no hay override ni
-  // default de cliente.
-  const confirmUserPreferenceBalanceMode = await loadUserDefaultBalanceMode(userId);
-  const confirmBalanceResolution = resolveSaleBalanceMode({
-    documentOverride:        confirmDocumentOverride,
-    entityBalanceMode:       (sale.client as any)?.balanceMode ?? null,
-    entityBalanceTypeLegacy: sale.client?.balanceType ?? null,
-    userPreferenceDefault:   confirmUserPreferenceBalanceMode,
-    priceListDefault:        confirmPriceListDefault,
-    priceListMode:           confirmPriceListMode,
-    tenantDefault:           confirmTenantDefault,
-  });
+  // ── T55 (Fase 3B.5) — Balance Mode resolución: HOISTED arriba de
+  // `computeSaleDocumentTotals` / capa 16 (2026-06-17) para resolver el scope
+  // efectivo del redondeo financiero "Ambos" (BOTH). `confirmBalanceResolution`
+  // ya está definido — se congela acá y persiste en Sale.balanceMode/
+  // balanceModeSource (POLICY.md §11 R11.1, R11.5).
 
   // Nombres de metales (sólo si BREAKDOWN). Cargamos en batch desde los
   // STEPS del motor (fuente real — el breakdown.metal.items[] viene vacío) y,
@@ -3252,8 +3291,10 @@ async function _confirmSaleImpl(
     // Espejo EXACTO de previewSale: con `confirmFinancialPhysicalActive`, el
     // redondeo financiero MONETARIO (saldo + total) corre acá, post metal sale-
     // gram, como último paso automático. Determinismo del helper ⇒ paridad.
-    financialMonetary: confirmFinancialPhysicalActive && docRoundingPolicy.documentRounding
-      ? { config: docRoundingPolicy.documentRounding }
+    // SCOPE EFECTIVO: con config `BOTH` pasamos UNIFIED o BREAKDOWN según el
+    // balanceMode resuelto (NUNCA BOTH en cascada). Espejo de previewSale.
+    financialMonetary: confirmFinancialPhysicalActive && confirmEffectiveDocumentRounding
+      ? { config: confirmEffectiveDocumentRounding }
       : null,
   });
 
@@ -6507,7 +6548,11 @@ async function _previewSaleImpl(
         const mhb = pricing.metalHechuraBreakdown as any;
         const metalSale   = mhb ? r2(Number(mhb.metalSale   ?? 0) * qty) : 0;
         const hechuraSale = mhb ? r2(Number(mhb.hechuraSale ?? 0) * qty) : 0;
-        return { unitPrice, basePrice: basePrice ?? unitPrice, lineTotal, lineTaxAmount, lineTotalWithTax, metalSale, hechuraSale };
+        // Base EFECTIVA del documento (manual → unitPrice; lista → basePrice).
+        const effBasePrice = effectiveDocumentBasePrice(
+          (pricing as any).priceSource, basePrice, unitPrice,
+        );
+        return { unitPrice, basePrice: effBasePrice, lineTotal, lineTaxAmount, lineTotalWithTax, metalSale, hechuraSale };
       };
 
       // Re-pricear SOLO las líneas BREAKDOWN (las Unificadas no se tocan).
@@ -6643,6 +6688,110 @@ async function _previewSaleImpl(
     }
   }
 
+  // ── Fase 2A.7 — consolidación doc-level de la lista de precios ─────────
+  // Si todas las líneas usaron la misma lista → ese id/nombre. Si difieren →
+  // "MIXED" + nombre "Múltiples". Si ninguna resolvió lista → null.
+  // (Hoisted 2026-06-17: se computa ANTES de `computeSaleDocumentTotals` para
+  // resolver el balance mode y, con él, el SCOPE EFECTIVO del redondeo
+  // financiero cuando la config del tenant es `BOTH`.)
+  const distinctAppliedPriceListIds = new Set<string>();
+  let firstAppliedName: string | null = null;
+  for (const l of resolvedLines) {
+    if (l.appliedPriceListId) {
+      distinctAppliedPriceListIds.add(l.appliedPriceListId);
+      if (!firstAppliedName) firstAppliedName = l.appliedPriceListName ?? null;
+    }
+  }
+  let consolidatedPriceListId:   string | null = null;
+  let consolidatedPriceListName: string | null = null;
+  if (distinctAppliedPriceListIds.size === 1) {
+    consolidatedPriceListId   = [...distinctAppliedPriceListIds][0]!;
+    consolidatedPriceListName = firstAppliedName;
+  } else if (distinctAppliedPriceListIds.size > 1) {
+    consolidatedPriceListId   = "MIXED";
+    consolidatedPriceListName = "Múltiples";
+  }
+
+  // `priceListWasOverridden`: true si el operador pidió override (a nivel
+  // documento o en alguna línea), independientemente de si el motor pudo
+  // respetarlo (lista vencida, sin permiso, etc.).
+  const lineHasOverride = resolvedLines.some(
+    (l) => !!(l as any).priceListIdOverride && (l as any).priceListIdOverride !== input.priceListId,
+  );
+  const priceListWasOverridden =
+    !!input.priceListId || lineHasOverride;
+
+  // `clientCommercialRules` — null si no hay cliente.
+  const clientCommercialRules: SalePreviewClientCommercialRules | null = clientRow
+    ? {
+        ruleType:  clientRow.commercialRuleType  ?? null,
+        valueType: clientRow.commercialValueType ?? null,
+        value:     clientRow.commercialValue != null
+          ? parseFloat(clientRow.commercialValue.toString())
+          : null,
+        applyOn:   clientRow.commercialApplyOn ?? null,
+      }
+    : null;
+
+  // ── T55 (Fase 3B.5) — Balance Mode resolución (R11.4, POLICY.md §11) ───
+  const balanceModeOverrideInput: BalanceMode | null =
+    input.balanceModeOverride === "UNIFIED" || input.balanceModeOverride === "BREAKDOWN"
+      ? input.balanceModeOverride
+      : null;
+  // Lista única → leemos su `balanceMode`. Si MIXED o ninguna, queda null.
+  let priceListBalanceModeDefault: BalanceMode | null = null;
+  let priceListModeForResolver:    string       | null = null;
+  if (
+    consolidatedPriceListId &&
+    consolidatedPriceListId !== "MIXED"
+  ) {
+    try {
+      const pl = await prisma.priceList.findFirst({
+        where:  { id: consolidatedPriceListId, jewelryId, deletedAt: null },
+        select: { balanceMode: true, mode: true },
+      });
+      priceListBalanceModeDefault = (pl?.balanceMode ?? null) as BalanceMode | null;
+      priceListModeForResolver    = (pl?.mode        ?? null) as string       | null;
+    } catch { /* defensive — tests con prisma parcial */ }
+  }
+  // Tenant default (Jewelry.defaultBalanceMode). Cargamos sólo el campo.
+  let tenantBalanceModeDefault: BalanceMode | null = null;
+  try {
+    const tenantRow = await prisma.jewelry.findUnique({
+      where:  { id: jewelryId },
+      select: { defaultBalanceMode: true },
+    });
+    tenantBalanceModeDefault = (tenantRow?.defaultBalanceMode ?? null) as BalanceMode | null;
+  } catch { /* defensive — tests con prisma parcial */ }
+  // Preferencia del usuario (UserPreference.defaultBalanceMode, scope
+  // SALES_INVOICE). Nivel R11.4 entre cliente y lista. Solo si llega userId.
+  const userPreferenceBalanceMode = await loadUserDefaultBalanceMode(userId);
+  const balanceModeResolution = resolveSaleBalanceMode({
+    documentOverride:        balanceModeOverrideInput,
+    entityBalanceMode:       (clientRow as any)?.balanceMode ?? null,
+    entityBalanceTypeLegacy: clientRow?.balanceType ?? null,
+    userPreferenceDefault:   userPreferenceBalanceMode,
+    priceListDefault:        priceListBalanceModeDefault,
+    priceListMode:           priceListModeForResolver,
+    tenantDefault:           tenantBalanceModeDefault,
+  });
+
+  // ── REDONDEO FINANCIERO "Ambos" (BOTH) — scope efectivo por balanceMode ──
+  // Redefinición del operador (2026-06-17): cuando la config del tenant es
+  // `documentRoundingScope=BOTH`, NO se aplica en cascada (desglose + unificado).
+  // Se aplica SOLO UNO según el `balanceMode` RESUELTO del documento:
+  //   · BREAKDOWN → solo el redondeo financiero DESGLOSADO (metal + saldo).
+  //   · UNIFIED   → solo el redondeo financiero UNIFICADO (redondea el total).
+  // El loader (`document-rounding.ts`) ya arma `breakdown` (metal/hechura) y
+  // `mode`/`direction` (unified) para BOTH, por lo que el override de scope a
+  // UNIFIED/BREAKDOWN reutiliza los campos ya presentes — no falta nada.
+  // Solo SALES resuelve el scope efectivo; el motor sigue soportando BOTH en
+  // cascada para otros callers (compras, cross-settlements).
+  const effectiveDocumentRounding = resolveEffectiveDocumentRounding(
+    docRoundingPolicy.documentRounding,
+    balanceModeResolution.mode,
+  );
+
   const documentTotals = computeSaleDocumentTotals({
     lines: resolvedLines.map((l, idx): SaleDocumentTotalsLineInput => {
       const mhb = (l as any).metalHechuraBreakdown ?? null;
@@ -6654,7 +6803,11 @@ async function _previewSaleImpl(
       const clean = mixedCleanByIdx?.get(idx) ?? null;
       return {
         quantity:      l.quantity,
-        basePrice:     clean ? clean.basePrice : (l.basePrice ?? l.unitPrice ?? 0),
+        // Base EFECTIVA del documento: manual → unitPrice; lista → basePrice.
+        // El `clean` (rama MIXED) ya trae su base efectiva desde repriceLineClean.
+        basePrice:     clean
+          ? clean.basePrice
+          : effectiveDocumentBasePrice((l as any).priceSource, l.basePrice, l.unitPrice),
         unitPrice:     clean ? clean.unitPrice : (l.unitPrice ?? 0),
         lineTotal:     clean ? clean.lineTotal : (l.lineTotal ?? 0),
         lineTaxAmount: clean ? clean.lineTaxAmount : l.lineTaxAmount,
@@ -6709,7 +6862,7 @@ async function _previewSaleImpl(
     // delta 0; distinta → re-redondea). Cuando NO está activo, `defer=false` →
     // todo queda como hoy (motor descarta el deferred y aplica el financiero,
     // capa 15).
-    documentRounding:                 docRoundingPolicy.documentRounding,
+    documentRounding:                 effectiveDocumentRounding,
     deferDocumentRoundingApplication: financialPhysicalActive,
     // Etapa D' — Redondeo Comercial PER_DOCUMENT (POLICY §R-Rounding-15).
     // `null` cuando PER_LINE_LEGACY o MIXED_LIST_FALLBACK → la capa no actúa
@@ -6773,108 +6926,11 @@ async function _previewSaleImpl(
   }
   docRoundingAdjustment = Math.round(docRoundingAdjustment * 100) / 100;
 
-  // ── Fase 2A.7 — consolidación doc-level de la lista de precios ─────────
-  // Si todas las líneas usaron la misma lista → ese id/nombre. Si difieren →
-  // "MIXED" + nombre "Múltiples". Si ninguna resolvió lista → null.
-  const distinctAppliedPriceListIds = new Set<string>();
-  let firstAppliedName: string | null = null;
-  for (const l of resolvedLines) {
-    if (l.appliedPriceListId) {
-      distinctAppliedPriceListIds.add(l.appliedPriceListId);
-      if (!firstAppliedName) firstAppliedName = l.appliedPriceListName ?? null;
-    }
-  }
-  let consolidatedPriceListId:   string | null = null;
-  let consolidatedPriceListName: string | null = null;
-  if (distinctAppliedPriceListIds.size === 1) {
-    consolidatedPriceListId   = [...distinctAppliedPriceListIds][0]!;
-    consolidatedPriceListName = firstAppliedName;
-  } else if (distinctAppliedPriceListIds.size > 1) {
-    consolidatedPriceListId   = "MIXED";
-    consolidatedPriceListName = "Múltiples";
-  }
-
-  // `priceListWasOverridden`: true si el operador pidió override (a nivel
-  // documento o en alguna línea), independientemente de si el motor pudo
-  // respetarlo (lista vencida, sin permiso, etc.).
-  const lineHasOverride = resolvedLines.some(
-    (l) => !!(l as any).priceListIdOverride && (l as any).priceListIdOverride !== input.priceListId,
-  );
-  const priceListWasOverridden =
-    !!input.priceListId || lineHasOverride;
-
-  // `clientCommercialRules` — null si no hay cliente.
-  const clientCommercialRules: SalePreviewClientCommercialRules | null = clientRow
-    ? {
-        ruleType:  clientRow.commercialRuleType  ?? null,
-        valueType: clientRow.commercialValueType ?? null,
-        value:     clientRow.commercialValue != null
-          ? parseFloat(clientRow.commercialValue.toString())
-          : null,
-        applyOn:   clientRow.commercialApplyOn ?? null,
-      }
-    : null;
-
-  // ── T55 (Fase 3B.5) — Balance Mode resolución + breakdown ──────────────
-  // Resolución R11.4 (POLICY.md §11):
-  //   1. documentOverride (input.balanceModeOverride)
-  //   2. entityDefault (clientRow.balanceMode ?? legacy balanceType)
-  //   3. priceListDefault (PriceList.balanceMode si hay una única lista)
-  //   4. tenantDefault (Jewelry.defaultBalanceMode)
-  //   5. fallback UNIFIED
-  //
-  // El frontend NO resuelve — solo manda `balanceModeOverride` si el operador
-  // lo seteó. Toda la prioridad se evalúa acá.
-  //
-  // Para BREAKDOWN: necesitamos el detalle por metal padre. Cargamos los
-  // nombres en batch desde Metal + MetalVariant — query única.
-  const balanceModeOverrideInput: BalanceMode | null =
-    input.balanceModeOverride === "UNIFIED" || input.balanceModeOverride === "BREAKDOWN"
-      ? input.balanceModeOverride
-      : null;
-  // Lista única → leemos su `balanceMode`. Si MIXED o ninguna, queda null.
-  // Defensive: tests pueden mockear `prisma` parcialmente y omitir
-  // `priceList.findFirst`/`jewelry.findUnique`. En esos casos caemos a null
-  // y la resolución termina en FALLBACK_UNIFIED — comportamiento legacy
-  // exacto. Runtime real siempre tiene el cliente completo.
-  let priceListBalanceModeDefault: BalanceMode | null = null;
-  let priceListModeForResolver:    string       | null = null;
-  if (
-    consolidatedPriceListId &&
-    consolidatedPriceListId !== "MIXED"
-  ) {
-    try {
-      const pl = await prisma.priceList.findFirst({
-        where:  { id: consolidatedPriceListId, jewelryId, deletedAt: null },
-        select: { balanceMode: true, mode: true },
-      });
-      priceListBalanceModeDefault = (pl?.balanceMode ?? null) as BalanceMode | null;
-      priceListModeForResolver    = (pl?.mode        ?? null) as string       | null;
-    } catch { /* defensive — tests con prisma parcial */ }
-  }
-  // Tenant default (Jewelry.defaultBalanceMode). Cargamos sólo el campo.
-  let tenantBalanceModeDefault: BalanceMode | null = null;
-  try {
-    const tenantRow = await prisma.jewelry.findUnique({
-      where:  { id: jewelryId },
-      select: { defaultBalanceMode: true },
-    });
-    tenantBalanceModeDefault = (tenantRow?.defaultBalanceMode ?? null) as BalanceMode | null;
-  } catch { /* defensive — tests con prisma parcial */ }
-
-  // Preferencia del usuario (UserPreference.defaultBalanceMode, scope
-  // SALES_INVOICE). Nivel R11.4 entre cliente y lista. Solo si llega userId.
-  const userPreferenceBalanceMode = await loadUserDefaultBalanceMode(userId);
-
-  const balanceModeResolution = resolveSaleBalanceMode({
-    documentOverride:        balanceModeOverrideInput,
-    entityBalanceMode:       (clientRow as any)?.balanceMode ?? null,
-    entityBalanceTypeLegacy: clientRow?.balanceType ?? null,
-    userPreferenceDefault:   userPreferenceBalanceMode,
-    priceListDefault:        priceListBalanceModeDefault,
-    priceListMode:           priceListModeForResolver,
-    tenantDefault:           tenantBalanceModeDefault,
-  });
+  // ── Fase 2A.7 — consolidación doc-level de la lista de precios + Balance
+  // Mode resolución: HOISTED arriba de `computeSaleDocumentTotals` (2026-06-17)
+  // para resolver el scope efectivo del redondeo financiero "Ambos" (BOTH).
+  // `consolidatedPriceListId`, `consolidatedPriceListName`, `priceListWasOverridden`,
+  // `clientCommercialRules` y `balanceModeResolution` ya están definidos.
 
   // Mapas de nombres de metal (cargados sólo si BREAKDOWN y hay items).
   let metalNamesMap:   Map<string, string> | undefined;
@@ -7051,8 +7107,10 @@ async function _previewSaleImpl(
     // metal sale-gram, como último paso automático. La capa 16 construye el
     // `documentRoundingApplied` completo. Si no está activo → undefined (la capa
     // 15 ya lo hizo, comportamiento histórico).
-    financialMonetary: financialPhysicalActive && docRoundingPolicy.documentRounding
-      ? { config: docRoundingPolicy.documentRounding }
+    // SCOPE EFECTIVO: con config `BOTH` pasamos UNIFIED o BREAKDOWN según el
+    // balanceMode resuelto (NUNCA BOTH en cascada). Ver `effectiveDocumentRounding`.
+    financialMonetary: financialPhysicalActive && effectiveDocumentRounding
+      ? { config: effectiveDocumentRounding }
       : null,
   });
 
