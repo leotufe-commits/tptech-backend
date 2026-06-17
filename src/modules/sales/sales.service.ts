@@ -5543,6 +5543,15 @@ async function _previewSaleImpl(
             value: (art as any).manualAdjustmentValue,
           },
           batchCostCtx,
+          // FIX (2026-06-17) — los costLineOverrides UNIFICADOS (legacy +
+          // explicit) que el motor de precios ya resolvió. Sin esto, los steps
+          // del costo standalone que alimentan el balance breakdown se computaban
+          // con la composición CRUDA del artículo → `gramsOriginal` = peso del
+          // artículo aunque el operador pusiera la cantidad del metal en 0. El
+          // footer mostraba gramos físicos (ej. 1,13 g) inconsistentes con el
+          // total 0. Espejo EXACTO de confirmSale (`frozenCostLineOverrides =
+          // snap.costLineOverridesApplied`) → paridad preview ↔ confirm.
+          (pricing as any).costLineOverridesApplied,
         );
         costBreakdown = costResult.breakdown ?? null;
         // T55 (Fase 3B.5) — guarda lateral para el balance breakdown.
