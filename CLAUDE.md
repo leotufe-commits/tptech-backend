@@ -253,6 +253,37 @@ con gramos puros" que aparecen más abajo en este archivo.
    físico (NO sobrescribir — fuente fiscal). Diferido al sprint de cuenta corriente
    (campo `gramsBilled` nuevo, no overwrite de `gramsPure`).
 
+8. **Redondeo financiero "Ambos" (`documentRoundingScope=BOTH`) → scope EFECTIVO
+   por `balanceMode` (2026-06-17, SOLO VENTAS).** En ventas el `BOTH` NO se aplica
+   en cascada (desglose metal+saldo Y unificado sobre el total). Se resuelve a UNO
+   según el `balanceMode` RESUELTO del documento:
+   - `BREAKDOWN` → solo el financiero DESGLOSADO (metal + saldo); el total NO se
+     redondea además (total = metal + saldo redondeados).
+   - `UNIFIED` → solo el financiero UNIFICADO (redondea el total); sin desglose.
+
+   SSOT: helper puro `resolveEffectiveDocumentRounding` (`document-rounding.ts`),
+   llamado SOLO por el wiring de SALES (`sales.service.ts`) en `previewSale` **y**
+   `confirmSale`. Para lograrlo se HOISTEÓ la resolución de balance mode
+   (`resolveSaleBalanceMode`) arriba de `computeSaleDocumentTotals` en ambos paths
+   (paridad exacta preview↔confirm). El motor y la capa 16 SIGUEN soportando `BOTH`
+   en cascada para otros callers (compras, cross-settlements) — no se tocó esa
+   semántica. **Gate adicional en capa 16** (`applyDocumentPhysicalRounding`): con
+   scope efectivo `UNIFIED` el metal sale-gram se SUPRIME (`useCommercial=false`,
+   `metals:[]`, `metalEq=0`) para no contaminar el total crudo que entra al paso
+   `unified` (sin el gate, `715.986,32 → 718.636,32 → 718.600` en vez de
+   `715.986,32 → 716.000`). El gate solo aplica cuando el caller pasó
+   `financialMonetary` (lado venta); callers legacy corren según `metalDomain`.
+9. **Base EFECTIVA del documento con precio MANUAL** (`effectiveDocumentBasePrice`,
+   `sales.service.ts`). El motor mantiene `basePrice` SIEMPRE en el precio de LISTA
+   (la UI lo lee para el default del input y la traza del descuento). Pero cuando
+   `priceSource==="MANUAL_OVERRIDE"`, la base EFECTIVA que entra a
+   `computeSaleDocumentTotals` (fila "Precio"/`subtotalBeforeDiscounts`) es
+   `unitPrice` (el manual), para que "Precio" = manual × qty, el descuento de línea
+   quede 0 y el footer reconcilie. Passthrough puro (cero matemática nueva): solo
+   elige qué campo YA calculado representa la base del documento; NO toca
+   `pricing.basePrice` ni el `pricingSnapshot` del line-card. Espejo EXACTO en
+   preview y confirm.
+
 ## Jerarquía (orden de aplicación, NO alterable)
 
 | # | Mecanismo | Alcance | Vive en | Snapshot |
