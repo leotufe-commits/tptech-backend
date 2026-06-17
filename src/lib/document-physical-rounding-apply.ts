@@ -94,6 +94,11 @@ export interface PhysicalRoundingCommercialInput {
   metalsByParent: PhysicalRoundingCommercialMetalLike[];
   /** Factor de margen documental = metalSaleSubtotal / metalCostSubtotal. */
   marginFactor:   number;
+  /** Σ valor de venta COMERCIAL de metal del documento (= `metalSaleSubtotal`).
+   *  Cuando es ~0 (artículo con PESO pero composición/precio en 0), el metal NO
+   *  se redondea (gate "metal sin valor comercial"). Opcional: sin el campo el
+   *  comportamiento es el histórico. */
+  commercialSaleSubtotal?: number;
 }
 
 /**
@@ -199,8 +204,26 @@ export function applyDocumentPhysicalRounding(args: {
   const suppressCommercialMetalByScope =
     !!financialMonetary && (financialMonetary.config.scope ?? "UNIFIED") === "UNIFIED";
 
+  // ── GATE "metal sin valor comercial" (2026-06-17) ─────────────────────────
+  // Si el documento NO tiene valor de venta de metal (`commercialSaleSubtotal`
+  // ≤ EPS — artículo con PESO pero composición/precio en 0), el gramo de VENTA
+  // del metal NO se redondea. Sin este gate la capa 16 redondea el gramo físico
+  // CON MERMA (ej. 1,13 → 1,10) y emite un `metalMonetaryEquivalent` (−4.687,50)
+  // que no corresponde a ninguna venta real, empujando el saldo monetario a
+  // negativo. Espejo del gate de `pricing-engine.balance.ts` (valuationMonetary
+  // = 0). Solo aplica cuando el caller pasó `commercialSaleSubtotal` (lado venta);
+  // callers legacy / no-sales no lo pasan → comportamiento histórico.
+  const suppressCommercialMetalByNoSale =
+    !!commercial &&
+    typeof commercial.commercialSaleSubtotal === "number" &&
+    Number.isFinite(commercial.commercialSaleSubtotal) &&
+    Math.abs(commercial.commercialSaleSubtotal) <= 0.005;
+
+  const suppressCommercialMetal =
+    suppressCommercialMetalByScope || suppressCommercialMetalByNoSale;
+
   const useCommercial =
-    !!commercial && commercial.metalsByParent.length > 0 && !suppressCommercialMetalByScope;
+    !!commercial && commercial.metalsByParent.length > 0 && !suppressCommercialMetal;
   const marginFactor =
     useCommercial && Number.isFinite(commercial!.marginFactor) && commercial!.marginFactor > 0
       ? commercial!.marginFactor
@@ -274,12 +297,12 @@ export function applyDocumentPhysicalRounding(args: {
         configByMetalParentId: policy.physical.configByMetalParentId,
         fallbackConfig:        policy.physical.fallbackConfig,
       };
-  // Cuando el scope efectivo del financiero es UNIFIED (gate de arriba), el
-  // metal NO se redondea por separado: cortocircuitamos el helper a un resultado
-  // vacío (metalEq=0, metals=[]). NO caemos al path back-compat del balance —
-  // si lo hiciéramos, el metal se redondearía igual y volvería a contaminar el
-  // total. El paso `unified` de `financialMonetary` redondeará el total crudo.
-  const result: RoundDocumentMetalGramsResult = suppressCommercialMetalByScope
+  // Cuando algún gate suprime el metal sale-gram (scope UNIFIED, o documento sin
+  // valor de venta de metal), el metal NO se redondea por separado:
+  // cortocircuitamos el helper a un resultado vacío (metalEq=0, metals=[]). NO
+  // caemos al path back-compat del balance — si lo hiciéramos, el metal se
+  // redondearía igual (físico) y volvería a contaminar el total.
+  const result: RoundDocumentMetalGramsResult = suppressCommercialMetal
     ? { metals: [], metalMonetaryEquivalent: 0, fallback: "NO_METALS_TO_ROUND" }
     : roundDocumentMetalGrams(helperInput);
 

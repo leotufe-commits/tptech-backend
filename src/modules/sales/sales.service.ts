@@ -3287,6 +3287,9 @@ async function _confirmSaleImpl(
         documentTotals.metalCostSubtotal > 0
           ? documentTotals.metalSaleSubtotal / documentTotals.metalCostSubtotal
           : 1,
+      // Gate "metal sin valor comercial": si el doc no tiene venta de metal
+      // (~0), la capa 16 NO redondea el gramo de venta. Espejo de previewSale.
+      commercialSaleSubtotal: documentTotals.metalSaleSubtotal,
     },
     // Espejo EXACTO de previewSale: con `confirmFinancialPhysicalActive`, el
     // redondeo financiero MONETARIO (saldo + total) corre acá, post metal sale-
@@ -7101,6 +7104,10 @@ async function _previewSaleImpl(
         documentTotals.metalCostSubtotal > 0
           ? documentTotals.metalSaleSubtotal / documentTotals.metalCostSubtotal
           : 1,
+      // Gate "metal sin valor comercial": si el doc no tiene venta de metal
+      // (~0), la capa 16 NO redondea el gramo de venta (evita el −4.687,50
+      // sobre un artículo con peso pero composición/precio en 0).
+      commercialSaleSubtotal: documentTotals.metalSaleSubtotal,
     },
     // Cuando `financialPhysicalActive`, el redondeo financiero MONETARIO (saldo
     // BREAKDOWN + total UNIFIED) NO lo hizo el motor (capa 15) → corre acá, post

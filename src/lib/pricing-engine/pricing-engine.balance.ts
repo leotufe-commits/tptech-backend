@@ -180,6 +180,15 @@ interface MetalAccumulator {
   quotePriceSnapshot: number | null;
   variants:           DocumentBalanceMetalVariant[];
   sourceLineIds:      Set<string>;
+  /** Σ `metalLineValuationDocCurrency` del padre (valor de venta COMERCIAL,
+   *  = `lineSale × qty`). Distinto de la valuación física `gramsPure × quote`. */
+  commercialValuationDoc: number;
+  /** true si AL MENOS una línea del padre emitió un `metalLineValuationDocCurrency`
+   *  finito. Distingue "valor comercial = 0" (contexto comercial presente, ej.
+   *  artículo con peso pero precio/composición en 0) de "valor comercial
+   *  desconocido" (snapshot legacy sin el campo → se conserva la valuación
+   *  física, sin regresión). */
+  hasCommercialValuation: boolean;
 }
 
 /** Construye el `DocumentBalanceBreakdown` canónico desde el output del motor.
@@ -238,6 +247,8 @@ export function buildDocumentBalanceBreakdown(
           quotePriceSnapshot: m.quotePriceSnapshot ?? null,
           variants:           [],
           sourceLineIds:      new Set<string>(),
+          commercialValuationDoc: 0,
+          hasCommercialValuation: false,
         };
         accByParent.set(parentId, acc);
       }
@@ -268,7 +279,9 @@ export function buildDocumentBalanceBreakdown(
         m.metalLineValuationDocCurrency != null &&
         Number.isFinite(m.metalLineValuationDocCurrency)
       ) {
-        totalMetalValuationDoc += m.metalLineValuationDocCurrency;
+        totalMetalValuationDoc     += m.metalLineValuationDocCurrency;
+        acc.commercialValuationDoc += m.metalLineValuationDocCurrency;
+        acc.hasCommercialValuation  = true;
       }
     }
   }
@@ -280,8 +293,22 @@ export function buildDocumentBalanceBreakdown(
       const purityPonderada =
         acc.gramsOriginal > 1e-9 ? acc.gramsPure / acc.gramsOriginal : null;
       // Valorización referencial (display): gramsPure × quotePrice.
-      const valuationMonetary =
-        acc.quotePriceSnapshot != null && acc.gramsPure > 0
+      //
+      // GATE "metal sin valor comercial" (2026-06-17): si el padre tiene
+      // CONTEXTO comercial (alguna línea emitió su valor de venta) y ese valor
+      // agregado es ~0 (artículo con peso pero precio/composición en 0), el
+      // metal NO se valúa comercialmente → `valuationMonetary = 0`. Conserva
+      // `gramsPure` (cuenta corriente / auditoría). Evita que la valuación
+      // FÍSICA (gramsPure × quote) se muestre como "valor de venta metal" y
+      // empuje el saldo monetario a negativo (METAL +201.562 / MONETARIO
+      // −201.550 / TOTAL 12,50). Sin contexto comercial (snapshot legacy sin
+      // `metalLineValuationDocCurrency`) se conserva la valuación física — sin
+      // regresión. EPS 0.005 coherente con el resto del motor.
+      const commerciallyValueless =
+        acc.hasCommercialValuation && Math.abs(acc.commercialValuationDoc) <= 0.005;
+      const valuationMonetary = commerciallyValueless
+        ? 0
+        : acc.quotePriceSnapshot != null && acc.gramsPure > 0
           ? acc.gramsPure * acc.quotePriceSnapshot
           : null;
       const entry: DocumentBalanceMetalEntry = {

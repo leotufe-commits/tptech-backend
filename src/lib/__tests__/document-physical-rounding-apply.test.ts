@@ -1437,3 +1437,72 @@ describe("applyDocumentPhysicalRounding — BOTH resuelto a scope efectivo (J)",
     expect(dra.breakdown.hechura).toBeNull();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gate "metal sin valor comercial" (K) — commercialSaleSubtotal ≤ EPS
+//
+// Artículo con PESO de metal pero composición/precio en 0: el metal NO se
+// redondea (no emite delta ni monetaryEquivalent, no mueve el total). Evita el
+// "−4.687,50" sobre un metal sin venta real.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("applyDocumentPhysicalRounding — gate metal sin valor comercial (K)", () => {
+  it("commercialSaleSubtotal ~0 → NO redondea el metal (sin delta, total intacto)", () => {
+    const dt: any = { total: 12.5, metalCostSubtotal: 0, metalSaleSubtotal: 0 };
+    const bb = fixtureBalance({
+      metals: [
+        { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 1.13, gramsOriginal: 1.13, purity: 1, quotePriceSnapshot: 187500, valuationMonetary: 0 },
+      ],
+    });
+    const policy = policyPhysical();
+    policy.physical.configByMetalParentId = { [ORO]: { mode: "DECIMAL_1", direction: "NEAREST" } };
+
+    const result = applyDocumentPhysicalRounding({
+      documentTotals: dt,
+      balanceBreakdown: bb,
+      policy,
+      commercial: {
+        metalsByParent: [
+          { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 1.13, metalPricePerGram: 187500, metalReferenceValue: 187500 },
+        ],
+        marginFactor: 1,
+        commercialSaleSubtotal: 0,   // ← sin valor de venta de metal
+      },
+    });
+
+    // El metal NO se redondea: sin entries, sin equivalente monetario.
+    expect(result!.metals).toHaveLength(0);
+    expect(result!.metalMonetaryEquivalent).toBe(0);
+    // El total NO se mueve por el metal (no aparece el −4.687,50).
+    expect(dt.total).toBeCloseTo(12.5, 2);
+  });
+
+  it("NO regresión — commercialSaleSubtotal > 0 redondea como siempre", () => {
+    const dt: any = { total: 200000, metalCostSubtotal: 80000, metalSaleSubtotal: 100000 };
+    const bb = fixtureBalance({
+      metals: [
+        { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 0.72, gramsOriginal: 0.72, purity: 1, quotePriceSnapshot: 100000, valuationMonetary: 72000 },
+      ],
+    });
+    const policy = policyPhysical();
+    policy.physical.configByMetalParentId = { [ORO]: { mode: "INTEGER", direction: "NEAREST" } };
+
+    const result = applyDocumentPhysicalRounding({
+      documentTotals: dt,
+      balanceBreakdown: bb,
+      policy,
+      commercial: {
+        metalsByParent: [
+          { metalParentId: ORO, metalParentName: "Oro Fino", gramsPure: 0.72, metalPricePerGram: 100000, metalReferenceValue: 120000 },
+        ],
+        marginFactor: 1.25,
+        commercialSaleSubtotal: 100000,   // ← con valor de venta → gate inactivo
+      },
+    });
+
+    const oroEntry = result!.metals.find((m) => m.metalParentId === ORO)!;
+    expect(oroEntry.deltaGrams).toBeCloseTo(0.1, 4);
+    expect(oroEntry.monetaryEquivalent).toBeCloseTo(12000, 2);
+    expect(dt.total).toBeCloseTo(212000, 2);
+  });
+});

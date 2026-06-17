@@ -723,3 +723,86 @@ describe("T58 — Negativos en BREAKDOWN (clamp removido)", () => {
     expect(out.monetaryBalance.amount).toBeCloseTo(-65000, 2);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gate "metal sin valor comercial" (2026-06-17)
+//
+// Artículo con PESO de metal pero composición/precio en 0 → el metal NO se
+// valúa comercialmente (valuationMonetary = 0), conservando gramsPure. Evita
+// el desglosado roto (METAL +físico / MONETARIO −físico / TOTAL chico).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Gate metal sin valor comercial", () => {
+  it("peso presente + valor de venta 0 → valuationMonetary = 0, gramsPure intacto, monetario = total", () => {
+    const out = buildDocumentBalanceBreakdown(
+      {
+        documentTotal:     12.5,   // solo redondeo; la composición vale 0
+        documentTotalBase: 12.5,
+        currency:          ars(),
+        lines: [{
+          lineId:   "line-1",
+          quantity: 1,
+          metals: [{
+            metalParentId:                 "oro-fino",
+            metalParentName:               "Oro Fino",
+            metalVariantId:                "oro-18k",
+            metalVariantName:              "Oro 18 Kilates",
+            appliedGramsPerUnit:           1.10,            // PESO real del artículo
+            purity:                        1,
+            quotePriceSnapshot:            187500,          // físico = 206.250
+            metalLineValuationDocCurrency: 0,               // valor de venta COMERCIAL = 0
+          }],
+        }],
+      },
+      "BREAKDOWN",
+    );
+    // El metal sigue visible con sus gramos (cuenta corriente / auditoría)…
+    expect(out.metals).toHaveLength(1);
+    expect(out.metals[0].gramsPure).toBeCloseTo(1.10, 4);
+    // …pero NO se valúa comercialmente (no muestra 206.250 físico).
+    expect(out.metals[0].valuationMonetary).toBe(0);
+    // El saldo monetario = total (no se va a negativo por la valuación física).
+    expect(out.monetaryBalance.amount).toBeCloseTo(12.5, 2);
+  });
+
+  it("NO regresión — valor de venta > 0 conserva la valuación física", () => {
+    const out = buildDocumentBalanceBreakdown(
+      {
+        documentTotal:     100000,
+        documentTotalBase: 100000,
+        currency:          ars(),
+        lines:             [lineWithMetal()],   // metalLineValuationDocCurrency: 75000
+      },
+      "BREAKDOWN",
+    );
+    expect(out.metals[0].valuationMonetary).toBeCloseTo(75000, 2); // 1g × 0.75 × 100000
+    expect(out.monetaryBalance.amount).toBeCloseTo(25000, 2);      // 100000 − 75000
+  });
+
+  it("legacy — sin metalLineValuationDocCurrency NO gatea (conserva valuación física)", () => {
+    const out = buildDocumentBalanceBreakdown(
+      {
+        documentTotal:     100000,
+        documentTotalBase: 100000,
+        currency:          ars(),
+        lines: [{
+          lineId:   "line-1",
+          quantity: 1,
+          metals: [{
+            metalParentId:    "oro-fino",
+            metalParentName:  "Oro Fino",
+            metalVariantId:   "oro-18k",
+            metalVariantName: "Oro 18 Kilates",
+            appliedGramsPerUnit: 1,
+            purity:              0.75,
+            quotePriceSnapshot:  100000,
+            // sin metalLineValuationDocCurrency → contexto comercial AUSENTE
+          }],
+        }],
+      },
+      "BREAKDOWN",
+    );
+    // Sin contexto comercial, se conserva la valuación física referencial.
+    expect(out.metals[0].valuationMonetary).toBeCloseTo(75000, 2); // 1g × 0.75 × 100000
+  });
+});
