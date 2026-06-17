@@ -1861,3 +1861,115 @@ describe("componentSaleBreakdown — paridad simulador/totales", () => {
     expect(sumComponents).toBeCloseTo(res.unitPrice!.toNumber(), 2);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REDONDEO COMERCIAL DIFERIDO (lista UNIFICADA, applyOn=TOTAL) + el gate
+// `suppressListDeferredRounding`.
+//
+// REGLA DEL OPERADOR: el redondeo COMERCIAL de una lista UNIFICADA debe
+// comportarse IDÉNTICO con o sin redondeo financiero configurado.
+//   · SIN financiero            → la línea recibe `appliedRounding` y el total
+//                                 queda redondeado (el card lo muestra).
+//   · CON financiero PHYSICAL   → cuando el financiero se DIFIERE a la capa 16,
+//     (defer a capa 16)           el redondeo de lista SÍ aplica POR LÍNEA →
+//                                 MISMO `appliedRounding` y MISMO total.
+//
+// El motor consume `opts.suppressListDeferredRounding`. El fix vive en los
+// call-sites de `sales.service.ts`: con financiero PHYSICAL diferido se pasa
+// `false` (no se suprime), igual que sin financiero. Acá verificamos el
+// contrato del motor que esos call-sites alimentan:
+//   (a) suppress=false → appliedRounding poblado + total redondeado.
+//   (b) suppress=true  → appliedRounding null + total SIN redondear (legacy).
+//   (a) y (b) coexisten: el comercial es idéntico mientras suppress=false,
+//   independientemente de si hay financiero (que encadena después).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Redondeo comercial diferido UNIFICADO — gate suppressListDeferredRounding", () => {
+  // Lista UNIFICADA con redondeo diferido al TOTAL (HUNDRED NEAREST).
+  // El precio crudo de lista = 2456 → redondeado a 2500.
+  function setupDeferredTotalList() {
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle());
+    mockResolveArticleCost.mockResolvedValue(costOf(1000));
+
+    const fakePriceList = {
+      id: "pl-unif", name: "Lista Unificada",
+      mode: "MARGIN_TOTAL", marginTotal: "100",
+      marginMetal: null, marginHechura: null,
+      costPerGram: null, surcharge: null, minimumPrice: null,
+      roundingTarget: "FINAL_PRICE", roundingMode: "HUNDRED",
+      roundingDirection: "NEAREST", roundingApplyOn: "TOTAL",
+      validFrom: null, validTo: null, isActive: true,
+    };
+    mockResolvePriceList.mockResolvedValue({ priceList: fakePriceList, source: "GENERAL" });
+    // El motor de lista difiere el redondeo: devuelve el valor crudo +
+    // `roundingDeferred` (applyOn=TOTAL). El redondeo real lo ejecuta
+    // `resolveFinalSalePrice` con el `applyRounding` real (HUNDRED NEAREST).
+    mockApplyPriceList.mockReturnValue({
+      value: new D("2456"),
+      partial: false,
+      roundingDeferred: { mode: "HUNDRED", direction: "NEAREST", applyOn: "TOTAL" },
+    });
+  }
+
+  it("(a) SIN financiero (suppress=false) → appliedRounding poblado + total redondeado a 2500", async () => {
+    setupDeferredTotalList();
+    const res = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      suppressListDeferredRounding: false,
+    });
+    expect(res.appliedRounding).not.toBeNull();
+    expect(res.appliedRounding!.applyOn).toBe("TOTAL");
+    expect(res.appliedRounding!.preRounding?.toNumber()).toBe(2456);
+    expect(res.appliedRounding!.postRounding?.toNumber()).toBe(2500);
+    expect(res.totalWithTax?.toNumber()).toBe(2500);
+  });
+
+  it("(b) CON financiero PHYSICAL diferido (suppress=false) → MISMO appliedRounding + MISMO total", async () => {
+    // Cuando el financiero PHYSICAL se difiere a la capa 16, el call-site del
+    // service pasa suppress=false (igual que sin financiero). El motor produce
+    // EXACTAMENTE el mismo redondeo comercial; el financiero encadena después.
+    setupDeferredTotalList();
+    const res = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      suppressListDeferredRounding: false,
+    });
+    expect(res.appliedRounding).not.toBeNull();
+    expect(res.appliedRounding!.applyOn).toBe("TOTAL");
+    expect(res.appliedRounding!.preRounding?.toNumber()).toBe(2456);
+    expect(res.appliedRounding!.postRounding?.toNumber()).toBe(2500);
+    expect(res.totalWithTax?.toNumber()).toBe(2500);
+  });
+
+  it("(a)≡(b) — el redondeo comercial es IDÉNTICO con o sin financiero (mismo suppress=false)", async () => {
+    setupDeferredTotalList();
+    const sinFinanciero = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      suppressListDeferredRounding: false,
+    });
+    setupDeferredTotalList();
+    const conFinancieroDiferido = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      suppressListDeferredRounding: false,
+    });
+    // Mismo appliedRounding (preRounding/postRounding) y mismo total.
+    expect(conFinancieroDiferido.appliedRounding!.preRounding?.toNumber())
+      .toBe(sinFinanciero.appliedRounding!.preRounding?.toNumber());
+    expect(conFinancieroDiferido.appliedRounding!.postRounding?.toNumber())
+      .toBe(sinFinanciero.appliedRounding!.postRounding?.toNumber());
+    expect(conFinancieroDiferido.totalWithTax?.toNumber())
+      .toBe(sinFinanciero.totalWithTax?.toNumber());
+  });
+
+  it("(legacy/anti-doble) suppress=true → appliedRounding null + total SIN redondear (2456)", async () => {
+    // Comportamiento legacy: cuando el financiero NO se difiere (o el tenant
+    // tiene política financiera que redondea el doc), la lista NO aplica su
+    // redondeo POR LÍNEA y el motor de documento redondea una sola vez.
+    setupDeferredTotalList();
+    const res = await resolveFinalSalePrice("j1", {
+      articleId: "a1",
+      suppressListDeferredRounding: true,
+    });
+    expect(res.appliedRounding).toBeNull();
+    expect(res.totalWithTax?.toNumber()).toBe(2456);
+  });
+});

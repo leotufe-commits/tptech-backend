@@ -589,6 +589,38 @@ describe("buildDocumentMonetaryComponentsFromTotals", () => {
     expect(byType.ROUNDING_MONETARY.group).toBe("ROUNDING");
   });
 
+  // POLICY §R-Rounding-3 — el ORIGEN del redondeo monetario lo decide el caller
+  // (no se infiere de documentRoundingApplied). El component lo propaga como
+  // `roundingSource` para que el frontend etiquete LIST vs DOCUMENT.
+  it("emite roundingSource='LIST' cuando el redondeo viene de la lista (opción B / sin financiero)", () => {
+    const out = buildDocumentMonetaryComponentsFromTotals({
+      totals: { roundingAdjustment: 13.68 },
+      roundingSource: "LIST",
+    });
+    const r = out.find((c) => c.type === "ROUNDING_MONETARY")!;
+    expect(r.amount).toBe(13.68);
+    expect(r.roundingSource).toBe("LIST");
+  });
+
+  it("emite roundingSource='DOCUMENT' cuando el redondeo viene del financiero (capa 15)", () => {
+    const out = buildDocumentMonetaryComponentsFromTotals({
+      totals: { roundingAdjustment: -7031.25 },
+      roundingSource: "DOCUMENT",
+    });
+    const r = out.find((c) => c.type === "ROUNDING_MONETARY")!;
+    expect(r.amount).toBe(-7031.25);
+    expect(r.roundingSource).toBe("DOCUMENT");
+  });
+
+  it("NO emite roundingSource cuando el caller no lo provee (back-compat)", () => {
+    const out = buildDocumentMonetaryComponentsFromTotals({
+      totals: { roundingAdjustment: -0.50 },
+    });
+    const r = out.find((c) => c.type === "ROUNDING_MONETARY")!;
+    expect(r.amount).toBe(-0.50);
+    expect("roundingSource" in r).toBe(false);
+  });
+
   it("usa labels custom y carga source cuando se pasan IDs", () => {
     const out = buildDocumentMonetaryComponentsFromTotals({
       totals: {

@@ -1610,6 +1610,17 @@ export interface DocumentBalanceMonetaryComponent {
   sourceLineId?: string;
   /** ID externo (promoId / taxId / couponId / etc.) para drill-down futuro. */
   source?:       string;
+  /** Solo para `type="ROUNDING_MONETARY"`. Origen REAL del redondeo monetario
+   *  que viaja en este componente. Aditivo / back-compat (opcional):
+   *    · `"LIST"`     → el `roundingAdjustment` ES el Redondeo Comercial de la
+   *      lista (sin financiero, o financiero diferido a capa 16 — opción B).
+   *      Se renderiza como "Redondeo comercial".
+   *    · `"DOCUMENT"` → el `roundingAdjustment` ES el Redondeo Financiero del
+   *      comprobante (el motor lo reemplazó con el delta financiero en capa 15).
+   *      Se renderiza como "Redondeo financiero".
+   *  Cuando falta, el frontend cae al heurístico legacy
+   *  (`documentRoundingApplied != null`). Ver POLICY §R-Rounding-3. */
+  roundingSource?: "LIST" | "DOCUMENT";
 }
 
 /** Saldo monetario consolidado del documento. */

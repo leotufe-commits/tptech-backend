@@ -430,6 +430,15 @@ export interface BuildDocumentMonetaryComponentsArgs {
   couponSource?:  string | null;
   /** Etiqueta de la forma de pago (ej. "Tarjeta Visa 12 cuotas"). */
   paymentLabel?:  string | null;
+  /** Origen REAL del `roundingAdjustment` que llega en `totals`. Se propaga al
+   *  componente `ROUNDING_MONETARY` como `roundingSource` para que el frontend
+   *  etiquete sin inferir de `documentRoundingApplied` (POLICY §R-Rounding-3):
+   *    · `"DOCUMENT"` → el `roundingAdjustment` ES el Redondeo Financiero del
+   *      comprobante (capa 15 lo reemplazó con el delta financiero).
+   *    · `"LIST"` → el `roundingAdjustment` ES el Redondeo Comercial de la lista
+   *      (sin financiero, o financiero diferido a capa 16 — opción B).
+   *  Cuando falta, NO se emite el campo (back-compat: frontend usa heurístico). */
+  roundingSource?: "LIST" | "DOCUMENT" | null;
 }
 
 const EPS = 0.005;
@@ -557,6 +566,9 @@ export function buildDocumentMonetaryComponentsFromTotals(
       group:  "ROUNDING",
       label:  "Redondeo",
       amount: rounding,
+      // POLICY §R-Rounding-3 — el origen lo decide el caller (LIST vs DOCUMENT),
+      // no se infiere de `documentRoundingApplied`. Solo se emite si vino.
+      ...(args.roundingSource ? { roundingSource: args.roundingSource } : {}),
     });
   }
 

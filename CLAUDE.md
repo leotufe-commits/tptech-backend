@@ -211,6 +211,48 @@ Siempre:
 
 > Detalle conceptual completo en el `CLAUDE.md` raíz (sección "Contrato canónico del modo DESGLOSADO" + "Redondeos y Ajuste Manual — Etapa A") y en `src/lib/pricing-engine/POLICY.md §R-Rounding-1/2/6/10/13/14`. Esta sección es la vista jerárquica que el backend implementa.
 
+## ⚡ OVERHAUL 2026-06 — Redondeo financiero (CRÍTICO, leer antes de tocar)
+
+Reescritura del redondeo financiero. Supersede las descripciones de "capa 15/16
+con gramos puros" que aparecen más abajo en este archivo.
+
+1. **Metal financiero (`documentRoundingMetalDomain=PHYSICAL`) redondea el GRAMO
+   DE VENTA, no el puro.** Capa 16 (`applyDocumentPhysicalRounding`) redondea
+   `gramsSale = gramsPure × marginFactor` con `refValue` (= `metalReferenceValue ??
+   metalPricePerGram`) — IDÉNTICO al redondeo comercial. Recibe
+   `commercial: { metalsByParent, marginFactor }` desde `sales.service.ts`
+   (`computeSaleDocumentTotals` expone `metalSaleSubtotal`/`metalCostSubtotal`).
+   **NO muta `balanceBreakdown.metals[].gramsPure`** (queda físico para la cuenta
+   corriente / ajuste manual).
+2. **Todo el financiero (metal + saldo + unified) corre en capa 16** cuando
+   `financialPhysicalActive` (= `metalDomain==="PHYSICAL" && physical.enabled`) —
+   ÚLTIMO paso automático antes del ajuste manual. Para lograrlo, `sales.service.ts`
+   pasa `documentRounding` PRESENTE + `deferDocumentRoundingApplication=true` a
+   `computeSaleDocumentTotals` (mantiene `docRoundingActive` para el descarte del
+   diferido, pero difiere la APLICACIÓN del financiero a capa 16). Para tenants
+   no-physical el financiero sigue en capa 15.
+3. **Anti-doble (comercial PER_DOCUMENT + financiero conviviendo):** el financiero
+   opera sobre los valores POST-comercial — gramo de entrada =
+   `commercialDocumentRoundingApplied.breakdown.metalsPostGrams[].postGrams`; saldo
+   base = `commercialDocumentRoundingApplied.breakdown.hechura.postRoundingSaldoMonetario`.
+   Misma config → delta 0 (no duplica); config distinta → encadena sobre el post.
+4. **Listas UNIFICADAS con redondeo diferido (`applyOn=TOTAL`) + financiero —
+   "opción B" (comercial se aplica, financiero encadena):**
+   - `roundingAdjustment = (docRoundingActive && !deferDocumentRoundingApplication) ? 0 : input.roundingAdjustment` — con `defer` activo el diferido de la lista SE APLICA (no se descarta), atribuido al campo `roundingAdjustment` / step `ROUNDING`.
+   - `suppressListDeferredRounding` se fuerza a `false` cuando `financialPhysicalActive` en los call-sites de resolución de precio POR LÍNEA → la lista aplica su redondeo POR LÍNEA (la línea recibe `appliedRounding.unitAdjustment`) **IDÉNTICO a sin financiero**. Regla del operador: **comercial → card de artículos (por línea); financiero → footer (por documento)**.
+5. **`applyOn=TOTAL` (el default de listas) es POST-impuestos**, no pre. Step
+   `ROUNDING` del `sourceTrace` corre después de `TAX`/`PAYMENT`. Solo `applyOn=NET`
+   o el inmediato (FINAL_PRICE sobre el precio) son pre-tax.
+6. **`roundingSource: "LIST" | "DOCUMENT"`** en el componente `ROUNDING_MONETARY`
+   (`buildDocumentMonetaryComponentsFromTotals`, `balance-mode-runtime.ts`):
+   distingue comercial (LIST) de financiero (DOCUMENT) — necesario porque con
+   opción B ambos coexisten. `roundingSource = (documentRounding && !financialPhysicalActive) ? "DOCUMENT" : "LIST"`. Ver `POLICY.md §R-Rounding-3`.
+7. **Pendiente / futuro (cuenta corriente):** regla del operador "lo que se ve en
+   el comprobante = lo que se manda a la cuenta corriente" (gramo MOSTRADO + saldo
+   en pesos, post-redondeo). HOY la cuenta corriente metálica guarda `gramsPure`
+   físico (NO sobrescribir — fuente fiscal). Diferido al sprint de cuenta corriente
+   (campo `gramsBilled` nuevo, no overwrite de `gramsPure`).
+
 ## Jerarquía (orden de aplicación, NO alterable)
 
 | # | Mecanismo | Alcance | Vive en | Snapshot |

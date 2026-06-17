@@ -2431,7 +2431,13 @@ async function _confirmSaleImpl(
           taxAppliesToOverride:      (line as any).manualTaxAppliesToOverride      ?? null,
           priceListIdOverride:    realListId,                 // ← lista REAL de la línea
           costLineOverrides:      frozenLineCostOverrides,
-          suppressListDeferredRounding: docRoundingPolicy.suppressListDeferredRounding,
+          // FIX (UNIFICADA con/sin financiero) — cuando el financiero PHYSICAL
+          // se DIFIERE a la capa 16 (`confirmFinancialPhysicalActive`), NO
+          // suprimimos el redondeo diferido de la lista POR LÍNEA: la línea
+          // debe recibir su `appliedRounding.unitAdjustment` igual que sin
+          // financiero (el card de artículos lo muestra). El financiero
+          // encadena después en capa 16 (opción B, anti-doble ya implementado).
+          suppressListDeferredRounding: docRoundingPolicy.suppressListDeferredRounding && !confirmFinancialPhysicalActive,
           // α — suprimir el redondeo comercial PER_LINE (pre-tax) de ESTA línea.
           applyPriceListOptions: {
             suppressLineHechuraRounding:       true,
@@ -3202,6 +3208,11 @@ async function _confirmSaleImpl(
       taxAmount:                documentTotals.taxAmount,
       roundingAdjustment:      documentTotals.roundingAdjustment,
     },
+    // POLICY §R-Rounding-3 — espejo EXACTO de previewSale. DOCUMENT solo cuando
+    // hay política doc activa y el financiero NO se difirió a capa 16.
+    roundingSource: (docRoundingPolicy.documentRounding && !confirmFinancialPhysicalActive)
+      ? "DOCUMENT"
+      : "LIST",
     channelLabel:  confirmChannelAdj?.channelName ?? null,
     channelSource: confirmChannelAdj?.channelId   ?? null,
     couponLabel:   confirmCouponAdj?.couponName   ?? null,
@@ -3517,6 +3528,10 @@ async function _confirmSaleImpl(
           roundingAdjustment:      documentTotals.roundingAdjustment,
           metalCostSubtotal:       documentTotals.metalCostSubtotal,
         },
+        // POLICY §R-Rounding-3 — ver call anterior. LIST salvo financiero capa 15.
+        roundingSource: (docRoundingPolicy.documentRounding && !confirmFinancialPhysicalActive)
+          ? "DOCUMENT"
+          : "LIST",
         metalValuationSum:             metalValuationSumPost,
         manualAdjustmentMonetaryAmount: manualAdjMonetary,
         channelLabel:  confirmChannelAdj?.channelName ?? null,
@@ -4047,7 +4062,15 @@ export async function resolveDraftSaleLinesPricing(
   // snapshots del DRAFT deben construirse SIN el redondeo diferido (NET/TOTAL)
   // de la lista. El redondeo se aplica una sola vez, al confirmar, sobre el
   // total del documento.
-  const { suppressListDeferredRounding } = await loadDocumentRoundingConfig(jewelryId);
+  // FIX (UNIFICADA con/sin financiero) — pero cuando el financiero PHYSICAL se
+  // DIFIERE a la capa 16, el redondeo diferido de la lista SÍ debe aplicarse
+  // POR LÍNEA (la línea recibe `appliedRounding.unitAdjustment`, el card lo
+  // muestra). El financiero encadena después en capa 16 (opción B, anti-doble).
+  const draftRoundingPolicy = await loadDocumentRoundingConfig(jewelryId);
+  const draftFinancialPhysicalActive =
+    draftRoundingPolicy.metalDomain === "PHYSICAL" && draftRoundingPolicy.physical.enabled;
+  const suppressListDeferredRounding =
+    draftRoundingPolicy.suppressListDeferredRounding && !draftFinancialPhysicalActive;
 
   // ── Etapa D' — Contexto comercial PER_DOCUMENT para createSale/updateSale ─
   // Se resuelve usando los mismos `priceListIdOverride` de las líneas del
@@ -4353,7 +4376,14 @@ export async function getLinePricingSnapshotForConfirm(
 
   // Misma regla anti doble redondeo que el DRAFT: si el tenant tiene política
   // doc activa, ignoramos el redondeo diferido de la lista al recomputar.
-  const { suppressListDeferredRounding } = await loadDocumentRoundingConfig(jewelryId);
+  // FIX (UNIFICADA con/sin financiero) — salvo cuando el financiero PHYSICAL se
+  // DIFIERE a la capa 16: ahí el redondeo diferido de la lista SÍ aplica POR
+  // LÍNEA (espejo de preview/draft); el financiero encadena en capa 16.
+  const recomputeRoundingPolicy = await loadDocumentRoundingConfig(jewelryId);
+  const recomputeFinancialPhysicalActive =
+    recomputeRoundingPolicy.metalDomain === "PHYSICAL" && recomputeRoundingPolicy.physical.enabled;
+  const suppressListDeferredRounding =
+    recomputeRoundingPolicy.suppressListDeferredRounding && !recomputeFinancialPhysicalActive;
 
   const result = await resolveFinalSalePrice(jewelryId, {
     articleId: line.articleId,
@@ -5418,7 +5448,16 @@ async function _previewSaleImpl(
         costLineOverrides:      line.costLineOverrides,
         // Anti doble redondeo: si el tenant tiene redondeo doc activo, el
         // motor IGNORA el redondeo diferido (NET/TOTAL) de la lista.
-        suppressListDeferredRounding: docRoundingPolicy.suppressListDeferredRounding,
+        // FIX (UNIFICADA con/sin financiero) — cuando el financiero PHYSICAL
+        // se DIFIERE a la capa 16, NO suprimimos el redondeo diferido de la
+        // lista POR LÍNEA: la línea debe recibir su `appliedRounding.unitAdjustment`
+        // igual que sin financiero (el card de artículos lo muestra). El
+        // financiero encadena después en capa 16 (opción B, anti-doble ya
+        // implementado). `financialPhysicalActive` se define más abajo (~6146);
+        // acá derivamos la misma condición inline desde `docRoundingPolicy`.
+        suppressListDeferredRounding:
+          docRoundingPolicy.suppressListDeferredRounding &&
+          !(docRoundingPolicy.metalDomain === "PHYSICAL" && docRoundingPolicy.physical.enabled),
         // Etapa D' — Si el documento opera PER_DOCUMENT, suprimimos el
         // redondeo PER_LINE de hechura y/o metal físico en applyPriceList
         // (gate anti-doble). Cuando es PER_LINE_LEGACY, el objeto está
@@ -6948,6 +6987,15 @@ async function _previewSaleImpl(
         ? documentTotals.roundingAdjustment
         : docRoundingAdjustment,
     },
+    // POLICY §R-Rounding-3 — origen REAL del `roundingAdjustment`. El motor
+    // (capa 15) REEMPLAZA `roundingAdjustment` con el delta FINANCIERO solo
+    // cuando hay política doc activa Y NO se difirió a capa 16
+    // (`!financialPhysicalActive`). En cualquier otro caso (sin financiero, o
+    // financiero diferido = opción B) el `roundingAdjustment` es el COMERCIAL
+    // de la lista. Ver pricing-engine.document.ts:1336-1339.
+    roundingSource: (docRoundingPolicy.documentRounding && !financialPhysicalActive)
+      ? "DOCUMENT"
+      : "LIST",
     channelLabel:  channelResult?.channelName ?? null,
     channelSource: channelResult?.channelId   ?? null,
     couponLabel:   couponResult?.couponName   ?? null,
@@ -7440,6 +7488,10 @@ async function _previewSaleImpl(
           : docRoundingAdjustment,
         metalCostSubtotal:       documentTotals.metalCostSubtotal,
       },
+      // POLICY §R-Rounding-3 — ver call anterior. LIST salvo financiero capa 15.
+      roundingSource: (docRoundingPolicy.documentRounding && !financialPhysicalActive)
+        ? "DOCUMENT"
+        : "LIST",
       metalValuationSum:             metalValuationSumPost,
       manualAdjustmentMonetaryAmount: manualAdjMonetary,
       channelLabel:  channelResult?.channelName ?? null,

@@ -503,11 +503,38 @@ puede provenir de dos fuentes que el operador necesita distinguir:
 
 | Origen del `roundingAdjustment` | Cómo se renderiza | Atributo |
 |---|---|---|
-| **Lista** (`documentRoundingApplied == null`) | "Redondeo de lista" + caption "Ya incluido en el subtotal" — estilo italic/muted | `data-tp-rounding-source="LIST"` |
-| **Comprobante** (`documentRoundingApplied != null`) | "Redondeo del comprobante" + caption con scope (UNIFIED/BREAKDOWN/BOTH) | `data-tp-rounding-source="DOCUMENT"` |
+| **Lista** (Redondeo Comercial) | "Redondeo comercial" + caption "Antes de impuestos · ya incluido en el subtotal" — estilo italic/muted | `data-tp-rounding-source="LIST"` |
+| **Comprobante** (Redondeo Financiero) | "Redondeo financiero" + caption con scope (UNIFIED/BREAKDOWN/BOTH) | `data-tp-rounding-source="DOCUMENT"` |
 
-Implementación: `MonetarySummary.RoundingRow` en
-`tptech-frontend/src/components/sales/TotalDelComprobanteCard/parts/MonetarySummary.tsx`.
+**El origen lo emite el BACKEND, no se infiere (CRÍTICO).** El componente trae
+un campo `roundingSource: "LIST" | "DOCUMENT"` que DECIDE la etiqueta. El caller
+(`sales.service.ts`, los 4 call-sites de
+`buildDocumentMonetaryComponentsFromTotals`) lo computa así:
+
+```
+roundingSource = (docRoundingPolicy.documentRounding && !financialPhysicalActive)
+  ? "DOCUMENT"   // el motor REEMPLAZÓ roundingAdjustment con el delta financiero (capa 15)
+  : "LIST"       // sin financiero, o financiero diferido a capa 16 (opción B)
+```
+
+> **Por qué `documentRoundingApplied != null` ya NO basta (opción B).** Cuando el
+> tenant tiene Redondeo Financiero `metalDomain=PHYSICAL`, el motor DIFIERE el
+> redondeo a la capa 16 (`deferDocumentRoundingApplication=true`): el
+> `roundingAdjustment` que viaja en el componente `ROUNDING_MONETARY` es el
+> COMERCIAL de la lista, mientras `documentRoundingApplied` (financiero) SÍ está
+> presente (lo construye la capa 16). En ese escenario el origen real es `LIST`
+> aunque `documentRoundingApplied != null`. Por eso el frontend prioriza
+> `roundingSource` y solo cae al heurístico `documentRoundingApplied != null`
+> como FALLBACK back-compat para snapshots legacy que no traen el campo.
+
+Implementación: campo `roundingSource` en `DocumentBalanceMonetaryComponent`
+(`pricing-engine.types.ts`), emitido por `buildDocumentMonetaryComponentsFromTotals`
+(`balance-mode-runtime.ts`). Render: `MonetarySummary.RoundingRow` en
+`tptech-frontend/src/components/sales/TotalDelComprobanteCard/parts/MonetarySummary.tsx`
+(usa `roundingSource` cuando viene; fallback a `documentRoundingApplied`).
+
+> El Redondeo Comercial PER_DOCUMENT de listas DESGLOSADAS NO viaja por este
+> componente (va por `commercialDocumentRoundingApplied`) — intacto.
 
 ### §R-Rounding-4 — BOTH mode: orden oficial
 
