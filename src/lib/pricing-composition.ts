@@ -895,6 +895,13 @@ export function extractCompositionItems(
   targetKey: "COST_LINES_PRODUCT" | "COST_LINES_SERVICE",
   catalogItems?: Map<string, { code: string; name: string; sku: string; unitOfMeasure: string }>,
   hechuraSaleFactor: number | null = null,
+  // COMBO — venta REAL por componente (keyed por costLineId). Cuando un item
+  // tiene entrada acá, su `lineSale` se toma de este mapa (venta del componente
+  // resuelta con la lista del documento = `costo × (1 + margen)`) en lugar de
+  // derivarse de `hechuraSaleFactor`. Garantiza paridad unificada ↔ desglosada
+  // en combos (la unificada emite hechuraMarginPct=0 → factor 1 → colapso a
+  // costo). Sin combo → null → comportamiento histórico intacto.
+  comboComponentSale: Record<string, number> | null = null,
 ): CompositionItemBlock[] {
   if (!Array.isArray(steps) || steps.length === 0) return [];
 
@@ -932,10 +939,22 @@ export function extractCompositionItems(
       const qty       = meta.qty       != null ? Number(meta.qty)       : 0;
       const unitValue = meta.unitValue != null ? Number(meta.unitValue) : 0;
       const totalValueFinite = Number.isFinite(totalValue) ? totalValue : null;
+      // COMBO — si el motor emitió la venta real de este componente (por
+      // costLineId), la usamos tal cual (`costo × (1 + margen)` resuelto con la
+      // lista del documento). Es IDÉNTICA a la que la lista desglosada ya
+      // producía vía `hechuraSaleFactor`; en la unificada (factor 1) corrige el
+      // colapso a costo. Fallback al cálculo histórico para no-combos.
+      const costLineIdForSale = (meta.costLineId ?? null) as string | null;
+      const comboSale =
+        costLineIdForSale != null && comboComponentSale != null
+          ? comboComponentSale[costLineIdForSale]
+          : undefined;
       const lineSale =
-        totalValueFinite != null && hechuraSaleFactor != null && Number.isFinite(hechuraSaleFactor)
-          ? totalValueFinite * hechuraSaleFactor
-          : null;
+        comboSale != null && Number.isFinite(comboSale)
+          ? comboSale
+          : totalValueFinite != null && hechuraSaleFactor != null && Number.isFinite(hechuraSaleFactor)
+            ? totalValueFinite * hechuraSaleFactor
+            : null;
 
       // Moneda original — passthrough display desde `step.meta.currencyCode`
       // y `currencySymbol` que el motor cost inyecta (vía spread de
@@ -1194,8 +1213,13 @@ export function buildComposition(
   const metalSaleFactorPre = computeMetalSaleFactorPre(result);
   const metals   = extractCompositionMetals(result.steps, metalVariantInfoMap, metalSaleFactor, metalSaleFactorPre);
   const hechuras = extractCompositionHechuras(result.steps, hechuraSaleFactor);
-  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems, hechuraSaleFactor);
-  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems, hechuraSaleFactor);
+  // COMBO — venta real por componente (keyed por costLineId), emitida por el
+  // motor de venta. Cuando está presente, sobreescribe el `lineSale` derivado
+  // de `hechuraSaleFactor` (que en listas UNIFICADAS / MARGIN_TOTAL colapsa a
+  // costo). Sin combo → undefined → comportamiento histórico intacto.
+  const comboComponentSale = result.comboComponentSaleByCostLineId ?? null;
+  const products = extractCompositionItems(result.steps, "COST_LINES_PRODUCT", catalogItems, hechuraSaleFactor, comboComponentSale);
+  const services = extractCompositionItems(result.steps, "COST_LINES_SERVICE", catalogItems, hechuraSaleFactor, comboComponentSale);
   // Fase 2.5 — ajuste global de costo extraído del step COST_LINES_FINAL.
   const costAdjustment = extractCompositionCostAdjustment(result.steps);
 

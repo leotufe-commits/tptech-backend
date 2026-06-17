@@ -1287,6 +1287,9 @@ export async function resolveFinalSalePrice(
   let comboDerivedPrice: Prisma.Decimal | null = null;
   let comboPricePartial = false;
   let comboPriceStep: any = null;
+  // COMBO — venta real por componente (keyed por costLineId), lifted al scope
+  // del resultado. Poblado dentro del branch COMBO_COMMERCIAL más abajo.
+  let comboComponentSaleOut: Record<string, number> | null = null;
   // true cuando AL MENOS un componente usó el pipeline nuevo (cost-line con
   // unitValue > 0 → costLineAdj × margen). Habilita la precedencia
   // COMBO_COMPONENTS > PRICE_LIST. Para combos legacy (todos unitValue=0) queda
@@ -1340,6 +1343,12 @@ export async function resolveFinalSalePrice(
       let comboMetalCost   = new Prisma.Decimal(0);
       let comboHechuraCost = new Prisma.Decimal(0);
       let comboPartial = false;
+      // COMBO — venta REAL por componente (keyed por costLineId = line.id).
+      // Es la MISMA `saleContribution` que alimenta el subtotal del combo, PRE
+      // ajuste del combo. `buildComposition` la usa para que la "Venta total"
+      // por componente sea consistente entre lista unificada y desglosada (la
+      // unificada emite hechuraMarginPct=0 → su lineSale colapsaba a costo).
+      const comboComponentSaleByCostLineId: Record<string, number> = {};
       const componentsDetail: Array<{
         articleId: string;
         code: string | null;
@@ -1467,6 +1476,13 @@ export async function resolveFinalSalePrice(
         if (saleContribution != null) {
           comboPriceSubtotal = comboPriceSubtotal.add(saleContribution);
           comboPriceResolved += 1;
+          // Guardar la venta REAL del componente por costLineId para que
+          // `composition.products[].lineSale` la use (consistencia unificada ↔
+          // desglosada). PRE ajuste del combo — el frontend aplica el
+          // `comboAdjFactor` aparte. Solo cuando la línea tiene id estable.
+          if (typeof line.id === "string" && line.id.length > 0) {
+            comboComponentSaleByCostLineId[line.id] = parseFloat(saleContribution.toString());
+          }
         } else {
           comboPriceMissing += 1;
         }
@@ -1525,6 +1541,12 @@ export async function resolveFinalSalePrice(
           unitPrice: componentResult?.unitPrice != null ? parseFloat(componentResult.unitPrice.toString()) : null,
           priceSource: (componentResult as any)?.priceSource ?? null,
         });
+      }
+
+      // Lift de la venta real por componente al scope del resultado (solo si
+      // hubo al menos un componente con venta resuelta).
+      if (Object.keys(comboComponentSaleByCostLineId).length > 0) {
+        comboComponentSaleOut = comboComponentSaleByCostLineId;
       }
 
       // Sobreescribir el costo del motor con el del combo derivado.
@@ -3127,6 +3149,9 @@ export async function resolveFinalSalePrice(
       return unified.length > 0 ? unified : undefined;
     })(),
     debugWarnings: costResult.debugWarnings,
+    // COMBO — venta real por componente (keyed por costLineId) para que
+    // `buildComposition` la use en `composition.products/services[].lineSale`.
+    comboComponentSaleByCostLineId: comboComponentSaleOut,
   };
 
   // ── pricing-trace (dev-only, gated por env PRICING_TRACE) ────────────────

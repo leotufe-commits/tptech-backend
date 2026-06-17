@@ -533,6 +533,26 @@ export interface SalePriceResult {
    * de debug si quiere; la UI normal lo ignora.
    */
   debugWarnings?: DebugWarning[];
+
+  /**
+   * COMBO — venta REAL por componente (Σ por costLineId), PRE ajuste del combo.
+   *
+   * Para un combo, cada componente se resuelve con la lista del documento, así
+   * que su venta de lista (`costLineAdj × margen`) ya refleja el margen
+   * configurado (ej. 85%) en CUALQUIER modo de lista. El motor la calcula para
+   * armar el subtotal del combo (`COMBO_PRICE`) pero la descartaba.
+   *
+   * `buildComposition` la usa para poblar `composition.products[i].lineSale` /
+   * `services[i].lineSale` del combo en lugar de derivarlas de
+   * `hechuraSaleFactor` (que en listas UNIFICADAS / `MARGIN_TOTAL` colapsa a
+   * costo porque emiten `hechuraMarginPct = 0`). Resultado: la venta por
+   * componente del combo es IDÉNTICA entre lista unificada y desglosada
+   * (consistencia + verificable: `costo × (1 + margen)`).
+   *
+   * Clave = `ArticleCostLine.id` (mismo id que `composition.products[].costLineId`).
+   * `null`/ausente para artículos no-combo (no los afecta).
+   */
+  comboComponentSaleByCostLineId?: Record<string, number> | null;
 }
 
 // ---------------------------------------------------------------------------

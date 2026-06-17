@@ -224,6 +224,78 @@ describe("F1.5 #A+ — retrocompat callers viejos", () => {
 });
 
 // =============================================================================
+// 4.b COMBO — `comboComponentSale` sobreescribe el lineSale derivado del factor
+//
+// Reproduce el caso real: el MISMO combo con lista UNIFICADA (MARGIN_TOTAL →
+// hechuraMarginPct=0 → factor 1 → lineSale colapsa a costo) y con lista
+// DESGLOSADA (METAL_HECHURA 85% → factor 1.85). El motor emite la venta real
+// por componente (costo × 1.85) en AMBAS listas; con el override, la
+// composición muestra el MISMO lineSale (85%) sin importar el modo de lista.
+// =============================================================================
+
+describe("COMBO — comboComponentSale override de lineSale", () => {
+  it("lista UNIFICADA (factor 1) — override fuerza la venta real del componente", () => {
+    // Componente con costo 319850.94; venta real de lista 85% = 591724.24.
+    const steps = [
+      step("COST_LINES_PRODUCT", 319850.94, { qty: "1", unitValue: "319850.94", costLineId: "cl-1" }, "Anillo Solitario"),
+    ];
+    // Lista unificada: factor = 1 (hechuraMarginPct 0) → SIN override colapsaría a costo.
+    const factorUnificada = 1;
+    const comboSale = { "cl-1": 591724.24 };
+    const [withOverride] = extractCompositionItems(
+      steps, "COST_LINES_PRODUCT", undefined, factorUnificada, comboSale,
+    );
+    expect(withOverride.lineSale).toBeCloseTo(591724.24, 2);
+
+    // Control: sin override, la unificada colapsaba a costo (el bug).
+    const [withoutOverride] = extractCompositionItems(
+      steps, "COST_LINES_PRODUCT", undefined, factorUnificada,
+    );
+    expect(withoutOverride.lineSale).toBeCloseTo(319850.94, 2);
+  });
+
+  it("lista DESGLOSADA (factor 1.85) — el override coincide con el factor (no cambia nada)", () => {
+    const steps = [
+      step("COST_LINES_PRODUCT", 319850.94, { qty: "1", unitValue: "319850.94", costLineId: "cl-1" }, "Anillo Solitario"),
+    ];
+    const factorDesglosada = 1.85;
+    const comboSale = { "cl-1": 591724.24 }; // = 319850.94 × 1.85
+    const [withOverride] = extractCompositionItems(
+      steps, "COST_LINES_PRODUCT", undefined, factorDesglosada, comboSale,
+    );
+    const [withoutOverride] = extractCompositionItems(
+      steps, "COST_LINES_PRODUCT", undefined, factorDesglosada,
+    );
+    // Ambos dan 85% → la desglosada queda IDÉNTICA con o sin override.
+    expect(withOverride.lineSale).toBeCloseTo(591724.24, 2);
+    expect(withoutOverride.lineSale).toBeCloseTo(591724.24, 2);
+  });
+
+  it("paridad unificada ↔ desglosada: mismo lineSale con override en ambas", () => {
+    const steps = [
+      step("COST_LINES_PRODUCT", 319850.94, { qty: "1", unitValue: "319850.94", costLineId: "cl-1" }, "Anillo Solitario"),
+      step("COST_LINES_PRODUCT", 934618.44, { qty: "1", unitValue: "934618.44", costLineId: "cl-2" }, "Anillos Multimetales"),
+    ];
+    const comboSale = { "cl-1": 591724.24, "cl-2": 1729044.11 };
+    const unificada  = extractCompositionItems(steps, "COST_LINES_PRODUCT", undefined, 1,    comboSale);
+    const desglosada = extractCompositionItems(steps, "COST_LINES_PRODUCT", undefined, 1.85, comboSale);
+    expect(unificada.map((i) => i.lineSale)).toEqual(desglosada.map((i) => i.lineSale));
+    // Σ = subtotal del combo (suma de componentes a 85%).
+    const sum = unificada.reduce((a, x) => a + (x.lineSale ?? 0), 0);
+    expect(sum).toBeCloseTo(2320768.35, 1);
+  });
+
+  it("item sin entrada en el mapa cae al cálculo por factor (no-combo intacto)", () => {
+    const steps = [
+      step("COST_LINES_PRODUCT", 100, { qty: "1", unitValue: "100", costLineId: "otro" }, "X"),
+    ];
+    // Mapa presente pero sin "otro" → fallback al factor histórico.
+    const [item] = extractCompositionItems(steps, "COST_LINES_PRODUCT", undefined, 1.5, { "cl-1": 999 });
+    expect(item.lineSale).toBe(150);
+  });
+});
+
+// =============================================================================
 // 5. F1.5 #A++ — METAL lineSale (passthrough metalSale/metalCost)
 // =============================================================================
 
