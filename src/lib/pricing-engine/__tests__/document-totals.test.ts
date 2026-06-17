@@ -1226,6 +1226,36 @@ describe("computeSaleDocumentTotals — deferDocumentRoundingApplication (fix re
     expect(out.roundingAdjustment).toBeCloseTo(DEFERRED, 2);
   });
 
+  it("applyDeferredCommercialRounding (COMBO): el comercial diferido SE APLICA en capa 15 y el FINANCIERO ENCADENA encima", () => {
+    // pre-round = 1149. Comercial diferido 26.03 → 1175.03. Financiero HUNDRED
+    // NEAREST encadena sobre 1175.03 → 1200 (delta +24.97). Total = 1200.
+    // roundingAdjustment (trace) = comercial 26.03 + financiero 24.97 = 51.
+    const out = computeSaleDocumentTotals({
+      lines:   [line({ lineTotal: 1000, lineTaxAmount: 149 })],
+      channel: null, coupon: null,
+      roundingAdjustment: DEFERRED,                 // comercial diferido
+      documentRounding:   financialPolicy,          // financiero HUNDRED NEAREST
+      applyDeferredCommercialRounding: true,        // ← OPCIÓN B en capa 15 (combo)
+    });
+    expect(out.total).toBeCloseTo(1200, 2);
+    expect(out.roundingAdjustment).toBeCloseTo(51, 2);
+    // El snapshot financiero reporta SOLO su delta (24.97), no el comercial.
+    expect(out.documentRoundingApplied?.totalAdjustment).toBeCloseTo(24.97, 2);
+  });
+
+  it("control — SIN el flag (default): el comercial se DESCARTA, financiero solo (no cambia el comportamiento global)", () => {
+    const out = computeSaleDocumentTotals({
+      lines:   [line({ lineTotal: 1000, lineTaxAmount: 149 })],
+      channel: null, coupon: null,
+      roundingAdjustment: DEFERRED,
+      documentRounding:   financialPolicy,
+      // sin applyDeferredCommercialRounding → default false
+    });
+    // Comercial descartado: 1149 → HUNDRED → 1100. Solo el financiero.
+    expect(out.total).toBeCloseTo(1100, 2);
+    expect(out.documentRoundingApplied?.totalAdjustment).toBeCloseTo(-49, 2);
+  });
+
   it("sin política financiera + defer ausente: el diferido de la lista SÍ se aplica (comercial unificado)", () => {
     // Caso operador: sin financiero → documentRounding null/inerte →
     // docRoundingActive=false → el diferido de la lista se aplica normalmente.

@@ -573,6 +573,25 @@ export interface SaleDocumentTotalsInput {
    */
   deferDocumentRoundingApplication?: boolean;
 
+  /**
+   * Forzar OPCIÓN B también en la capa 15 (financiero no-PHYSICAL): el redondeo
+   * COMERCIAL diferido de la lista (`roundingAdjustment` del caller, applyOn=
+   * TOTAL/NET) SE APLICA y el FINANCIERO ENCADENA encima (no lo descarta).
+   *
+   * Motivación (2026-06-17): un COMBO con lista unificada recibe su redondeo
+   * comercial SOLO por el canal diferido (`roundingAdjustment`); con financiero
+   * activo no-PHYSICAL, la capa 15 lo DESCARTABA (=0) y el financiero lo
+   * reemplazaba → el comercial se mostraba pero NO impactaba el total. Un
+   * artículo común con lista PER_DOCUMENT no tiene el problema (va por
+   * `commercialDelta`, que no se descarta). La bandera alinea el combo al
+   * comportamiento del artículo común: comercial primero, financiero encadenado.
+   *
+   * ACOTADO: solo el caller que lo necesita (sales.service, cuando hay líneas
+   * combo) la pone en `true`. Default `false` → comportamiento global legacy
+   * intacto (el diferido se descarta cuando coexiste con financiero capa 15).
+   */
+  applyDeferredCommercialRounding?: boolean;
+
   // ── Etapa D' — Redondeo Comercial PER_DOCUMENT (POLICY §R-Rounding-15) ──
   /**
    * Configuración del redondeo comercial PER_DOCUMENT. Se aplica entre el
@@ -1095,9 +1114,14 @@ export function computeSaleDocumentTotals(
   //     acá (queda en `roundingAdjustment`, atribuido a la LISTA) y el financiero
   //     ENCADENA encima en la capa 16, operando sobre el total YA post-comercial
   //     (misma config → delta 0; config distinta → re-redondea el post-comercial).
-  //     Antes (opción A) se descartaba igual; se cambió por decisión del operador.
+  //   · `applyDeferredCommercialRounding=true` (caller, p.ej. COMBOS) → fuerza
+  //     OPCIÓN B también en la capa 15: el comercial diferido SE APLICA y el
+  //     financiero ENCADENA encima (no lo descarta). Acotado al caso del combo —
+  //     el comportamiento global default (descartar) NO cambia. Ver `chainFinancial`
+  //     abajo.
   const docRoundingActive = !!(input.documentRounding && isDocumentRoundingActive(input.documentRounding));
-  let   roundingAdjustment      = (docRoundingActive && !input.deferDocumentRoundingApplication)
+  const chainCommercialBeforeFinancial = !!input.applyDeferredCommercialRounding;
+  let   roundingAdjustment      = (docRoundingActive && !input.deferDocumentRoundingApplication && !chainCommercialBeforeFinancial)
     ? 0
     : round2(input.roundingAdjustment ?? 0);
 
@@ -1333,15 +1357,24 @@ export function computeSaleDocumentTotals(
     }
 
     if (combinedDelta !== 0 || fallback) {
-      // El delta combinado REEMPLAZA `roundingAdjustment` (la política doc
-      // es la única autoridad cuando está activa; el redondeo de listas
-      // con applyOn=NET|TOTAL viene suprimido por el caller).
-      roundingAdjustment = round2(combinedDelta);
+      const financialDelta = round2(combinedDelta);
+      // `chainCommercialBeforeFinancial` (OPCIÓN B, p.ej. combos): el redondeo
+      // COMERCIAL diferido (ya en `roundingAdjustment` y sumado al `total` en
+      // :1244) SE CONSERVA; el FINANCIERO ENCADENA encima (el `total` que redondeó
+      // la capa ya estaba post-comercial). El snapshot financiero reporta SOLO su
+      // propio delta; `roundingAdjustment` (trace) reporta comercial + financiero.
+      //
+      // Default (sin el flag): el delta financiero REEMPLAZA `roundingAdjustment`
+      // (la política doc es la única autoridad; el comercial diferido ya venía en
+      // 0). Comportamiento global legacy intacto.
+      roundingAdjustment = chainCommercialBeforeFinancial
+        ? round2(roundingAdjustment + financialDelta)
+        : financialDelta;
       documentRoundingApplied = {
         source:  "TENANT_POLICY",
         scope,
         applyOn: "DOC_TOTAL",
-        totalAdjustment: roundingAdjustment,
+        totalAdjustment: financialDelta,
         ...(unifiedLayer   ? { unified:   unifiedLayer }   : {}),
         ...(breakdownLayer ? { breakdown: breakdownLayer } : {}),
         ...(fallback       ? { fallback }                  : {}),

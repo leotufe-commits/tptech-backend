@@ -2743,6 +2743,12 @@ async function _confirmSaleImpl(
     })
     .filter((l): l is SaleDocumentTotalsLineInput => l != null);
 
+  // OPCIÓN B en capa 15 SOLO para combos (espejo EXACTO de previewSale): el
+  // comercial diferido del combo se aplica y el financiero encadena. Misma
+  // detección que el resto del confirm (`lineResults`).
+  const hasComboLineForRounding = (lineResults as any[]).some(
+    (lr) => lr?.priceSource === "COMBO_COMPONENTS" || lr?.commercialMode === "COMBO_COMMERCIAL",
+  );
   const documentTotals = computeSaleDocumentTotals({
     lines:   documentLineInputsForEngine,
     channel: confirmChannelInput,
@@ -2765,6 +2771,8 @@ async function _confirmSaleImpl(
     // 16, que encadena sobre el total post-comercial). Ver previewSale.
     documentRounding:                 confirmEffectiveDocumentRounding,
     deferDocumentRoundingApplication: confirmFinancialPhysicalActive,
+    // Combos — OPCIÓN B en capa 15 (espejo preview).
+    applyDeferredCommercialRounding:  hasComboLineForRounding,
     // Etapa D' — Redondeo Comercial PER_DOCUMENT.
     commercialDocumentRounding:             confirmCommercialDocCtx.commercialDocumentRounding,
     metalsByParentForCommercialRounding:    confirmCommercialAggregates.metalsByParent,
@@ -6804,6 +6812,14 @@ async function _previewSaleImpl(
     balanceModeResolution.mode,
   );
 
+  // OPCIÓN B en capa 15 SOLO para combos: un combo recibe su redondeo comercial
+  // por el canal diferido (`roundingAdjustment`); sin esto, con financiero activo
+  // no-PHYSICAL, la capa 15 lo descartaba y el comercial no impactaba. El flag
+  // hace que el comercial se aplique y el financiero encadene, igual que un
+  // artículo común de lista PER_DOCUMENT. Acotado a combos → no cambia el resto.
+  const hasComboLineForRounding = resolvedLines.some(
+    (l) => (l as any).priceSource === "COMBO_COMPONENTS" || (l as any).costMode === "COMBO",
+  );
   const documentTotals = computeSaleDocumentTotals({
     lines: resolvedLines.map((l, idx): SaleDocumentTotalsLineInput => {
       const mhb = (l as any).metalHechuraBreakdown ?? null;
@@ -6876,6 +6892,8 @@ async function _previewSaleImpl(
     // capa 15).
     documentRounding:                 effectiveDocumentRounding,
     deferDocumentRoundingApplication: financialPhysicalActive,
+    // Combos — OPCIÓN B en capa 15 (comercial diferido aplica, financiero encadena).
+    applyDeferredCommercialRounding:  hasComboLineForRounding,
     // Etapa D' — Redondeo Comercial PER_DOCUMENT (POLICY §R-Rounding-15).
     // `null` cuando PER_LINE_LEGACY o MIXED_LIST_FALLBACK → la capa no actúa
     // (back-compat total). Cuando PER_DOCUMENT, alimenta la capa nueva.
