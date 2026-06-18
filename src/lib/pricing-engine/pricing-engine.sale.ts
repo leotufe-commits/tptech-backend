@@ -49,7 +49,8 @@ import { traceLine } from "./pricing-trace.js";
 // ---------------------------------------------------------------------------
 
 interface PricingPolicyConfig {
-  lowMarginWarningPercent: number;
+  // null = sin advertencia de margen bajo (el operador no configuró un umbral).
+  lowMarginWarningPercent: number | null;
   lowMarginBlockPercent: number | null;
   blockLossSale: boolean;
   blockZeroOrNegativePrice: boolean;
@@ -57,7 +58,10 @@ interface PricingPolicyConfig {
 }
 
 const PRICING_DEFAULTS: PricingPolicyConfig = {
-  lowMarginWarningPercent:  15,
+  // Sin default hardcodeado: si el tenant no configuró un umbral, NO se advierte
+  // por margen bajo (antes caía a 15%, lo que hacía saltar la alerta "sin haber
+  // ingresado nada"). El operador decide el umbral; vacío = sin advertencia.
+  lowMarginWarningPercent:  null,
   lowMarginBlockPercent:    null,
   blockLossSale:            false,
   blockZeroOrNegativePrice: false,
@@ -237,7 +241,7 @@ function finalize(
 
 function buildAlerts(
   result: Omit<SalePriceResult, "alerts" | "policy">,
-  warningPercent: number
+  warningPercent: number | null
 ): PricingAlert[] {
   const alerts: PricingAlert[] = [];
   const D = Prisma.Decimal;
@@ -270,8 +274,11 @@ function buildAlerts(
     });
   }
 
-  // LOW_MARGIN — margen por debajo del umbral de alerta, pero no negativo
+  // LOW_MARGIN — margen por debajo del umbral de alerta, pero no negativo.
+  // `warningPercent == null` ⇒ el operador no configuró umbral ⇒ NO se advierte
+  // por margen bajo (vacío = sin advertencia; ya no hay default 15% hardcodeado).
   if (
+    warningPercent != null &&
     result.marginPercent != null &&
     result.marginPercent.gte(0) &&
     result.marginPercent.lt(new D(warningPercent)) &&
@@ -938,7 +945,8 @@ export async function resolveFinalSalePrice(
     },
   });
   const policyConfig: PricingPolicyConfig = {
-    lowMarginWarningPercent:  toNum(jewelryConfig?.pricingLowMarginWarningPercent)  ?? PRICING_DEFAULTS.lowMarginWarningPercent,
+    // Sin fallback: null/vacío significa "sin advertencia de margen bajo".
+    lowMarginWarningPercent:  toNum(jewelryConfig?.pricingLowMarginWarningPercent),
     lowMarginBlockPercent:    toNum(jewelryConfig?.pricingLowMarginBlockPercent)    ?? PRICING_DEFAULTS.lowMarginBlockPercent,
     blockLossSale:            jewelryConfig?.pricingBlockLossSale            ?? PRICING_DEFAULTS.blockLossSale,
     blockZeroOrNegativePrice: jewelryConfig?.pricingBlockZeroOrNegativePrice ?? PRICING_DEFAULTS.blockZeroOrNegativePrice,

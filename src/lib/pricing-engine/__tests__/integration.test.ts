@@ -55,7 +55,9 @@ function noDiscount() { return []; }
 function defaultJewelryConfig() {
   return {
     defaultMermaPercent:            null,
-    pricingLowMarginWarningPercent:  null, // usará fallback 15%
+    // Umbral explícito 15% (antes el motor lo defaulteaba; ahora vacío = sin
+    // advertencia, así que los tests que esperan LOW_MARGIN lo fijan acá).
+    pricingLowMarginWarningPercent:  15,
     pricingLowMarginBlockPercent:    null,
     pricingBlockLossSale:            false,
     pricingBlockZeroOrNegativePrice: true,
@@ -501,6 +503,24 @@ describe("Política de confirmación", () => {
     expect(res.alerts.map(a => a.code)).toContain("LOW_MARGIN");
     expect(res.policy.canConfirm).toBe(true);            // solo warning
     expect(res.policy.blockingAlerts).not.toContain("LOW_MARGIN");
+  });
+
+  it("LOW_MARGIN NO se emite cuando el umbral de advertencia está vacío (null)", async () => {
+    // Contrato nuevo: sin umbral configurado ⇒ no se advierte por margen bajo
+    // (antes el motor defaulteaba a 15% y la alerta saltaba "sin configurar nada").
+    mockPrisma.jewelry.findUnique.mockResolvedValue({
+      ...defaultJewelryConfig(),
+      pricingLowMarginWarningPercent: null, // vacío = sin advertencia
+    });
+    // costo=100, precio=110 → margen≈9.09% (sería LOW_MARGIN si hubiera umbral).
+    mockPrisma.article.findFirst.mockResolvedValue(makeDbArticle({
+      costComposition: [{ type: "MANUAL", quantity: "1", unitValue: new D("100"), currencyId: null, mermaPercent: null, metalVariantId: null }],
+      salePrice: new D("110"),
+    }));
+
+    const res = await resolveFinalSalePrice("j1", { articleId: "a1" });
+    expect(res.alerts.map(a => a.code)).not.toContain("LOW_MARGIN");
+    expect(res.policy.canConfirm).toBe(true);
   });
 
   it("LOW_MARGIN bloquea cuando lowMarginBlockPercent está configurado y margen < umbral", async () => {
